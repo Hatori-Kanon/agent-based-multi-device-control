@@ -172,10 +172,12 @@ export class XhtkjBackend implements DeviceBackend {
   }
 
   get name(): string {
-    if (this.options.name !== undefined) return this.options.name
+    const base = this.options.name ?? '谜姬 BLE toy'
+    // Always carry the capability and product id: it is the evidence needed
+    // to map a unit's channel layout (rotation toys, dual motors, ...).
     return this.productId === undefined
-      ? '谜姬 BLE toy'
-      : `谜姬 BLE toy (${this.capability}, pid ${this.productId})`
+      ? base
+      : `${base} (${this.capability}, pid ${this.productId})`
   }
 
   /** Product id read from the standard PnP ID characteristic, when available. */
@@ -237,9 +239,12 @@ export class XhtkjBackend implements DeviceBackend {
 
       // Adopt the control layout by handshake: clones (ANKNI ZKRXB...) serve
       // 0xdddd instead of 0xff10 and expose no notify characteristic, so the
-      // classic layout must fail over cleanly.
+      // classic layout must fail over cleanly. Probe failures are expected
+      // here (a clone has no 0xff10 at all) and stay out of the error panel;
+      // only a notify failure on the ADOPTED layout is worth reporting.
       let adopted: XhtkjLayout | undefined
       let lastError: unknown
+      let probeNotifyError: unknown
       for (const layout of XHTKJ_LAYOUTS) {
         this.notifyOff?.()
         this.notifyOff = undefined
@@ -249,7 +254,7 @@ export class XhtkjBackend implements DeviceBackend {
               this.lastNotificationHex = [...data].map(byte => byte.toString(16).padStart(2, '0')).join('')
             })
           } catch (error) {
-            this.options.onError?.(error)
+            probeNotifyError = error
           }
         }
         try {
@@ -266,6 +271,9 @@ export class XhtkjBackend implements DeviceBackend {
           'NOT_CONNECTED',
           `initialize handshake failed on every known layout (classic 0xff10 and ANKNI 0xdddd): ${lastError instanceof Error ? lastError.message : String(lastError)}`,
         )
+      }
+      if (adopted.notify !== undefined && this.notifyOff === undefined && probeNotifyError !== undefined) {
+        this.options.onError?.(probeNotifyError)
       }
       this.layout = adopted
     } catch (error) {
