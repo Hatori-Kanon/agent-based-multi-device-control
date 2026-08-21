@@ -130,9 +130,20 @@ export class AnkniBackend implements DeviceBackend {
   }
 
   /** Raw frame from a human protocol experiment, via the adopted live channel. */
-  async writeRaw(data: Uint8Array): Promise<void> {
+  async writeRaw(data: Uint8Array, channel: 'live' | 'setup' = 'live'): Promise<void> {
     this.assertReady()
-    await this.flushFrame(Uint8Array.from(data))
+    const layout = this.layout
+    if (layout === undefined) throw new Error('no control layout adopted')
+    if (channel === 'setup') {
+      await this.flushRaw(() => this.peripheral!.write(layout.write, Uint8Array.from(data), false))
+      return
+    }
+    await this.flushRaw(() => this.peripheral!.write(layout.live, Uint8Array.from(data), layout.liveWithoutResponse))
+  }
+
+  private async flushRaw(write: () => Promise<void>): Promise<void> {
+    await this.writeChain.catch(() => {})
+    await write()
   }
 
   async close(): Promise<void> {

@@ -253,11 +253,15 @@ export class XhtkjBackend implements DeviceBackend {
     }
   }
 
-  /** Raw frame from a human protocol experiment, via the adopted live channel. */
-  async writeRaw(data: Uint8Array): Promise<void> {
+  /** Raw frame from a human protocol experiment — live or the acked setup channel. */
+  async writeRaw(data: Uint8Array, channel: 'live' | 'setup' = 'live'): Promise<void> {
     this.assertReady()
     this.dirty = false
-    await this.write(data)
+    if (channel === 'setup') {
+      await this.write(Uint8Array.from(data), false)
+      return
+    }
+    await this.write(Uint8Array.from(data))
   }
 
   /** Resolve once no write is in flight. Tests advance the clock for the rest. */

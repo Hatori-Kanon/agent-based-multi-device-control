@@ -273,8 +273,8 @@ export class DeviceRegistry {
    * map onto channels. Locked runtime and malformed hex refuse; the attempt is
    * audited either way.
    */
-  async rawWrite(actor: AuditActor, deviceId: string, hex: string): Promise<void> {
-    const detail = { deviceId, hex }
+  async rawWrite(actor: AuditActor, deviceId: string, hex: string, channel: 'live' | 'setup' = 'live'): Promise<void> {
+    const detail = { deviceId, hex, channel }
     const trimmed = hex.trim()
     try {
       if (trimmed.length === 0 || trimmed.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(trimmed)) {
@@ -292,7 +292,7 @@ export class DeviceRegistry {
       if (device.backend.writeRaw === undefined) {
         throw new SafetyError('WRONG_CHANNEL_KIND', `${deviceId} has no raw frame channel`)
       }
-      await device.queue.enqueue(() => device.backend.writeRaw!(bytes), true)
+      await device.queue.enqueue(() => device.backend.writeRaw!(bytes, channel), true)
     } catch (error) {
       await this.recordFailure(actor, 'raw_write', detail, error)
       throw error
