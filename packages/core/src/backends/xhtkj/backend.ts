@@ -35,6 +35,7 @@ import {
   STOP_MODE_PACKET,
   XHTKJ_ADVERTISING_SERVICE,
   XHTKJ_ALT_SERVICE,
+  XHTKJ_ALT_STREAM_CHARACTERISTIC,
   XHTKJ_ALT_WRITE_CHARACTERISTIC,
   XHTKJ_DEVICE_SERVICE,
   XHTKJ_NOTIFY_CHARACTERISTIC,
@@ -63,18 +64,30 @@ const PNP_REF: BleCharacteristicRef = {
 
 /** One known control-service layout of the 谜姬 family. */
 interface XhtkjLayout {
+  /** Acked setup channel: initialise and other confirmed commands. */
   readonly write: BleCharacteristicRef
+  /** Live policy channel: strength, clear, and stop traffic. */
+  readonly live: BleCharacteristicRef
+  /** Live traffic is fire-and-forget (stream toys) rather than acked. */
+  readonly liveWithoutResponse: boolean
   readonly notify: BleCharacteristicRef | undefined
 }
 
-/** Classic 谜姬 layout (0xff10/ff11/ff12). */
-const CLASSIC_LAYOUT: XhtkjLayout = { write: WRITE_REF, notify: NOTIFY_REF }
+/** Classic 谜姬 layout (0xff10/ff11/ff12): one channel for everything. */
+const CLASSIC_LAYOUT: XhtkjLayout = {
+  write: WRITE_REF,
+  live: WRITE_REF,
+  liveWithoutResponse: false,
+  notify: NOTIFY_REF,
+}
 /**
- * ANKNI-clone layout (nakani, 0xdddd/ddd1/ddd2/ddd3): no notify path at all.
- * The clone's control service was confirmed on a real ANKNI ZKRXB unit.
+ * ANKNI clone layout (0xdddd): ddd1 = fire-and-forget stream, ddd2 = acked
+ * commands, ddd3 = read, no notify. Layout confirmed on a real ANKNI ZKRXB.
  */
 const ALT_LAYOUT: XhtkjLayout = {
   write: { service: XHTKJ_ALT_SERVICE, characteristic: XHTKJ_ALT_WRITE_CHARACTERISTIC },
+  live: { service: XHTKJ_ALT_SERVICE, characteristic: XHTKJ_ALT_STREAM_CHARACTERISTIC },
+  liveWithoutResponse: true,
   notify: undefined,
 }
 /** Tried in order; the first one that accepts the INITIALIZE write wins. */
@@ -360,11 +373,14 @@ export class XhtkjBackend implements DeviceBackend {
     }
   }
 
-  private async write(packet: Uint8Array): Promise<void> {
+  private async write(packet: Uint8Array, live = true): Promise<void> {
     const peripheral = this.peripheral
     if (peripheral?.connected !== true) throw new SafetyError('NOT_CONNECTED', `${this.id} is not connected`)
-    // With response: this transport is command-per-change, not a stream.
-    await peripheral.write(this.layout.write, packet, false)
+    // Setup goes to the acked channel; live strength/stop traffic goes to the
+    // live channel, fire-and-forget on stream toys.
+    const ref = live ? this.layout.live : this.layout.write
+    const withoutResponse = live && this.layout.liveWithoutResponse
+    await peripheral.write(ref, packet, withoutResponse)
   }
 
   private cancelSchedule(): void {

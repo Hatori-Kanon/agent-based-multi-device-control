@@ -30,6 +30,7 @@ export const XHTKJ_WRITE_CHARACTERISTIC = bleUuid(0xff12)
 export const XHTKJ_NOTIFY_CHARACTERISTIC = bleUuid(0xff11)
 /** ANKNI-clone control layout (ZKRXB & friends): no 0xff10, no notify. */
 export const XHTKJ_ALT_SERVICE = bleUuid(0xdddd)
+export const XHTKJ_ALT_STREAM_CHARACTERISTIC = bleUuid(0xddd1)
 export const XHTKJ_ALT_WRITE_CHARACTERISTIC = bleUuid(0xddd2)
 export const XHTKJ_ALT_READ_CHARACTERISTIC = bleUuid(0xddd3)
 /** Standard Device Information service, never advertised. */

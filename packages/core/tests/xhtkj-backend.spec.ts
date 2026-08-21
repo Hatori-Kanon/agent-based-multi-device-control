@@ -12,6 +12,7 @@ import {
   SafetyError,
   XHTKJ_ADVERTISING_SERVICE,
   XHTKJ_ALT_SERVICE,
+  XHTKJ_ALT_STREAM_CHARACTERISTIC,
   XHTKJ_ALT_WRITE_CHARACTERISTIC,
   XHTKJ_DEVICE_SERVICE,
   XHTKJ_WRITE_CHARACTERISTIC,
@@ -121,13 +122,21 @@ describe('XHTKJ connect', () => {
     expect(backend.reportedProductId).toBe(0x2000)
     expect(backend.reportedCapability).toBe('vibration')
 
-    // Output now goes through the clone's write characteristic.
+    // Initialize goes through the acked channel (0xddd2) with a response.
+    const init = (transport.peripheral?.writes ?? []).find(
+      write => write.service === XHTKJ_ALT_SERVICE && write.characteristic === XHTKJ_ALT_WRITE_CHARACTERISTIC,
+    )
+    expect(init?.data[2]).toBe(COMMAND.initialize)
+    expect(init?.withoutResponse).toBe(false)
+
+    // Live output goes through the fire-and-forget stream channel (0xddd1).
     await backend.applyLevel('primary', 30)
     clock.advance(200)
     await backend.settled()
     const strength = (transport.peripheral?.writes ?? []).find(write => write.data[2] === COMMAND.strength)
     expect(strength?.service).toBe(XHTKJ_ALT_SERVICE)
-    expect(strength?.characteristic).toBe(XHTKJ_ALT_WRITE_CHARACTERISTIC)
+    expect(strength?.characteristic).toBe(XHTKJ_ALT_STREAM_CHARACTERISTIC)
+    expect(strength?.withoutResponse).toBe(true)
   })
 
   it('refuses with named errors when no control layout answers the handshake', async () => {
