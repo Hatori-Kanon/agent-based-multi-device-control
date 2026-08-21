@@ -111,7 +111,16 @@ describe('DashboardServer', () => {
     const body = await response.json() as { locked: boolean; devices: Array<{ id: string; lifecycle: string }> }
     expect(body.locked).toBe(false)
     expect(body.devices.map(device => device.id)).toEqual(['mock-pulse', 'mock-hold'])
-    expect(body.devices.every(device => device.lifecycle === 'ready')).toBe(true)
+    // Nothing auto-connects; the 连接 button drives the link.
+    expect(body.devices.every(device => device.lifecycle === 'disconnected')).toBe(true)
+  })
+
+  it('exposes the background log buffer over the API', async () => {
+    const host = await start()
+    const response = await fetch(`${base(host)}/api/logs`, { headers: headers(host.dashboardToken) })
+    expect(response.status).toBe(200)
+    const body = await response.json() as { lines: string[] }
+    expect(Array.isArray(body.lines)).toBe(true)
   })
 
   it('adds and removes manifest devices over the API', async () => {
@@ -158,6 +167,12 @@ describe('DashboardServer', () => {
   it('runs a pattern, stops a channel, and changes a cap', async () => {
     const host = await start()
     const token = host.dashboardToken
+    const connect = await fetch(`${base(host)}/api/connect`, {
+      method: 'POST',
+      headers: headers(token, true),
+      body: JSON.stringify({ deviceId: 'mock-pulse' }),
+    })
+    expect(connect.status).toBe(200)
 
     const pattern = await fetch(`${base(host)}/api/pattern`, {
       method: 'POST',
@@ -195,6 +210,11 @@ describe('DashboardServer', () => {
   it('panics, locks, and unlocks', async () => {
     const host = await start()
     const token = host.dashboardToken
+    await fetch(`${base(host)}/api/connect`, {
+      method: 'POST',
+      headers: headers(token, true),
+      body: JSON.stringify({ deviceId: 'mock-pulse' }),
+    })
 
     const panic = await fetch(`${base(host)}/api/panic`, {
       method: 'POST',

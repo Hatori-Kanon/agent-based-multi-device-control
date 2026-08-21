@@ -11,6 +11,9 @@
     devices: document.getElementById('devices'),
     addDevice: document.getElementById('addDevice'),
     addProtocol: document.getElementById('addProtocol'),
+    logsToggle: document.getElementById('logsToggle'),
+    logPanel: document.getElementById('logPanel'),
+    logs: document.getElementById('logs'),
     wfName: document.getElementById('wfName'),
     wfFrames: document.getElementById('wfFrames'),
     wfImport: document.getElementById('wfImport'),
@@ -21,6 +24,7 @@
 
   let snapshot = null
   let waveforms = []
+  let logsOpen = false
   /** Keys of manifest devices: only these get a 移除 button. */
   let managedKeys = new Set()
   const editing = new Set()
@@ -221,14 +225,17 @@
       const title = document.createElement('h2')
       title.textContent = device.name
       const life = document.createElement('span')
-      life.className = `life ${device.lifecycle}`
-      life.textContent = device.lifecycle
+      // A lost link is just "disconnected" to the operator; the app retries only
+      // when they press 连接.
+      const shownLife = device.lifecycle === 'failed' ? 'disconnected' : device.lifecycle
+      life.className = `life ${shownLife}`
+      life.textContent = shownLife
       header.append(title, life)
 
       if (device.lifecycle === 'failed' || device.lifecycle === 'disconnected') {
         const connect = document.createElement('button')
         connect.className = 'mini'
-        connect.textContent = device.lifecycle === 'failed' ? '重连' : '连接'
+        connect.textContent = '连接'
         connect.addEventListener('click', () => call(api('/api/connect', {
           method: 'POST',
           body: JSON.stringify({ deviceId: device.id }),
@@ -360,6 +367,25 @@
     return result
   })))
 
+  el.logsToggle.addEventListener('click', () => {
+    logsOpen = !logsOpen
+    el.logPanel.style.display = logsOpen ? '' : 'none'
+    el.logsToggle.textContent = logsOpen ? '收起日志' : '日志'
+    if (logsOpen) renderLogs()
+  })
+
+  async function renderLogs() {
+    if (!logsOpen) return
+    try {
+      const body = await api('/api/logs')
+      const lines = body.lines ?? []
+      el.logs.textContent = lines.length === 0 ? '（暂无日志）' : lines.join('\n')
+      el.logs.scrollTop = el.logs.scrollHeight
+    } catch {
+      // The log panel must never take the console down with it.
+    }
+  }
+
   el.wfImport.addEventListener('click', async () => {
     try {
       await call(api('/api/waveforms/import', {
@@ -422,5 +448,6 @@
     setInterval(refresh, 500)
     setInterval(renderAudit, 3_000)
     setInterval(renderErrors, 3_000)
+    setInterval(renderLogs, 2_000)
   })()
 })()

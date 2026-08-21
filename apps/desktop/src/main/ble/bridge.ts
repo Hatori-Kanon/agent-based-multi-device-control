@@ -10,6 +10,7 @@
 
 import { SafetyError } from '@embodied/core'
 import type { BleCharacteristicRef, BleFilter, BlePeripheral, BleTransport } from '@embodied/core'
+import { log } from '../log.ts'
 
 /** What the renderer worker offers. All payloads are JSON-serialisable. */
 export interface BleBridge {
@@ -172,7 +173,7 @@ export class BridgedBleTransport implements BleTransport {
   private readonly detach: (() => void)[] = []
 
   constructor(private readonly bridge: BleBridge) {
-    console.log(`[ble] BridgedBleTransport constructed; selectDevice: ${typeof bridge.selectDevice}`)
+    log(`[ble] BridgedBleTransport constructed; selectDevice: ${typeof bridge.selectDevice}`)
     this.detach.push(bridge.onNotify(event => {
       const peripheral = this.peripherals.get(event.handle)
       if (peripheral === undefined) return
@@ -191,7 +192,7 @@ export class BridgedBleTransport implements BleTransport {
 
   async request(filter: BleFilter, signal: AbortSignal): Promise<BlePeripheral> {
     signal.throwIfAborted()
-    console.log(`[ble] transport.request start; chooser: ${this.bridge.selectDevice !== undefined}`)
+    log(`[ble] transport.request start; chooser: ${this.bridge.selectDevice !== undefined}`)
 
     // A BLE scan cache takes a moment to populate. Each attempt opens its own
     // collection window, so a powered-on device does not lose to timing.

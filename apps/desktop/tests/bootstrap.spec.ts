@@ -31,24 +31,30 @@ async function auditRecords(): Promise<AuditRecord[]> {
 }
 
 describe('host runtime', () => {
-  it('connects both mock control models and exposes a snapshot', async () => {
+  it('registers both mock control models disconnected until a human connects them', async () => {
     const clock = new FakeClock()
     runtime = await createHostRuntime({ dataDir: root, clock, withPanicServer: false })
 
     const snapshot = runtime.snapshot()
     expect(snapshot.locked).toBe(false)
     expect(snapshot.devices.map(device => device.id)).toEqual(['mock-pulse', 'mock-hold'])
+    // Nothing connects or scans on start; the 连接 button drives it.
     for (const device of snapshot.devices) {
-      expect(device.lifecycle).toBe('ready')
+      expect(device.lifecycle).toBe('disconnected')
     }
     // Two channels on the streaming box, one on the stateful toy.
     expect(snapshot.devices[0]?.channels).toHaveLength(2)
     expect(snapshot.devices[1]?.channels).toHaveLength(1)
+
+    await runtime.registry.connect('mock-pulse', new AbortController().signal)
+    await runtime.registry.connect('mock-hold', new AbortController().signal)
+    expect(runtime.snapshot().devices.every(device => device.lifecycle === 'ready')).toBe(true)
   })
 
   it('writes an append-only audit trail to disk', async () => {
     const clock = new FakeClock()
     runtime = await createHostRuntime({ dataDir: root, clock, withPanicServer: false })
+    await runtime.registry.connect('mock-pulse', new AbortController().signal)
     await runtime.registry.runPattern('model', {
       deviceId: 'mock-pulse',
       channelId: 'a',
@@ -70,6 +76,7 @@ describe('host runtime', () => {
     runtime = await createHostRuntime({ dataDir: root, clock, panicPort: 0 })
     const address = runtime.panicAddress
     expect(address).toBeDefined()
+    await runtime.registry.connect('mock-pulse', new AbortController().signal)
 
     await runtime.registry.runPattern('model', {
       deviceId: 'mock-pulse',
@@ -114,6 +121,7 @@ describe('host runtime', () => {
     const clock = new FakeClock()
     runtime = await createHostRuntime({ dataDir: root, clock, panicPort: 0 })
     const address = runtime.panicAddress!
+    await runtime.registry.connect('mock-hold', new AbortController().signal)
 
     await runtime.registry.runPattern('model', {
       deviceId: 'mock-hold',
@@ -140,19 +148,23 @@ describe('host runtime', () => {
 })
 
 describe('host runtime with a BLE transport', () => {
-  it('registers and connects a real Coyote alongside the mocks', async () => {
+  it('registers a Coyote disconnected and connects it on demand', async () => {
     const clock = new FakeClock()
     const transport = new MockBleTransport({ clock, name: COYOTE_BLE_NAME })
     runtime = await createHostRuntime({ dataDir: root, clock, withPanicServer: false, bleTransport: transport })
 
     const devices = runtime.snapshot().devices
     const coyote = devices.find(device => device.id === 'coyote')
-    expect(coyote?.lifecycle).toBe('ready')
+    expect(coyote?.lifecycle).toBe('disconnected')
     expect(coyote?.channels.map(channel => channel.id)).toEqual(['a', 'b'])
     expect(coyote?.channels.every(channel => channel.supportsWaveform)).toBe(true)
 
+    // Nothing scanned during startup; the operator's 连接 does.
+    expect(transport.peripheralFor(filter => filter.name === COYOTE_BLE_NAME)).toBeUndefined()
+    await runtime.registry.connect('coyote', new AbortController().signal)
+    expect(runtime.snapshot().devices.find(device => device.id === 'coyote')?.lifecycle).toBe('ready')
+
     // The hardware ceiling was written from policy before anything else.
-    // Two BLE backends share the adapter, so pick the Coyote's own peripheral.
     const peripheral = transport.peripheralFor(filter => filter.name === COYOTE_BLE_NAME)!
     const first = peripheral.writes[0]
     expect(first?.data).toHaveLength(BF_LENGTH)
@@ -219,9 +231,12 @@ describe('host runtime with a BLE transport', () => {
 
     const added = await runtime.addDevice('coyote')
     expect(added.key).toBe('coyote-2')
-    expect(added.lifecycle).toBe('ready')
+    // Add registers only; the operator connects afterwards.
+    expect(added.lifecycle).toBe('disconnected')
     expect(runtime.snapshot().devices.map(device => device.id)).toContain('coyote-2')
 
+    await runtime.registry.connect('coyote-2', new AbortController().signal)
+    expect(runtime.snapshot().devices.find(device => device.id === 'coyote-2')?.lifecycle).toBe('ready')
     // The transport addresses each unit by its own filter name.
     expect(transport.peripheralFor(filter => filter.name === COYOTE_BLE_NAME)).toBeDefined()
     expect(runtime.listDevices().map(entry => entry.key)).toEqual(['coyote', 'xhtkj', 'coyote-2'])
@@ -252,6 +267,7 @@ describe('host runtime with a BLE transport', () => {
       bleTransport: transport,
       onError: error => { errors.push(error) },
     })
+    await runtime.registry.connect('coyote', new AbortController().signal)
     const coyote = runtime.snapshot().devices.find(device => device.id === 'coyote')
     expect(coyote?.lifecycle).toBe('ready')
 
@@ -279,8 +295,14 @@ describe('host runtime with a BLE transport', () => {
     })
     const relay = runtime.snapshot().devices.find(device => device.id === 'monsterparty')
     expect(relay).toBeDefined()
-    // With no reachable relay it lands in `failed`, and the app still starts.
-    expect(relay?.lifecycle).toBe('failed')
+    // Registered but not connected: nothing dials out until the operator asks.
+    expect(relay?.lifecycle).toBe('disconnected')
+    // A human-driven connect fails without a reachable relay, and the app
+    // keeps serving everything else.
+    await expect(runtime.registry.connect('monsterparty', new AbortController().signal)).rejects.toThrow()
+    expect(runtime.snapshot().devices.find(device => device.id === 'monsterparty')?.lifecycle).toBe('failed')
+    expect(runtime.snapshot().devices.find(device => device.id === 'mock-pulse')?.lifecycle).toBe('disconnected')
+    await runtime.registry.connect('mock-pulse', new AbortController().signal)
     expect(runtime.snapshot().devices.find(device => device.id === 'mock-pulse')?.lifecycle).toBe('ready')
   })
 
@@ -288,6 +310,7 @@ describe('host runtime with a BLE transport', () => {
     const clock = new FakeClock()
     const transport = new MockBleTransport({ clock, name: COYOTE_BLE_NAME })
     runtime = await createHostRuntime({ dataDir: root, clock, withPanicServer: false, bleTransport: transport })
+    await runtime.registry.connect('coyote', new AbortController().signal)
 
     await runtime.registry.runPattern('model', {
       deviceId: 'coyote',
@@ -321,9 +344,15 @@ describe('host runtime with a BLE transport', () => {
       onError: error => { errors.push(error) },
     })
 
-    // A box that is off must not stop the app from starting.
-    expect(errors.length).toBeGreaterThan(0)
+    // Nothing tried to connect at startup: no scan, no error.
+    expect(errors.length).toBe(0)
+    expect(runtime.snapshot().devices.find(device => device.id === 'coyote')?.lifecycle).toBe('disconnected')
+
+    // The operator's 连接 hits the dead box: refused, marked failed, and
+    // everything else stays usable.
+    await expect(runtime.registry.connect('coyote', new AbortController().signal)).rejects.toThrow()
     expect(runtime.snapshot().devices.find(device => device.id === 'coyote')?.lifecycle).toBe('failed')
+    await runtime.registry.connect('mock-pulse', new AbortController().signal)
     expect(runtime.snapshot().devices.find(device => device.id === 'mock-pulse')?.lifecycle).toBe('ready')
   })
 })

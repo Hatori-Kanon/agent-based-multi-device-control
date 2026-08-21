@@ -52,6 +52,8 @@ export interface DashboardDeps {
   auditTail(limit: number): Promise<unknown[]>
   /** Recent runtime errors, so the console can show why something failed. */
   recentErrors(): { ts: number; message: string }[]
+  /** Background diagnostic log ring buffer (newest last). */
+  recentLogs(): string[]
 }
 
 export interface DashboardServerOptions {
@@ -293,6 +295,11 @@ export class DashboardServer {
 
     if (request.method === 'GET' && pathname === '/api/errors') {
       sendJson(response, 200, this.options.deps.recentErrors())
+      return
+    }
+
+    if (request.method === 'GET' && pathname === '/api/logs') {
+      sendJson(response, 200, { lines: this.options.deps.recentLogs() })
       return
     }
 

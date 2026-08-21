@@ -29,6 +29,7 @@ import {
 } from '@embodied/core'
 import { IntifaceProcess, type IntifaceAvailability } from './intiface.ts'
 import { DashboardServer, type DashboardDeps } from './dashboard.ts'
+import { log, recentLogs } from './log.ts'
 import { NodeTextSocketTransport } from './node-socket.ts'
 import { FileAppendOnlyStore, FileDocumentStore, readAuditTail } from './node-storage.ts'
 import { PanicServer } from './panic-server.ts'
@@ -228,11 +229,9 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     }
   }
 
-  const connectIds: string[] = []
   if (options.withMockDevices !== false) {
     for (const backend of createMockDevices(clock)) {
       registry.register(backend)
-      connectIds.push(backend.id)
     }
   }
 
@@ -284,12 +283,11 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     // BLE protocols need a transport; on start-dev (none) they are skipped but
     // stay in the manifest so a later BLE run picks them back up.
     if (entry.protocol !== 'mock' && options.bleTransport === undefined) {
-      console.log(`[devices] skipping ${entry.key} (${entry.protocol}): no BLE transport configured`)
+      log(`[devices] skipping ${entry.key} (${entry.protocol}): no BLE transport configured`)
       continue
     }
     try {
       registry.register(createBackend(entry))
-      connectIds.push(entry.key)
     } catch (error) {
       recordError(error)
     }
@@ -304,12 +302,13 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       onError: recordError,
     })
     registry.register(relay)
-    connectIds.push(relay.id)
   }
 
-  // The probe is expected to fail when no engine is installed; surface it on
-  // the terminal, not in the console's error panel (noise for most operators).
-  const intifaceProcess = new IntifaceProcess({ onError: error => { console.error('[embodied] Intiface probe:', error) } })
+  // The probe is expected to fail when no engine is installed; that lives in
+  // the background log buffer, not the terminal (noise for most operators).
+  const intifaceProcess = new IntifaceProcess({
+    onError: error => { log(`[embodied] Intiface probe: ${error instanceof Error ? error.message : String(error)}`) },
+  })
   let intifaceAvailability: IntifaceAvailability = 'unavailable'
   if (options.withButtplug !== false) {
     intifaceAvailability = await intifaceProcess.ensure()
@@ -324,7 +323,6 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
         onError: recordError,
       })
       registry.register(buttplug)
-      connectIds.push(buttplug.id)
     }
   }
 
@@ -369,13 +367,8 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       registry.register(createBackend(entry))
       manifest = [...manifest, entry]
       await saveManifest()
-      try {
-        // A miss (toy off, not advertising) keeps the entry so the UI can
-        // retry with 重连 instead of re-adding.
-        await registry.connect(entry.key, controller.signal)
-      } catch (error) {
-        recordError(error)
-      }
+      // Registered but not connected: the operator drives the connection with
+      // the 连接 button, so nothing scans on add.
       return listDevices().find(device => device.key === entry.key)!
     })
   }
@@ -388,14 +381,8 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     })
   }
 
-  for (const id of connectIds) {
-    try {
-      await registry.connect(id, controller.signal)
-    } catch (error) {
-      recordError(error)
-    }
-  }
-
+  // Devices register disconnected; nothing connects or scans until the operator
+  // presses 连接 in the console.
   const panicToken = options.panicToken ?? randomBytes(24).toString('base64url')
   let panicServer: PanicServer | undefined
   let panicAddress: { host: string; port: number } | undefined
@@ -470,6 +457,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     },
     auditTail: async limit => readAuditTail(join(options.dataDir, 'audit', 'device.jsonl'), limit),
     recentErrors: () => recentErrors,
+    recentLogs,
   }
 
   if (options.withDashboard !== false) {

@@ -122,6 +122,7 @@
     <h1>Embodied 控制台</h1>
     <span class="status-pill" id="conn">连接中…</span>
     <span class="spacer"></span>
+    <button id="logsToggle">日志</button>
     <button id="panic">紧急停止</button>
   </header>
 
@@ -142,6 +143,11 @@
   </div>
 
   <div id="devices"></div>
+
+  <div class="panel" id="logPanel" style="display:none">
+    <h3>运行日志<small>后台环形缓冲（BLE 扫描、选择器决策、设备诊断）；终端只显示关键启动信息</small></h3>
+    <div id="logs" style="font: 11px/1.6 ui-monospace, Consolas, monospace; white-space: pre-wrap; word-break: break-all; background:#0b0b10; border-radius:8px; padding:8px 10px; max-height:220px; overflow-y:auto; color:#9a9aa6"></div>
+  </div>
 
   <div class="panel">
     <h3>波形库<small>agent 创作的波形存于「会话」作用域；「存入库」是人工动作</small></h3>

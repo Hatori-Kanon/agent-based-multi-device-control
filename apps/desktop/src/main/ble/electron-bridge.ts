@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url'
 import { BrowserWindow, ipcMain, type WebContents } from 'electron'
 import type { BleCharacteristicRef, BleFilter } from '@embodied/core'
 import { BridgedBleTransport, type BleBridge } from './bridge.ts'
+import { log } from '../log.ts'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -165,7 +166,7 @@ class ElectronBleBridge implements BleBridge {
     if (pending === undefined || pending.answered) {
       // Events can straggle in after the chooser settled. The request was
       // already answered; cancel nothing with them.
-      console.log(`[ble] stray chooser event ignored (${candidates.length} candidate(s), no selection in flight)`)
+      log(`[ble] stray chooser event ignored (${candidates.length} candidate(s), no selection in flight)`)
       return
     }
     // The callback stays valid until the chooser settles, so remember it.
@@ -173,7 +174,7 @@ class ElectronBleBridge implements BleBridge {
     pending.callbackStored = true
     for (const candidate of candidates) pending.devices.set(candidate.deviceId, candidate)
     this.selectionCandidates = pending.devices.size
-    console.log(`[ble] candidates received: ${candidates.length} (total ${this.selectionCandidates})`)
+    log(`[ble] candidates received: ${candidates.length} (total ${this.selectionCandidates})`)
   }
 
   /** Settle the pending selection, once. `deviceId` is the candidate the
@@ -322,7 +323,7 @@ export async function createBleWorker(onError: (error: unknown) => void = () => 
   }
   const routeDiag = (event: Electron.IpcMainEvent, message: string): void => {
     if (event.sender !== contents) return
-    console.log(`[ble] ${message}`)
+    log(`[ble] ${message}`)
   }
 
   ipcMain.on('ble:notify', routeNotify)
@@ -341,9 +342,9 @@ export async function createBleWorker(onError: (error: unknown) => void = () => 
       'JSON.stringify({ bluetooth: typeof navigator.bluetooth !== "undefined", ble: typeof window.__ble !== "undefined" })',
       true,
     )
-    console.log(`[ble] worker probe: ${probe}`)
+    log(`[ble] worker probe: ${probe}`)
   } catch (error) {
-    console.log(`[ble] worker probe failed: ${error instanceof Error ? error.message : String(error)}`)
+    log(`[ble] worker probe failed: ${error instanceof Error ? error.message : String(error)}`)
   }
 
   const transport = new BridgedBleTransport(bridge)
