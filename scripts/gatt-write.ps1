@@ -47,8 +47,7 @@ $null = [Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceService, Wi
 $null = [Windows.Devices.Bluetooth.GenericAttributeProfile.GattCharacteristic, Windows.Devices.Bluetooth, ContentType = WindowsRuntime]
 $null = [Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus, Windows.Devices.Bluetooth, ContentType = WindowsRuntime]
 $null = [Windows.Devices.Bluetooth.GenericAttributeProfile.GattWriteOption, Windows.Devices.Bluetooth, ContentType = WindowsRuntime]
-$null = [Windows.Storage.Streams.IBuffer, Windows.Storage.Streams, ContentType = WindowsRuntime]
-$null = [Windows.Storage.Streams.DataWriter, Windows.Storage.Streams, ContentType = WindowsRuntime]
+$null = [Windows.Security.Cryptography.CryptographicBuffer, Windows.Security.Cryptography, ContentType = WindowsRuntime]
 
 $address = [Convert]::ToUInt64($mac, 16)
 $leDevice = Await ([Windows.Devices.Bluetooth.BluetoothLEDevice]::FromBluetoothAddressAsync($address)) ([Windows.Devices.Bluetooth.BluetoothLEDevice])
@@ -68,10 +67,10 @@ foreach ($candidate in $charsResult.Characteristics) {
 if ($charObj -eq $null) { Write-Output "characteristic $Characteristic not found"; exit 1 }
 
 $bytes = for ($i = 0; $i -lt $Hex.Length; $i += 2) { [byte][Convert]::ToByte($Hex.Substring($i, 2), 16) }
-$writer = New-Object Windows.Storage.Streams.DataWriter
-$writer.WriteBytes($bytes)
-$buffer = [Windows.Storage.Streams.IBuffer]$writer.DetachBuffer()
-$writer.Dispose()
+# CreateFromByteArray is the canonical PS 5.1 route to an IBuffer: it returns
+# the projected type directly, unlike DataWriter.DetachBuffer() whose COM
+# object resists a plain cast.
+$buffer = [Windows.Security.Cryptography.CryptographicBuffer]::CreateFromByteArray($bytes)
 
 $option = if ($NoResponse) {
   [Windows.Devices.Bluetooth.GenericAttributeProfile.GattWriteOption]::WriteWithoutResponse
