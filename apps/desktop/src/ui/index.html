@@ -113,6 +113,22 @@
   .a-human { color: #6fb4ef; }
   #err { color: #ef8095; min-height: 18px; margin-top: 8px; font-size: 12px; }
 
+  .modal {
+    position: fixed; inset: 0; z-index: 20;
+    background: rgba(0,0,0,.55);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .modal-box {
+    background: #191922; border: 1px solid #3a3a46; border-radius: 12px;
+    padding: 18px 20px; min-width: 300px; max-width: 90vw;
+  }
+  .modal-box h3 { margin: 0 0 12px; font-size: 14px; }
+  .modal-box .radio {
+    display: flex; align-items: center; gap: 8px; padding: 6px 0;
+    font-size: 13px; cursor: pointer;
+  }
+  .modal-box input[type=radio] { accent-color: #4d8fd4; }
+
   footer { margin-top: 20px; color: #5f5f6a; font-size: 11.5px; }
   code { background: #1b1b24; padding: 1px 5px; border-radius: 5px; color: #b6b6c4; }
 </style>
@@ -123,6 +139,7 @@
     <span class="status-pill" id="conn">连接中…</span>
     <span class="spacer"></span>
     <button id="logsToggle">日志</button>
+    <button id="auditToggle">审计</button>
     <button id="panic">紧急停止</button>
   </header>
 
@@ -133,13 +150,22 @@
 
   <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; padding:10px 14px; background:#14141b; border:1px solid #262631; border-radius:12px;">
     <span style="font-size:12px; color:#9a9aa6;">设备管理</span>
-    <select id="addProtocol">
-      <option value="coyote">郊狼 · DG-LAB Coyote（BLE 直连）</option>
-      <option value="xhtkj">谜姬 / XHTKJ（BLE 直连）</option>
-      <option value="mock">模拟设备（Mock）</option>
-    </select>
     <button class="mini" id="addDevice">添加设备</button>
-    <span class="hint">添加时请只打开一台对应协议的设备；删除设备会立即停止输出并断开</span>
+    <span class="hint">设备不会自动连接：启动与添加后都停在「连接」，点设备卡上的「连接」才开始扫描</span>
+  </div>
+
+  <div class="modal" id="addDialog" style="display:none">
+    <div class="modal-box">
+      <h3>添加设备</h3>
+      <label class="radio"><input type="radio" name="addProto" value="coyote" checked>郊狼 · DG-LAB Coyote（BLE 直连）</label>
+      <label class="radio"><input type="radio" name="addProto" value="xhtkj">谜姬 / XHTKJ（BLE 直连）</label>
+      <label class="radio"><input type="radio" name="addProto" value="mock">模拟设备（Mock）</label>
+      <div class="hint" style="margin:10px 0">添加时请只打开一台对应协议的设备；移除设备会立即停止输出并断开</div>
+      <div style="display:flex; gap:10px; justify-content:flex-end">
+        <button id="addCancel">取消</button>
+        <button id="addConfirm">添加</button>
+      </div>
+    </div>
   </div>
 
   <div id="devices"></div>
@@ -165,7 +191,7 @@
     <div id="errors" style="font: 11.5px/1.6 ui-monospace, Consolas, monospace; color:#ef8095"></div>
   </div>
 
-  <div class="panel">
+  <div class="panel" id="auditPanel" style="display:none">
     <h3>审计日志<small>append-only；模型没有任何工具能写或删它</small></h3>
     <div id="audit"><div class="hint">加载中…</div></div>
   </div>

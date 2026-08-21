@@ -10,10 +10,14 @@
     unlock: document.getElementById('unlock'),
     devices: document.getElementById('devices'),
     addDevice: document.getElementById('addDevice'),
-    addProtocol: document.getElementById('addProtocol'),
+    addDialog: document.getElementById('addDialog'),
+    addConfirm: document.getElementById('addConfirm'),
+    addCancel: document.getElementById('addCancel'),
     logsToggle: document.getElementById('logsToggle'),
     logPanel: document.getElementById('logPanel'),
     logs: document.getElementById('logs'),
+    auditToggle: document.getElementById('auditToggle'),
+    auditPanel: document.getElementById('auditPanel'),
     wfName: document.getElementById('wfName'),
     wfFrames: document.getElementById('wfFrames'),
     wfImport: document.getElementById('wfImport'),
@@ -25,6 +29,7 @@
   let snapshot = null
   let waveforms = []
   let logsOpen = false
+  let auditOpen = false
   /** Keys of manifest devices: only these get a 移除 button. */
   let managedKeys = new Set()
   const editing = new Set()
@@ -57,7 +62,10 @@
   async function call(promise) {
     try {
       const result = await promise
-      if (result && result.devices) {
+      // Only bare snapshot responses qualify ({locked, devices...}); the
+      // add/remove device routes wrap theirs in {snapshot, devices} and are
+      // handled by their own explicit handlers.
+      if (result && result.devices && !('snapshot' in result)) {
         snapshot = result
         renderDevices()
       }
@@ -259,19 +267,17 @@
         remove.textContent = '移除'
         remove.style.borderColor = '#7d2642'
         remove.style.color = '#ef8095'
-        remove.addEventListener('click', () => {
+        remove.addEventListener('click', async () => {
           if (!window.confirm(`移除 ${device.name}？输出会立即停止并断开连接。`)) return
-          call(api('/api/devices/remove', {
-            method: 'POST',
-            body: JSON.stringify({ key: device.id }),
-          }).then(async result => {
-            if (result && result.snapshot) {
-              snapshot = result.snapshot
-              renderDevices()
-            }
+          try {
+            await api('/api/devices/remove', {
+              method: 'POST',
+              body: JSON.stringify({ key: device.id }),
+            })
             await refresh()
-            return result
-          }))
+          } catch (error) {
+            fail(error.message ?? String(error))
+          }
         })
         header.append(remove)
       }
@@ -332,6 +338,7 @@
   }
 
   async function renderAudit() {
+    if (!auditOpen) return
     try {
       const records = await api('/api/audit')
       el.audit.replaceChildren(...records.slice().reverse().map(record => {
@@ -355,23 +362,42 @@
     method: 'POST',
     body: JSON.stringify({ note: 'unlocked from web console' }),
   })))
-  el.addDevice.addEventListener('click', () => call(api('/api/devices', {
-    method: 'POST',
-    body: JSON.stringify({ protocol: el.addProtocol.value }),
-  }).then(async result => {
-    if (result && result.snapshot) {
-      snapshot = result.snapshot
-      renderDevices()
+  el.addDevice.addEventListener('click', () => { el.addDialog.style.display = 'flex' })
+  el.addCancel.addEventListener('click', () => { el.addDialog.style.display = 'none' })
+  el.addDialog.addEventListener('click', event => {
+    if (event.target === el.addDialog) el.addDialog.style.display = 'none'
+  })
+  el.addConfirm.addEventListener('click', async () => {
+    const checked = document.querySelector('input[name="addProto"]:checked')
+    const protocol = checked ? checked.value : 'coyote'
+    el.addDialog.style.display = 'none'
+    try {
+      const result = await api('/api/devices', {
+        method: 'POST',
+        body: JSON.stringify({ protocol }),
+      })
+      if (result && result.snapshot) {
+        snapshot = result.snapshot
+        renderDevices()
+      }
+      await refresh()
+    } catch (error) {
+      fail(error.message ?? String(error))
     }
-    await refresh()
-    return result
-  })))
+  })
 
   el.logsToggle.addEventListener('click', () => {
     logsOpen = !logsOpen
     el.logPanel.style.display = logsOpen ? '' : 'none'
     el.logsToggle.textContent = logsOpen ? '收起日志' : '日志'
     if (logsOpen) renderLogs()
+  })
+
+  el.auditToggle.addEventListener('click', () => {
+    auditOpen = !auditOpen
+    el.auditPanel.style.display = auditOpen ? '' : 'none'
+    el.auditToggle.textContent = auditOpen ? '收起审计' : '审计'
+    if (auditOpen) renderAudit()
   })
 
   async function renderLogs() {
@@ -443,7 +469,6 @@
       return
     }
     await refresh()
-    await renderAudit()
     await renderErrors()
     setInterval(refresh, 500)
     setInterval(renderAudit, 3_000)
