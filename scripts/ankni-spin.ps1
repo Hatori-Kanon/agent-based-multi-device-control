@@ -29,12 +29,14 @@ function Build-CommandPacket([string]$commandHex, [string]$paramHex) {
   return ('03' + '12' + $commandHex + $paramHex + ('00' * 16))
 }
 
-# Round 2 candidates. Names say what to look for.
+# Round 3 candidates: the header bytes are the remaining unknown. The JH1
+# family header is AA 08 04 — 0x04 looks like a motor-type/mode select, and a
+# reverse direction may ride a different value there.
 $stream = @(
-  @{ name = 'slot4=1';        hex = 'AA080428000001DF' },
-  @{ name = 'slot4=2';        hex = 'AA080428000002E0' },
-  @{ name = 'slot2=0xFF';     hex = 'AA08042800FF00DD' },
-  @{ name = 'slot2=0x28 same as motor'; hex = 'AA08042828000006' }
+  @{ name = 'byte2=03';      hex = 'AA080328000000DD' },
+  @{ name = 'byte2=05';      hex = 'AA080528000000DF' },
+  @{ name = 'byte1=09';      hex = 'AA090428000000DF' },
+  @{ name = 'byte2=00';      hex = 'AA080028000000DA' }
 )
 $acked = @(
   @{ name = '03 12 0E 01 (dir?)';  hex = (Build-CommandPacket '0E' '01') },
