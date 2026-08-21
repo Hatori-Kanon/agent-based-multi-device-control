@@ -261,6 +261,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
           transport,
           id: entry.key,
           name: entry.label ?? '谜姬 / XHTKJ 直连',
+          ...(entry.bleName === undefined ? {} : { bleName: entry.bleName }),
           onError: recordError,
         })
       }

@@ -75,6 +75,15 @@ describe('XHTKJ connect', () => {
     expect(filter.optionalServices).toEqual([XHTKJ_DEVICE_SERVICE, DEVICE_INFORMATION_SERVICE])
   })
 
+  it('pins the scan to a specific unit by advertised name', async () => {
+    const h = harness(29, { bleName: 'ANKNI ZKRXB' })
+    await h.backend.connect(signal())
+
+    const filter = h.transport.requests[0]!
+    expect(filter.name).toBe('ANKNI ZKRXB')
+    expect(filter.services).toEqual([XHTKJ_ADVERTISING_SERVICE])
+  })
+
   it('reads the product id and initialises the session', async () => {
     const h = harness(29)
     await h.backend.connect(signal())

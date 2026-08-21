@@ -95,6 +95,12 @@ export interface XhtkjBackendOptions {
   readonly name?: string
   readonly clock: Clock
   readonly transport: BleTransport
+  /**
+   * Advertised name to scan for. The family service UUID alone matches every
+   * 谜姬-family toy; a specific unit (dual-motor, rotation, etc.) is targeted
+   * by its name when several are around.
+   */
+  readonly bleName?: string
   readonly minWriteIntervalMs?: number
   readonly onError?: (error: unknown) => void
 }
@@ -176,6 +182,7 @@ export class XhtkjBackend implements DeviceBackend {
       // Only 0xd34e is advertised; the control and info services are not.
       services: [XHTKJ_ADVERTISING_SERVICE],
       optionalServices: [XHTKJ_DEVICE_SERVICE, DEVICE_INFORMATION_SERVICE],
+      ...(this.options.bleName === undefined ? {} : { name: this.options.bleName }),
     }, signal)
     this.peripheral = peripheral
     this.disconnectOff = peripheral.onDisconnect(() => { this.handleLinkLost() })
