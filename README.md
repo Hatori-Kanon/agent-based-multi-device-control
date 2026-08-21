@@ -95,32 +95,74 @@ M0 的 mock 刻意分成两类，因为它们的失效模式完全不同：
 
 Web Bluetooth 只存在于渲染进程，所以 BLE 跑在一个隐藏 worker 窗口里，主进程通过桥接驱动它。零原生依赖，Windows 开箱可用。已核对 Chromium 的 GATT 黑名单：郊狼的 `0x180C`/`0x180A`/`0x150A`/`0x150B`/`0x1500` 都不在其中。
 
-会出错的部分（十六进制转换、每特征共享一个订阅、断连扇出、句柄记账）都在 `bridge.ts` 里，用假桥接做了 14 条单测；剩下的 Electron 胶水（`executeJavaScript` 带 user gesture、`select-bluetooth-device`）无法在无显示器无硬件的环境里执行。
+**设备选择不抢答**：Electron 的 `select-bluetooth-device` 会随发现进度多次触发，若在空列表上回调空串会立刻取消请求——正是郊狼开机却连接失败的常见原因。所以现在会先收集 3 秒再按名字/服务择优，选不到再重试一次，仍无结果才报可读错误。
+
+会出错的部分（十六进制转换、每特征共享一个订阅、断连扇出、句柄记账、重试语义）都在 `bridge.ts` 里用假桥接做了 19 条单测；剩下的 Electron 胶水（`executeJavaScript` 带 user gesture、`select-bluetooth-device` 事件本身）无法在无显示器无硬件的环境里执行。
 
 ## 运行
 
-需要 Node ≥ 22.19 与 pnpm 10。
+需要 Node ≥ 22.19 与 pnpm 10。**首次安装不要用 `ELECTRON_SKIP_BINARY_DOWNLOAD`**——沙箱内开发环境用了它，导致 Electron 运行时从未下载，`pnpm install` 一次即可补齐。
 
 ```powershell
 pnpm install
 pnpm run check          # typecheck + test
 ```
 
-启动桌面外壳：
+**一键启动控制台**（构建 + 启动 Electron 控制台窗口；依赖安装、lockfile 调和、Electron 二进制恢复全自动）：
 
 ```powershell
+.\start.bat
+```
+
+**没有 GPU 桌面 / 只想在浏览器里测**（纯 Node，mock 设备，无需 Electron，自动打开浏览器）：
+
+```powershell
+.\start-dev.bat
+```
+
+手动方式：`pnpm --filter @embodied/desktop dev`（或先设 `EMBODIED_DASHBOARD_PORT` 指定端口）。它会打印带 token 的控制台地址，粘贴到浏览器。
+
+等价的手动方式：
+
+```powershell
+$env:EMBODIED_DATA_DIR = "E:\embodied-data"   # 可选：固定数据目录，方便找审计日志
 pnpm --filter @embodied/desktop start
 ```
 
-界面会显示全局热键与 `POST /panic` 地址。急停凭据写在 `<userData>/embodied/state/panic.json`（已 gitignore）；用 `EMBODIED_DATA_DIR` 可改数据目录。
+**只调试一台 BLE 设备时**，把另一个 BLE 后端关掉，省得它空扫两轮：
 
-点"试跑"会在对应通道跑 15 秒的 `wave` 包络——用来手工确认整条链路（策略校验 → 调度 → 串行写入 → 审计）真的通了。郊狼开机并允许蓝牙后会作为 `coyote` 出现；它没连上也不影响 app 启动，mock 设备照常可用。
+```powershell
+$env:EMBODIED_ENABLE_XHTKJ = "0"   # 只有郊狼时
+# 或 $env:EMBODIED_ENABLE_COYOTE = "0"   # 只有谜姬时
+$env:EMBODIED_WITH_BUTTPLUG = "0"  # 没有 Buttplug 设备时，跳过 Intiface 探测
+```
+
+MonsterParty 中继需要分享链接 token：`$env:EMBODIED_MONSTERPARTY_TOKEN = "<token>"`。
+
+## 控制台（HTTP + 静态网页）
+
+Electron 窗口加载的就是控制台网页，它由运行时内置的 HTTP 服务器提供（默认 `127.0.0.1`，端口随机，启动日志会打印带 token 的完整地址）。**同一个网页也可以直接在任何浏览器打开**——桌面窗口只是浏览器的一个壳。
+
+- **这是最终终端的雏形**：HTTP API（`/api/snapshot`、`/api/panic`、`/api/unlock`、`/api/cap`、`/api/pattern`、`/api/stop`、`/api/connect`、`/api/scan`、`/api/waveforms/*`、`/api/audit`）就是终端的能力面，M4b 的 Android WebView / 局域网手机浏览器复用的就是这套接口和这份静态 UI，零改动。UI 是纯静态三个文件（`apps/desktop/src/ui/`），无框架无构建。
+- 所有请求都要 `x-control-token`；凭据写在 `<dataDir>/state/dashboard.json`。
+- 带外急停（`POST /panic`）是**独立服务器、独立 token**，即使控制台出问题也不受影响。
+- 控制台功能：设备卡片（生命周期、重连/扫描）、每通道强度/脉宽/时长上限滑块（改动即下发郊狼 `BF` 并审计）、波形下拉选择、15 秒试跑与自定义模式（prompt 依次问模式/强度/时长/周期/抖动）、波形库（导入 hex、会话→库提升）、审计日志尾部、大急停按钮 + LOCKED 横幅。
+
+点"试跑"会在对应通道跑 15 秒的 `wave` 包络——用来手工确认整条链路（策略校验 → 调度 → 串行写入 → 审计）真的通了。郊狼开机并允许蓝牙后会作为 `coyote` 出现，谜姬作为 `xhtkj`；连接失败或断开的设备会显示「重连」按钮，不必重启 app。
+
+## 物理调试顺序
+
+1. **不接设备，先验证急停**：mock 设备试跑 → `Ctrl+Alt+X` → 锁定横幅 + 归零 → 锁定期间试跑被拒 → 解锁 → 审计日志里有 `panic`。
+2. **上限先压到 5** 再连接真机（郊狼的 `BF` 硬件软上限在连接时按 policy 写入，之后改滑块会重写）。
+3. 郊狼开蓝牙但**别开官方 App**（BLE 一次只允许一个主连接）。
+4. 逐台验证：先只动一个通道，感受上限收紧/放宽的差别，再动第二个通道确认互不干扰。
+5. 拔掉设备或关蓝牙，确认设备变 `failed`、输出归零、点「重连」能恢复。
 
 ## 测试
 
 ```
 packages/core    249 passed
-apps/desktop      64 passed
+apps/desktop      68 passed
 ```
 
 M0 的四项验收：

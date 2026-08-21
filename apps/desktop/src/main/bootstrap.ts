@@ -26,8 +26,9 @@ import {
   type SerializedWaveform,
 } from '@embodied/core'
 import { IntifaceProcess, type IntifaceAvailability } from './intiface.ts'
+import { DashboardServer, type DashboardDeps } from './dashboard.ts'
 import { NodeTextSocketTransport } from './node-socket.ts'
-import { FileAppendOnlyStore, FileDocumentStore } from './node-storage.ts'
+import { FileAppendOnlyStore, FileDocumentStore, readAuditTail } from './node-storage.ts'
 import { PanicServer } from './panic-server.ts'
 
 export interface HostRuntimeOptions {
@@ -39,6 +40,16 @@ export interface HostRuntimeOptions {
   readonly panicPort?: number
   /** Skip the HTTP endpoint entirely (used by tests that do not need it). */
   readonly withPanicServer?: boolean
+  /** Reuse an existing dashboard token; a fresh one is generated when omitted. */
+  readonly dashboardToken?: string
+  readonly dashboardHost?: string
+  readonly dashboardPort?: number
+  /** Absolute directory of the static console files. */
+  readonly dashboardStaticDir?: string
+  /** In-memory console files (bundled by the headless dev server). */
+  readonly dashboardStaticFiles?: Readonly<Record<string, string>>
+  /** Skip the control console entirely (used by tests that do not need it). */
+  readonly withDashboard?: boolean
   /** Register the simulated devices. Defaults to true. */
   readonly withMockDevices?: boolean
   /**
@@ -48,6 +59,10 @@ export interface HostRuntimeOptions {
    * not have the box powered on, and the rest of the runtime is still useful.
    */
   readonly bleTransport?: BleTransport
+  /** Register the Coyote backend over BLE. Defaults to true when BLE is present. */
+  readonly withCoyote?: boolean
+  /** Register the 谜姬 direct-BLE backend. Defaults to true when BLE is present. */
+  readonly withXhtkj?: boolean
   /**
    * MonsterParty share-link token.
    *
@@ -71,6 +86,9 @@ export interface HostRuntime {
   readonly documents: FileDocumentStore
   readonly panicToken: string
   readonly panicAddress: { host: string; port: number } | undefined
+  /** The control console's token and bind address. */
+  readonly dashboardToken: string
+  readonly dashboardAddress: { host: string; port: number } | undefined
   /** Whether an Intiface engine was found, and who owns it. */
   readonly intiface: { availability: IntifaceAvailability; url: string; owned: boolean }
   snapshot(): RegistrySnapshot
@@ -123,17 +141,26 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
   const policy = new PolicyStore()
   const waveforms = new WaveformLibrary()
 
+  // Keep the most recent failures visible to the console UI. Errors otherwise
+  // only reach the terminal, which an operator looking at the window never sees.
+  const recentErrors: { ts: number; message: string }[] = []
+  const recordError = (error: unknown): void => {
+    recentErrors.push({ ts: clock.now(), message: error instanceof Error ? error.message : String(error) })
+    if (recentErrors.length > 20) recentErrors.shift()
+    onError(error)
+  }
+
   // Restore anything the operator promoted in an earlier session.
   const savedWaveforms = await documents.read('waveforms')
   if (savedWaveforms !== undefined) {
     try {
       waveforms.loadLibrary(JSON.parse(savedWaveforms) as SerializedWaveform[])
     } catch (error) {
-      onError(error)
+      recordError(error)
     }
   }
 
-  const registry = new DeviceRegistry({ clock, audit, policy, waveforms, onError })
+  const registry = new DeviceRegistry({ clock, audit, policy, waveforms, onError: recordError })
 
   const connectIds: string[] = []
   if (options.withMockDevices !== false) {
@@ -143,21 +170,25 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     }
   }
   if (options.bleTransport !== undefined) {
-    const coyote = new CoyoteBackend({
-      clock,
-      transport: options.bleTransport,
-      // Read fresh on every call so a cap change reaches the hardware.
-      maxPercent: channel => policy.get('coyote', channel).maxPercent,
-      maxWaveIntensity: channel => policy.get('coyote', channel).maxWaveIntensity,
-      onError,
-    })
-    registry.register(coyote)
-    connectIds.push(coyote.id)
+    if (options.withCoyote !== false) {
+      const coyote = new CoyoteBackend({
+        clock,
+        transport: options.bleTransport,
+        // Read fresh on every call so a cap change reaches the hardware.
+        maxPercent: channel => policy.get('coyote', channel).maxPercent,
+        maxWaveIntensity: channel => policy.get('coyote', channel).maxWaveIntensity,
+        onError: recordError,
+      })
+      registry.register(coyote)
+      connectIds.push(coyote.id)
+    }
 
-    // Direct BLE to the 谜姬 family: no share link, no vendor server.
-    const xhtkj = new XhtkjBackend({ clock, transport: options.bleTransport, onError })
-    registry.register(xhtkj)
-    connectIds.push(xhtkj.id)
+    if (options.withXhtkj !== false) {
+      // Direct BLE to the 谜姬 family: no share link, no vendor server.
+      const xhtkj = new XhtkjBackend({ clock, transport: options.bleTransport, onError: recordError })
+      registry.register(xhtkj)
+      connectIds.push(xhtkj.id)
+    }
   }
 
   if (options.monsterPartyToken !== undefined && options.monsterPartyToken.trim().length > 0) {
@@ -166,13 +197,15 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       sockets: new NodeTextSocketTransport(),
       sessionToken: options.monsterPartyToken,
       userAgent: 'embodied-roleplay/0.0 (+local)',
-      onError,
+      onError: recordError,
     })
     registry.register(relay)
     connectIds.push(relay.id)
   }
 
-  const intifaceProcess = new IntifaceProcess({ onError })
+  // The probe is expected to fail when no engine is installed; surface it on
+  // the terminal, not in the console's error panel (noise for most operators).
+  const intifaceProcess = new IntifaceProcess({ onError: error => { console.error('[embodied] Intiface probe:', error) } })
   let intifaceAvailability: IntifaceAvailability = 'unavailable'
   if (options.withButtplug !== false) {
     intifaceAvailability = await intifaceProcess.ensure()
@@ -184,7 +217,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
         version: 4,
         // Give plugged-in toys a chance to appear without an explicit scan.
         scanOnConnectMs: 3_000,
-        onError,
+        onError: recordError,
       })
       registry.register(buttplug)
       connectIds.push(buttplug.id)
@@ -196,7 +229,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     try {
       await registry.connect(id, controller.signal)
     } catch (error) {
-      onError(error)
+      recordError(error)
     }
   }
 
@@ -213,11 +246,78 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       ...(options.panicPort === undefined ? {} : { port: options.panicPort }),
       onPanic: panic,
       onStatus: () => registry.snapshot(),
-      onError,
+      onError: recordError,
     })
     panicAddress = await panicServer.start()
     // The phone page needs this to reach /panic. It is gitignored.
     await documents.write('panic', JSON.stringify({ token: panicToken, ...panicAddress }, null, 2))
+  }
+
+  // ── Control console (the UI and its JSON API) ──────────────────────────
+  const dashboardToken = options.dashboardToken ?? randomBytes(24).toString('base64url')
+  let dashboardServer: DashboardServer | undefined
+  let dashboardAddress: { host: string; port: number } | undefined
+
+  const dashboardDeps: DashboardDeps = {
+    snapshot: () => registry.snapshot(),
+    panic,
+    unlock: async note => { await registry.unlock('human', note) },
+    setCap: async (deviceId, channelId, patch) => {
+      await registry.setPolicyByHuman(deviceId, channelId, patch)
+    },
+    demo: async (deviceId, channelId) => {
+      await registry.runPattern('human', {
+        deviceId,
+        channelId,
+        envelope: { preset: 'wave', minPercent: 5, maxPercent: 20, periodMs: 2_000, jitter: 10 },
+        durationSec: 15,
+      })
+    },
+    pattern: async (deviceId, channelId, envelope, durationSec) => {
+      const presets = ['steady', 'pulse', 'wave', 'random', 'ramp'] as const
+      if (!presets.includes(envelope.preset as (typeof presets)[number])) {
+        throw new Error(`unknown envelope preset: ${envelope.preset}`)
+      }
+      await registry.runPattern('human', {
+        deviceId,
+        channelId,
+        envelope: { ...envelope, preset: envelope.preset as (typeof presets)[number] },
+        durationSec,
+      })
+    },
+    stop: async (deviceId, channelId) => { await registry.stop('human', deviceId, channelId) },
+    connect: async deviceId => { await registry.connect(deviceId, controller.signal) },
+    scan: async (deviceId, durationMs) => { await registry.scan('human', deviceId, durationMs, controller.signal) },
+    listWaveforms: () => waveforms.list(),
+    importWaveform: async (name, frames) => {
+      const imported = waveforms.importFrames(name, frames)
+      await saveWaveforms()
+      return { id: imported.id, name: imported.name, frames: imported.frames.length }
+    },
+    promoteWaveform: async id => {
+      waveforms.promoteByHuman(id)
+      await saveWaveforms()
+      return waveforms.list()
+    },
+    setWaveform: async (deviceId, channelId, waveformId) => {
+      await registry.setWaveform('human', deviceId, channelId, waveformId)
+    },
+    auditTail: async limit => readAuditTail(join(options.dataDir, 'audit', 'device.jsonl'), limit),
+    recentErrors: () => recentErrors,
+  }
+
+  if (options.withDashboard !== false) {
+    dashboardServer = new DashboardServer({
+      deps: dashboardDeps,
+      token: dashboardToken,
+      ...(options.dashboardHost === undefined ? {} : { host: options.dashboardHost }),
+      ...(options.dashboardPort === undefined ? {} : { port: options.dashboardPort }),
+      ...(options.dashboardStaticDir === undefined ? {} : { staticDir: options.dashboardStaticDir }),
+      ...(options.dashboardStaticFiles === undefined ? {} : { staticFiles: options.dashboardStaticFiles }),
+      onError,
+    })
+    dashboardAddress = await dashboardServer.start()
+    await documents.write('dashboard', JSON.stringify({ token: dashboardToken, ...dashboardAddress }, null, 2))
   }
 
   let stopped = false
@@ -232,6 +332,8 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     documents,
     panicToken,
     panicAddress,
+    dashboardToken,
+    dashboardAddress,
     intiface: {
       availability: intifaceAvailability,
       url: intifaceProcess.url,
@@ -245,6 +347,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       stopped = true
       controller.abort()
       await panicServer?.stop()
+      await dashboardServer?.stop()
       await registry.shutdown()
       // Only stops an engine this process started.
       await intifaceProcess.stop()

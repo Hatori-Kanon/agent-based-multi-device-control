@@ -447,13 +447,18 @@ describe('Buttplug through the registry', () => {
     // 30% of the advertised 1-20 range.
     expect(sent).toMatchObject({ Command: { Vibrate: { Value: 6 } } })
 
-    const over = await safetyErrorFrom(h.registry.runPattern('model', {
+    // Over-cap authored content clamps to the channel cap instead of refusing.
+    await h.registry.runPattern('model', {
       deviceId: 'buttplug',
       channelId: '0:0:vibrate',
       envelope: { preset: 'steady', minPercent: 90, maxPercent: 90, periodMs: 1_000, jitter: 0 },
       durationSec: 20,
-    }))
-    expect(over.code).toBe('POLICY_ENVELOPE')
+    })
+    h.clock.advance(100)
+    await h.registry.settled()
+    const clamped = sentBody(h.sockets.socket!, 'OutputCmd')
+    // 90% requested on a 40-capped channel runs at 40%: 0.4 of 1-20.
+    expect(clamped).toMatchObject({ Command: { Vibrate: { Value: 8 } } })
   })
 
   it('refuses a scan while a human has output locked', async () => {

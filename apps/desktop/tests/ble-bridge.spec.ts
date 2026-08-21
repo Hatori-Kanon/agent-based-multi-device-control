@@ -7,7 +7,7 @@ const NOTIFY_REF: BleCharacteristicRef = { service: COYOTE_SERVICE, characterist
 
 interface Recorded {
   readonly kind: 'request' | 'read' | 'write' | 'subscribe' | 'unsubscribe' | 'disconnect'
-  readonly handle?: string
+  readonly handle?: string | undefined
   readonly hex?: string
   readonly withoutResponse?: boolean
   readonly ref?: BleCharacteristicRef
@@ -19,12 +19,52 @@ class FakeBridge implements BleBridge {
   requestResult: { handle: string; name?: string } = { handle: 'h1', name: 'Coyote' }
   readResult = '025e041d0001'
   failNext: Error | undefined
+  failRequests = 0
+  /** When set, `selectDevice` is offered and pops one answer per call. */
+  selections: Array<string | undefined> = []
+  /** When true, the last selection answer repeats instead of being consumed. */
+  repeatSelection = true
+  /** Candidates the fake chooser reports per selection. */
+  selectionSize = 0
+  /** Raw platform error the fake chooser reports. */
+  selectionError: string | undefined
+  /** Trace the fake chooser reports. */
+  trace: readonly string[] = ['called', 'executor']
   private notifyListeners = new Set<(event: { handle: string; ref: BleCharacteristicRef; hex: string }) => void>()
   private disconnectListeners = new Set<(event: { handle: string }) => void>()
 
-  request(filter: BleFilter): Promise<{ handle: string; name?: string }> {
-    this.calls.push({ kind: 'request', filter })
+  get lastSelectionSize(): number {
+    return this.selectionSize
+  }
+
+  get lastSelectionError(): string | undefined {
+    return this.selectionError
+  }
+
+  get lastSelectionTrace(): readonly string[] | undefined {
+    return this.trace
+  }
+
+  request(filter: BleFilter, deviceId?: string): Promise<{ handle: string; name?: string }> {
+    this.calls.push({ kind: 'request', filter, handle: deviceId })
+    if (this.failRequests > 0) {
+      this.failRequests -= 1
+      return Promise.reject(new Error('request refused'))
+    }
     return Promise.resolve(this.requestResult)
+  }
+
+  /** Only offered when a test configured selections: mirrors a real chooser. */
+  selectDevice?: (filter: BleFilter, signal: AbortSignal) => Promise<string | undefined>
+
+  withChooser(answers: Array<string | undefined>, selectionSize = 0): void {
+    this.selectionSize = selectionSize
+    this.selections = [...answers]
+    this.selectDevice = async (_filter: BleFilter, _signal: AbortSignal): Promise<string | undefined> => {
+      if (this.selections.length === 0) return undefined
+      if (this.repeatSelection && this.selections.length === 1) return this.selections[0]
+      return this.selections.shift()
+    }
   }
 
   read(handle: string, ref: BleCharacteristicRef): Promise<string> {
@@ -113,6 +153,89 @@ describe('BridgedBleTransport', () => {
     expect(peripheral.id).toBe('h1')
     expect(peripheral.name).toBe('Coyote')
     expect(peripheral.connected).toBe(true)
+  })
+
+  it('retries once when the chooser finds nothing on the first pass', async () => {
+    const bridge = new FakeBridge()
+    bridge.withChooser([undefined, 'found-late'])
+    bridge.repeatSelection = false
+    const transport = new BridgedBleTransport(bridge)
+    const filter: BleFilter = { name: '47L121000', services: [COYOTE_SERVICE] }
+
+    const peripheral = await transport.request(filter, signal())
+
+    // A miss never reaches the OS; the second pass pinned the found device.
+    expect(bridge.calls).toHaveLength(1)
+    expect(bridge.calls[0]?.handle).toBe('found-late')
+    expect(peripheral.connected).toBe(true)
+  })
+
+  it('explains itself when nothing matches after both attempts', async () => {
+    const bridge = new FakeBridge()
+    bridge.withChooser([undefined, undefined])
+    bridge.repeatSelection = false
+    const transport = new BridgedBleTransport(bridge)
+    const filter: BleFilter = { name: '47L121000', services: [COYOTE_SERVICE] }
+
+    let caught: unknown
+    try {
+      await transport.request(filter, signal())
+    } catch (error) {
+      caught = error
+    }
+    expect(caught).toBeInstanceOf(SafetyError)
+    expect((caught as SafetyError).message).toContain('2 attempt(s)')
+    expect((caught as SafetyError).message).toContain('47L121000')
+    // Nothing was ever sent to the OS.
+    expect(bridge.calls).toHaveLength(0)
+  })
+
+  it('distinguishes "no Bluetooth at all" from "toy not advertising" in the failure message', async () => {
+    // Zero candidates seen: the Bluetooth stack produced nothing at all, which
+    // is a different troubleshooting step than a toy that is simply off.
+    const empty = new FakeBridge()
+    empty.withChooser([undefined, undefined], 0)
+    empty.repeatSelection = false
+    const emptyTransport = new BridgedBleTransport(empty)
+    let caught: unknown
+    try {
+      await emptyTransport.request({ name: '47L121000', services: [COYOTE_SERVICE] }, signal())
+    } catch (error) {
+      caught = error
+    }
+    expect((caught as SafetyError).message).toContain('no Bluetooth devices were found at all')
+
+    // Some candidates, none matching: the stack works, the toy does not exist
+    // in range. The console should say so rather than hinting at Bluetooth.
+    // Counts accumulate across both scan attempts (3 seen per attempt).
+    const some = new FakeBridge()
+    some.withChooser([undefined, undefined], 3)
+    some.repeatSelection = false
+    const someTransport = new BridgedBleTransport(some)
+    try {
+      await someTransport.request({ name: '47L121000', services: [COYOTE_SERVICE] }, signal())
+    } catch (error2) {
+      caught = error2
+    }
+    expect((caught as SafetyError).message).toContain('found 6 device(s) but none matched')
+  })
+
+  it('surfaces the platform refusal when requestDevice fails outright', async () => {
+    // Adapter off/unavailable: the OS rejects the request immediately and no
+    // candidates ever arrive. The console must show the platform's own words.
+    const bridge = new FakeBridge()
+    bridge.withChooser([undefined, undefined], 0)
+    bridge.selectionError = 'NotFoundError: Bluetooth adapter not available'
+    bridge.repeatSelection = false
+    const transport = new BridgedBleTransport(bridge)
+    let caught: unknown
+    try {
+      await transport.request({ name: '47L121000', services: [COYOTE_SERVICE] }, signal())
+    } catch (error) {
+      caught = error
+    }
+    expect((caught as SafetyError).message).toContain('adapter not available')
+    expect((caught as SafetyError).message).toContain('no Bluetooth devices were found at all')
   })
 
   it('carries the optional services a device does not advertise', async () => {

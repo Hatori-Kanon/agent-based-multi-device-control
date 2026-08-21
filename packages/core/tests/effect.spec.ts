@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { assertValidEnvelope, createEnvelopeSampler, EffectRunner, FakeClock, SafetyError, type Envelope } from '../src/index.ts'
+import { assertValidEnvelope, clampEnvelopeToCap, createEnvelopeSampler, EffectRunner, FakeClock, SafetyError, type Envelope } from '../src/index.ts'
 
 function steady(percent: number): Envelope {
   return { preset: 'steady', minPercent: percent, maxPercent: percent, periodMs: 1_000, jitter: 0 }
@@ -92,6 +92,23 @@ describe('envelope sampler', () => {
 describe('envelope validation', () => {
   it('rejects a max above the channel cap', () => {
     expect(() => { assertValidEnvelope(steady(50), 40) }).toThrow(/must not exceed 40/)
+  })
+
+  it('clamps an authored envelope to the cap instead of refusing it', () => {
+    const clamped = clampEnvelopeToCap({ preset: 'wave', minPercent: 5, maxPercent: 50, periodMs: 1_000, jitter: 10 }, 40)
+    expect(clamped.maxPercent).toBe(40)
+    expect(clamped.minPercent).toBe(5)
+    // Shape stays untouched: a clamped envelope must still validate.
+    expect(() => assertValidEnvelope(clamped, 40)).not.toThrow()
+  })
+
+  it('moves the floor down too when the cap bites below it', () => {
+    expect(clampEnvelopeToCap(steady(45), 20)).toEqual({ ...steady(45), minPercent: 20, maxPercent: 20 })
+  })
+
+  it('returns the envelope untouched when it already fits', () => {
+    const envelope = steady(30)
+    expect(clampEnvelopeToCap(envelope, 40)).toBe(envelope)
   })
 
   it('rejects inverted bounds', () => {

@@ -106,21 +106,27 @@ describe('policy is enforced before the transport is touched', () => {
     expect(error.message).toMatch(/indefinite/)
   })
 
-  it('applies caps per channel', async () => {
+  it('plays authored patterns inside the cap instead of refusing them', async () => {
     const h = createHarness()
     await h.registry.connect('toy', signal())
     await h.registry.setPolicyByHuman('toy', 'a', { maxPercent: 10 })
 
-    const error = await safetyErrorFrom(
-      h.registry.runPattern('model', { deviceId: 'toy', channelId: 'a', envelope: steady(30), durationSec: 5 }),
-    )
-    expect(error.code).toBe('POLICY_ENVELOPE')
+    // An envelope that asks for 30 on a 10-capped channel runs at 10: the cap
+    // is the human's boundary, so authored content is tightened to it.
+    await h.registry.runPattern('model', { deviceId: 'toy', channelId: 'a', envelope: steady(30), durationSec: 5 })
+    h.clock.advance(50)
+    await h.registry.settled()
+    expect(h.toy.deviceLevel('a')).toBe(10)
 
     // The sibling channel still has the default cap.
     await h.registry.runPattern('model', { deviceId: 'toy', channelId: 'b', envelope: steady(30), durationSec: 5 })
     h.clock.advance(50)
     await h.registry.settled()
     expect(h.toy.deviceLevel('b')).toBe(30)
+
+    // The audit note records what actually ran: the clamped envelope.
+    const run = h.records().find(record => record.action === 'run_pattern' && record.result === 'ok')
+    expect(run?.detail?.envelope).toMatchObject({ minPercent: 10, maxPercent: 10 })
 
     const change = h.records().find(record => record.action === 'policy_change')
     expect(change?.actor).toBe('human')
@@ -410,8 +416,9 @@ describe('audit trail', () => {
     const h = createHarness()
     await h.registry.connect('toy', signal())
     await h.registry.runPattern('model', { deviceId: 'toy', channelId: 'a', envelope: steady(30), durationSec: 5 })
+    // Over-cap content now clamps; a malformed shape still refuses.
     await safetyErrorFrom(
-      h.registry.runPattern('model', { deviceId: 'toy', channelId: 'a', envelope: steady(90), durationSec: 5 }),
+      h.registry.runPattern('model', { deviceId: 'toy', channelId: 'a', envelope: { ...steady(30), preset: 'wobble' as never }, durationSec: 5 }),
     )
     await h.registry.settled()
 

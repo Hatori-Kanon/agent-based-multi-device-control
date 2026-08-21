@@ -10,6 +10,10 @@
   let nextHandle = 1
 
   const host = window.__bleHost
+  host?.diag('worker loaded; navigator.bluetooth = ' + (navigator.bluetooth ? 'present' : 'MISSING'))
+  void (navigator.bluetooth
+    ? navigator.bluetooth.getAvailability().then(v => host?.diag(`getAvailability() (startup) = ${v}`)).catch(() => {})
+    : undefined)
 
   function key(service, characteristic) {
     return `${String(service).toLowerCase()}/${String(characteristic).toLowerCase()}`
@@ -46,23 +50,67 @@
     return found
   }
 
-  window.__ble = {
-    async request(filter) {
-      if (!navigator.bluetooth) throw new Error('Web Bluetooth is unavailable in this build')
-      const services = Array.isArray(filter.services) ? filter.services : []
-      const optional = Array.isArray(filter.optionalServices) ? filter.optionalServices : []
-      const match = {}
-      if (filter.name) match.name = filter.name
-      if (filter.namePrefix) match.namePrefix = filter.namePrefix
-      // Only advertised services may appear in the match, or nothing is found.
-      if (!filter.name && !filter.namePrefix && services.length > 0) match.services = services
+  function matchFor(filter) {
+    const services = Array.isArray(filter.services) ? filter.services : []
+    const match = {}
+    if (filter.name) match.name = filter.name
+    if (filter.namePrefix) match.namePrefix = filter.namePrefix
+    // Only advertised services may appear in the match, or nothing is found.
+    if (!filter.name && !filter.namePrefix && services.length > 0) match.services = services
+    return match
+  }
 
-      const device = await navigator.bluetooth.requestDevice({
-        filters: [match],
-        // Access is denied to any service that was not declared up front.
-        optionalServices: [...new Set([...services, ...optional])],
-      })
-      const server = await device.gatt.connect()
+  function optionalFor(filter) {
+    const services = Array.isArray(filter.services) ? filter.services : []
+    const optional = Array.isArray(filter.optionalServices) ? filter.optionalServices : []
+    // Access is denied to any service that was not declared up front.
+    return [...new Set([...services, ...optional])]
+  }
+
+  /** stringify a thrown value without losing its name (DOMException prone to "[object Object]") */
+  function describe(error) {
+    const name = error && typeof error.name === 'string' ? error.name : ''
+    const message = error && typeof error.message === 'string' ? error.message : String(error)
+    return name ? `${name}: ${message}` : message
+  }
+
+  window.__ble = {
+    // Select AND connect in one call. The platform chooser stays pending until
+    // the main process answers it (grace window on the `select-bluetooth-device`
+    // events); once requestDevice resolves, the device's gatt is connected
+    // here, in the same context, so nothing has to survive the boundary.
+    async connect(filter) {
+      if (!navigator.bluetooth) throw new Error('Web Bluetooth is unavailable in this build')
+      // Adapter visibility is the single most useful diagnostic: on Windows a
+      // machine can show a perfectly healthy adapter in Device Manager while
+      // Chromium is bound to a different, broken one (commonly a shadowed
+      // duplicate). False or throwing means the page cannot scan at all.
+      try {
+        const available = await navigator.bluetooth.getAvailability()
+        host?.diag(`getAvailability() = ${available}`)
+        if (available === false) {
+          throw new Error('Bluetooth adapter is not available to this page; a broken or shadowed adapter may be bound in Windows (disable duplicate Bluetooth adapters in Device Manager)')
+        }
+      } catch (error) {
+        host?.diag(`getAvailability() failed: ${describe(error)}`)
+      }
+      const match = matchFor(filter)
+      let device
+      try {
+        device = await navigator.bluetooth.requestDevice({ filters: [match], optionalServices: optionalFor(filter) })
+        host?.diag(`connect: chooser approved device ${device.id}`)
+      } catch (error) {
+        host?.diag(`connect: requestDevice rejected: ${describe(error)}`)
+        throw new Error(`requestDevice failed: ${describe(error)}`)
+      }
+      let server
+      try {
+        server = await device.gatt.connect()
+      } catch (error) {
+        host?.diag(`connect: gatt connect failed: ${describe(error)}`)
+        throw new Error(`GATT connect failed: ${describe(error)}`)
+      }
+      host?.diag('connect: gatt connected')
       const handle = `ble-${nextHandle++}`
       links.set(handle, { device, server, chars: new Map(), notifiers: new Map() })
 

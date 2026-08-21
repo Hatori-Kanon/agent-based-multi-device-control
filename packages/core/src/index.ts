@@ -32,6 +32,7 @@ export type { AuditActor, AuditFailureHandler, AuditRecord, AuditResult } from '
 
 export {
   assertValidEnvelope,
+  clampEnvelopeToCap,
   createEnvelopeSampler,
   DEFAULT_TICK_MS,
   EffectRunner,

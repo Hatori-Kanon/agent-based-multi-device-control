@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld('host', {
   promoteWaveform: (id: string) => ipcRenderer.invoke('host:promote-waveform', id),
   audit: () => ipcRenderer.invoke('host:audit'),
   scan: (deviceId: string, durationMs?: number) => ipcRenderer.invoke('host:scan', deviceId, durationMs),
+  connect: (deviceId: string) => ipcRenderer.invoke('host:connect', deviceId),
   onChanged: (callback: () => void) => {
     const listener = (): void => { callback() }
     ipcRenderer.on('host:changed', listener)

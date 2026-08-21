@@ -13,8 +13,35 @@ import type { BleCharacteristicRef, BleFilter, BlePeripheral, BleTransport } fro
 
 /** What the renderer worker offers. All payloads are JSON-serialisable. */
 export interface BleBridge {
-  /** Request and connect one matching device. */
-  request(filter: BleFilter): Promise<{ handle: string; name?: string }>
+  /**
+   * Request and connect one matching device.
+   *
+   * `deviceId` pins the choice when the platform chooser already ran; omitted,
+   * the worker asks the OS to pick.
+   */
+  request(filter: BleFilter, deviceId?: string): Promise<{ handle: string; name?: string }>
+  /**
+   * Open the platform chooser for a filter and resolve with the chosen device
+   * id, or `undefined` when nothing suitable appeared. The caller drives the
+   * retry.
+   */
+  selectDevice?: (filter: BleFilter, signal: AbortSignal) => Promise<string | undefined>
+  /**
+   * How many candidate advertisements the platform produced during the most
+   * recent {@link BleBridge.selectDevice}, so a failure can distinguish
+   * "Bluetooth is off" (zero) from "the toy is not advertising" (some).
+   */
+  readonly lastSelectionSize?: number
+  /**
+   * Raw platform error from the most recent selection — typically the real
+   * reason `requestDevice` was refused (adapter off, unavailable, denied).
+   */
+  readonly lastSelectionError: string | undefined
+  /**
+   * Execution trace of the most recent selection, surfaced in the failure
+   * message because terminal stdout can be buffered and lost.
+   */
+  readonly lastSelectionTrace: readonly string[] | undefined
   /** Read one characteristic, returned as hex. */
   read(handle: string, ref: BleCharacteristicRef): Promise<string>
   write(handle: string, ref: BleCharacteristicRef, hex: string, withoutResponse: boolean): Promise<void>
@@ -145,6 +172,7 @@ export class BridgedBleTransport implements BleTransport {
   private readonly detach: (() => void)[] = []
 
   constructor(private readonly bridge: BleBridge) {
+    console.log(`[ble] BridgedBleTransport constructed; selectDevice: ${typeof bridge.selectDevice}`)
     this.detach.push(bridge.onNotify(event => {
       const peripheral = this.peripherals.get(event.handle)
       if (peripheral === undefined) return
@@ -163,14 +191,59 @@ export class BridgedBleTransport implements BleTransport {
 
   async request(filter: BleFilter, signal: AbortSignal): Promise<BlePeripheral> {
     signal.throwIfAborted()
-    const { handle, name } = await this.bridge.request(filter)
-    const peripheral = new BridgedPeripheral(handle, name, this.bridge)
-    this.peripherals.set(handle, peripheral)
-    if (signal.aborted) {
-      await peripheral.disconnect()
+    console.log(`[ble] transport.request start; chooser: ${this.bridge.selectDevice !== undefined}`)
+
+    // A BLE scan cache takes a moment to populate. Each attempt opens its own
+    // collection window, so a powered-on device does not lose to timing.
+    const attempts = this.bridge.selectDevice === undefined ? 1 : 2
+    let lastError: unknown
+    let totalCandidates = 0
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
       signal.throwIfAborted()
+      try {
+        // Call through the object, never detached: `const chooser = bridge.selectionMethod; chooser(...)` loses `this`, and the method's first `this.` reference throws. The fake in tests did not catch this because it uses an arrow-function property.
+        const deviceId = this.bridge.selectDevice === undefined
+          ? undefined
+          : await this.bridge.selectDevice(filter, signal)
+        totalCandidates += this.bridge.lastSelectionSize ?? 0
+        // A selection that found nothing means "scan again", not "connect to
+        // nothing": skip straight to the next attempt without asking the OS.
+        if (this.bridge.selectDevice !== undefined && deviceId === undefined) continue
+        const { handle, name } = await this.bridge.request(filter, deviceId)
+        const peripheral = new BridgedPeripheral(handle, name, this.bridge)
+        this.peripherals.set(handle, peripheral)
+        if (signal.aborted) {
+          await peripheral.disconnect()
+          signal.throwIfAborted()
+        }
+        return peripheral
+      } catch (error) {
+        lastError = error
+      }
     }
-    return peripheral
+
+    // The candidate count splits the two failure modes: none at all means the
+    // Bluetooth stack itself produced nothing, whereas some-but-unmatched means
+    // the toy is simply not advertising (off, far, or held by another app).
+    // When the platform refused the request outright, its own words belong in
+    // the message too.
+    const platformError = totalCandidates === 0 && this.bridge.lastSelectionError !== undefined
+      ? `; the Bluetooth stack reported: ${this.bridge.lastSelectionError}`
+      : ''
+    const guidance = totalCandidates === 0
+      ? 'no Bluetooth devices were found at all; check that Windows Bluetooth is on and the toy is powered on'
+      : `found ${totalCandidates} device(s) but none matched; make sure the toy is powered on, nearby, and not already connected to another app`
+    const trace = this.bridge.lastSelectionTrace !== undefined && this.bridge.lastSelectionTrace.length > 0
+      ? `; selection trace: [${this.bridge.lastSelectionTrace.join(' | ')}]`
+      : ''
+    const cause = lastError === undefined
+      ? ''
+      : `; inner cause: ${describeUnknown(lastError)}`
+    throw new SafetyError(
+      'NOT_CONNECTED',
+      `no BLE device matched this request after ${attempts} attempt(s)${describeFilter(filter)}; ${guidance}${platformError}${trace}${cause}`,
+    )
   }
 
   /** Drop every peripheral and stop listening to the worker. */
@@ -180,4 +253,25 @@ export class BridgedBleTransport implements BleTransport {
     for (const off of this.detach.splice(0)) off()
     await Promise.all(peripherals.map(peripheral => peripheral.disconnect().catch(() => {})))
   }
+}
+
+/** Human-readable hint about what a filter was looking for. */
+function describeFilter(filter: BleFilter): string {
+  const wanted = filter.name ?? filter.namePrefix ?? filter.services[0]
+  return wanted === undefined ? '' : ` (wanted: ${wanted})`
+}
+
+/**
+ * Best-effort description of a thrown value. DOMException is not an `Error`
+ * instance and its `toString` can degrade to "[object Object]", so pull the
+ * fields that matter first.
+ */
+function describeUnknown(error: unknown): string {
+  if (error === null || error === undefined) return String(error)
+  if (error instanceof Error) return `${error.name}: ${error.message}`
+  const candidate = error as { name?: unknown; message?: unknown }
+  if (typeof candidate.name === 'string' || typeof candidate.message === 'string') {
+    return `${String(candidate.name ?? 'Error')}: ${String(candidate.message ?? '')}`
+  }
+  return String(error)
 }

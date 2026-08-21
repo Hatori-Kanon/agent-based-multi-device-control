@@ -16,7 +16,7 @@
  */
 
 import type { AuditActor, AuditLog } from './audit.ts'
-import { EffectRunner, assertValidEnvelope, type EffectSnapshot, type Envelope } from './effect.ts'
+import { EffectRunner, assertValidEnvelope, clampEnvelopeToCap, type EffectSnapshot, type Envelope } from './effect.ts'
 import { SafetyError } from './errors.ts'
 import { assertLevelWithinPolicy, clampPercentToPolicy, type ChannelPolicy, type PolicyStore } from './policy.ts'
 import { SerialQueue } from './queue.ts'
@@ -325,22 +325,27 @@ export class DeviceRegistry {
 
   /** Run a background envelope on one channel, replacing any effect there. */
   async runPattern(actor: AuditActor, command: PatternCommand): Promise<void> {
+    // Author content plays inside the cap: an envelope that asks for more runs
+    // at the cap (the human's boundary), while malformed shapes still refuse.
+    let envelope = command.envelope
     const detail: Record<string, unknown> = {
       deviceId: command.deviceId,
       channelId: command.channelId,
-      envelope: { ...command.envelope },
+      envelope: { ...envelope },
       durationSec: command.durationSec,
       ...(command.waveformId === undefined ? {} : { waveformId: command.waveformId }),
     }
     try {
       const policy = this.prepare(command.deviceId, command.channelId)
       this.assertDuration(command.durationSec, policy)
-      assertValidEnvelope(command.envelope, policy.maxPercent)
+      envelope = clampEnvelopeToCap(envelope, policy.maxPercent)
+      detail.envelope = { ...envelope }
+      assertValidEnvelope(envelope, policy.maxPercent)
       if (command.waveformId !== undefined) {
         await this.selectWaveform(command.deviceId, command.channelId, command.waveformId)
         detail.waveformIntensityCap = policy.maxWaveIntensity
       }
-      this.channelState(command.deviceId, command.channelId).runner.start(command.envelope, command.durationSec * 1_000)
+      this.channelState(command.deviceId, command.channelId).runner.start(envelope, command.durationSec * 1_000)
     } catch (error) {
       await this.recordFailure(actor, 'run_pattern', detail, error)
       throw error

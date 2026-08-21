@@ -178,6 +178,48 @@ describe('host runtime with a BLE transport', () => {
     expect(xhtkj?.channels.map(channel => channel.id)).toEqual(['primary'])
   })
 
+  it('honours the per-backend enable flags', async () => {
+    const clock = new FakeClock()
+    const transport = new MockBleTransport({ clock, name: COYOTE_BLE_NAME })
+    runtime = await createHostRuntime({
+      dataDir: root,
+      clock,
+      withPanicServer: false,
+      bleTransport: transport,
+      withCoyote: false,
+      withXhtkj: false,
+    })
+
+    const ids = runtime.snapshot().devices.map(device => device.id)
+    expect(ids).not.toContain('coyote')
+    expect(ids).not.toContain('xhtkj')
+    // The mocks are unaffected.
+    expect(ids).toContain('mock-pulse')
+    expect(ids).toContain('mock-hold')
+  })
+
+  it('lets a failed device reconnect through the registry', async () => {
+    const clock = new FakeClock()
+    const transport = new MockBleTransport({ clock, name: COYOTE_BLE_NAME })
+    const errors: unknown[] = []
+    runtime = await createHostRuntime({
+      dataDir: root,
+      clock,
+      withPanicServer: false,
+      bleTransport: transport,
+      onError: error => { errors.push(error) },
+    })
+    const coyote = runtime.snapshot().devices.find(device => device.id === 'coyote')
+    expect(coyote?.lifecycle).toBe('ready')
+
+    // Drop the link, then reconnect without recreating anything.
+    transport.peripheralFor(filter => filter.name === COYOTE_BLE_NAME)!.simulateDisconnect()
+    expect(runtime.snapshot().devices.find(device => device.id === 'coyote')?.lifecycle).toBe('failed')
+
+    await runtime.registry.connect('coyote', new AbortController().signal)
+    expect(runtime.snapshot().devices.find(device => device.id === 'coyote')?.lifecycle).toBe('ready')
+  })
+
   it('registers the relay backend only when a share token is configured', async () => {
     const clock = new FakeClock()
     const without = await createHostRuntime({ dataDir: root, clock, withPanicServer: false })

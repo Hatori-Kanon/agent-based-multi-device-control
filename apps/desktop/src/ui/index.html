@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'">
+<title>Embodied 控制台</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 18px 22px 60px;
+    font: 14px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: #0d0d12; color: #e8e8ee;
+  }
+  header.top { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; flex-wrap: wrap; }
+  h1 { font-size: 17px; margin: 0; letter-spacing: .04em; }
+  .status-pill { font-size: 12px; color: #8a8a96; border: 1px solid #2a2a34; border-radius: 999px; padding: 2px 10px; }
+  .status-pill.on { color: #5fd08a; border-color: #2c5c3d; }
+  .spacer { flex: 1; }
+
+  #panic {
+    font-size: 17px; font-weight: 800; letter-spacing: .08em;
+    background: #8d1230; border: 1px solid #c22b4f; color: #fff;
+    border-radius: 12px; padding: 14px 30px; cursor: pointer;
+  }
+  #panic:hover { background: #a81738; }
+  #panic:active { transform: translateY(1px); }
+
+  #lockBanner {
+    display: none; align-items: center; gap: 12px;
+    background: #3d1420; border: 1px solid #8d2642; border-radius: 10px;
+    padding: 10px 16px; margin-bottom: 16px;
+  }
+  #lockBanner.on { display: flex; }
+  #lockBanner span { flex: 1; }
+  button {
+    font: inherit; color: inherit; background: #23232d; border: 1px solid #3a3a46;
+    border-radius: 8px; padding: 6px 12px; cursor: pointer;
+  }
+  button:hover { background: #2b2b37; }
+  button:disabled { opacity: .4; cursor: default; }
+  button.mini { font-size: 12px; padding: 4px 10px; }
+
+  .device {
+    background: #14141b; border: 1px solid #262631; border-radius: 12px;
+    margin-bottom: 16px; overflow: hidden;
+  }
+  .device > header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 12px 16px; background: #191922; border-bottom: 1px solid #262631;
+  }
+  .device h2 { font-size: 14px; margin: 0; font-weight: 650; }
+  .life { font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid #3a3a46; color: #8a8a96; }
+  .life.ready { color: #5fd08a; border-color: #2c5c3d; }
+  .life.failed { color: #ef8095; border-color: #7d2642; }
+  .life.connecting { color: #e6c267; border-color: #6b5a24; }
+
+  .ch { display: grid; grid-template-columns: 168px 1fr auto; gap: 14px; padding: 14px 16px; align-items: center; }
+  .ch + .ch { border-top: 1px solid #1f1f28; }
+  .ch-name { font-size: 13px; }
+  .ch-name small { display: block; color: #767682; font-size: 11px; margin-top: 1px; }
+
+  .meter { height: 9px; border-radius: 5px; background: #1e1e28; overflow: hidden; margin-bottom: 9px; }
+  .meter i {
+    display: block; height: 100%;
+    background: linear-gradient(90deg, #3d7fc4, #6fb4ef);
+    transition: width .15s linear;
+  }
+  .caps { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; font-size: 11.5px; color: #9a9aa6; }
+  .caps label { display: flex; align-items: center; gap: 6px; }
+  input[type=range] { width: 96px; accent-color: #4d8fd4; }
+  input[type=number] {
+    width: 64px; background: #1b1b24; border: 1px solid #34343f; color: inherit;
+    border-radius: 6px; padding: 3px 7px; font: inherit; font-size: 12px;
+  }
+  select {
+    background: #1b1b24; border: 1px solid #34343f; color: inherit;
+    border-radius: 6px; padding: 3px 6px; font: inherit; font-size: 12px; max-width: 170px;
+  }
+  .val { font-variant-numeric: tabular-nums; color: #d9d9e2; min-width: 40px; }
+  .acts { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .hint { color: #5f5f6a; font-size: 11px; }
+
+  .panel { background: #14141b; border: 1px solid #262631; border-radius: 12px; margin-bottom: 16px; padding: 14px 16px; }
+  .panel h3 { margin: 0 0 10px; font-size: 13px; font-weight: 650; }
+  .panel h3 small { color: #767682; font-weight: 400; margin-left: 8px; }
+
+  .wf-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px; }
+  .wf-card { background: #191922; border: 1px solid #262631; border-radius: 10px; padding: 10px 12px; }
+  .wf-card .row1 { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .wf-card .name { font-weight: 650; font-size: 13px; }
+  .wf-card .scope { font-size: 10.5px; color: #767682; }
+  .wf-card .scope.session { color: #e6c267; }
+  .wf-card .meta { color: #767682; font-size: 11px; margin-top: 4px; }
+  .wf-card .tags { margin-top: 6px; }
+  .tag { font-size: 10px; background: #232330; color: #a8a8b6; border-radius: 5px; padding: 1px 6px; margin-right: 4px; }
+
+  .import-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+  .import-row input[type=text] {
+    background: #1b1b24; border: 1px solid #34343f; color: inherit; border-radius: 6px;
+    padding: 5px 9px; font: inherit; font-size: 12px; width: 180px;
+  }
+  textarea {
+    width: 100%; min-height: 64px; background: #1b1b24; border: 1px solid #34343f;
+    color: inherit; border-radius: 8px; padding: 8px 10px; font: 12px/1.5 ui-monospace, Consolas, monospace;
+  }
+
+  #audit { max-height: 260px; overflow-y: auto; font: 11px/1.6 ui-monospace, Consolas, monospace; background: #0b0b10; border-radius: 8px; padding: 8px 10px; }
+  #audit div { white-space: pre-wrap; word-break: break-all; }
+  .r-rejected { color: #e6c267; }
+  .r-error { color: #ef8095; }
+  .a-human { color: #6fb4ef; }
+  #err { color: #ef8095; min-height: 18px; margin-top: 8px; font-size: 12px; }
+
+  footer { margin-top: 20px; color: #5f5f6a; font-size: 11.5px; }
+  code { background: #1b1b24; padding: 1px 5px; border-radius: 5px; color: #b6b6c4; }
+</style>
+</head>
+<body>
+  <header class="top">
+    <h1>Embodied 控制台</h1>
+    <span class="status-pill" id="conn">连接中…</span>
+    <span class="spacer"></span>
+    <button id="panic">紧急停止</button>
+  </header>
+
+  <div id="lockBanner">
+    <span><strong>输出已被锁定。</strong>所有写入都会被拒绝，直到你在这里解锁。</span>
+    <button id="unlock">解锁</button>
+  </div>
+
+  <div id="devices"></div>
+
+  <div class="panel">
+    <h3>波形库<small>agent 创作的波形存于「会话」作用域；「存入库」是人工动作</small></h3>
+    <div class="import-row">
+      <input type="text" id="wfName" placeholder="波形名称">
+      <button class="mini" id="wfImport">导入</button>
+      <span class="hint">粘贴每帧 16 位十六进制，空白或逗号分隔</span>
+    </div>
+    <textarea id="wfFrames" placeholder="0A0A0A0A00000000 0A0A0A0A64646464"></textarea>
+    <div class="wf-grid" id="wfGrid" style="margin-top:10px"></div>
+  </div>
+
+  <div class="panel" id="errorsPanel" style="display:none">
+    <h3>运行时错误<small>设备连接失败等原因会显示在这里</small></h3>
+    <div id="errors" style="font: 11.5px/1.6 ui-monospace, Consolas, monospace; color:#ef8095"></div>
+  </div>
+
+  <div class="panel">
+    <h3>审计日志<small>append-only；模型没有任何工具能写或删它</small></h3>
+    <div id="audit"><div class="hint">加载中…</div></div>
+  </div>
+
+  <footer>
+    <div>全局急停热键 <code>Ctrl+Alt+X</code> · 带外急停端点见启动窗口日志</div>
+    <div>上限只能人工修改；每次改动都会重新下发郊狼的 <code>BF</code> 硬件软上限并写入审计。</div>
+    <div id="err"></div>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

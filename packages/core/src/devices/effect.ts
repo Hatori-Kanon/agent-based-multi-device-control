@@ -95,6 +95,19 @@ export function assertValidEnvelope(envelope: Envelope, maxPercent: number): voi
   }
 }
 
+/**
+ * Play a caller-authored envelope inside the channel cap: the cap is the
+ * human's boundary, so an authored pattern that asks for more is tightened to
+ * it rather than refused (the device would be clamped downstream anyway).
+ * Shape problems (negative, min>max, odd preset) are still the caller's bug
+ * and stay refusals.
+ */
+export function clampEnvelopeToCap(envelope: Envelope, maxPercent: number): Envelope {
+  const capped = Math.min(envelope.maxPercent, maxPercent)
+  if (capped === envelope.maxPercent && envelope.minPercent <= capped) return envelope
+  return { ...envelope, maxPercent: capped, minPercent: Math.min(envelope.minPercent, capped) }
+}
+
 /** Stateful sampler for one envelope. */
 export interface EnvelopeSampler {
   valueAt(elapsedMs: number): number

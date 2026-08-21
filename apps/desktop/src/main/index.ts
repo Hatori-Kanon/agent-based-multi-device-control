@@ -9,7 +9,7 @@
 
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { app, BrowserWindow, globalShortcut, ipcMain } from 'electron'
+import { app, BrowserWindow, globalShortcut, ipcMain, session } from 'electron'
 import type { ChannelPolicy } from '@embodied/core'
 import { createBleWorker, type BleWorker } from './ble/electron-bridge.ts'
 import { createHostRuntime, type HostRuntime } from './bootstrap.ts'
@@ -17,6 +17,13 @@ import { readAuditTail } from './node-storage.ts'
 
 /** Global emergency stop. Chosen to be reachable one-handed and unlikely to clash. */
 const PANIC_ACCELERATOR = 'Control+Alt+X'
+
+/**
+ * Bump whenever the main-process bundle changes meaningfully. The launcher
+ * prints it at startup so a stale dist/main.mjs is never mistaken for current
+ * code — which already cost one debugging round.
+ */
+const BUILD_TOKEN = 'embodied-build-c8f8a'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -27,11 +34,6 @@ let quitting = false
 
 function dataDir(): string {
   return process.env.EMBODIED_DATA_DIR ?? join(app.getPath('userData'), 'embodied')
-}
-
-function rendererPath(): string {
-  // `dist/main.mjs` sits one level below the app root.
-  return join(here, '..', 'src', 'renderer', 'index.html')
 }
 
 function reportError(error: unknown): void {
@@ -107,14 +109,26 @@ function registerIpc(): void {
     await runtime?.registry.scan('human', deviceId, durationMs, controller.signal)
     return runtime?.snapshot() ?? null
   })
+
+  // Retry after a failed or dropped link without restarting the app.
+  ipcMain.handle('host:connect', async (_event, deviceId: string) => {
+    const controller = new AbortController()
+    await runtime?.registry.connect(deviceId, controller.signal)
+    return runtime?.snapshot() ?? null
+  })
 }
 
 async function createWindow(): Promise<void> {
+  const address = runtime?.dashboardAddress
+  if (address === undefined) {
+    throw new Error('the control console did not start; cannot open the window')
+  }
+  const url = `http://${address.host}:${address.port}/?token=${encodeURIComponent(runtime!.dashboardToken)}`
   window = new BrowserWindow({
-    width: 960,
-    height: 720,
-    title: 'Embodied Roleplay — device runtime',
-    backgroundColor: '#101014',
+    width: 1080,
+    height: 800,
+    title: 'Embodied 控制台',
+    backgroundColor: '#0d0d12',
     webPreferences: {
       preload: join(here, 'preload.cjs'),
       contextIsolation: true,
@@ -123,7 +137,9 @@ async function createWindow(): Promise<void> {
     },
   })
   window.on('closed', () => { window = undefined })
-  await window.loadFile(rendererPath())
+  // The console is an HTTP page served by the runtime; a phone on the LAN can
+  // open the same address once the dashboard is bound beyond loopback.
+  await window.loadURL(url)
 }
 
 /** Cut output before the process goes away, whatever the exit path. */
@@ -168,6 +184,23 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
 }
 
 void app.whenReady().then(async () => {
+  console.log(`[embodied] build token: ${BUILD_TOKEN}`)
+  // Web Bluetooth requests flow through Electron's session permission system.
+  // Without granting `bluetooth` the hidden worker's requestDevice is refused
+  // with zero candidates and no error details — the console then reports
+  // "no Bluetooth devices were found at all" on machines with a perfectly
+  // healthy adapter. This is the permission-layer half of the pair; the
+  // device-selection half is the `select-bluetooth-device` handler in
+  // createBleWorker.
+  session.defaultSession.setPermissionCheckHandler((_contents, permission) => {
+    // Electron's TypeScript union does not list 'bluetooth' yet, though the
+    // runtime ships it; cast through string.
+    return (permission as string) === 'bluetooth'
+  })
+  session.defaultSession.setPermissionRequestHandler((_contents, permission, callback) => {
+    callback((permission as string) === 'bluetooth')
+  })
+
   // The BLE worker is optional: without it the runtime still serves the mock
   // devices, which is better than refusing to start on a machine with no
   // Bluetooth adapter.
@@ -180,11 +213,27 @@ void app.whenReady().then(async () => {
   runtime = await createHostRuntime({
     dataDir: dataDir(),
     onError: reportError,
+    // The console UI ships as plain files next to the app root. Pass the
+    // absolute directory explicitly: the default relative resolution inside
+    // dashboard.ts depends on whether the code runs from src/ or dist/.
+    dashboardStaticDir: join(app.getAppPath(), 'src', 'ui'),
     ...(bleWorker === undefined ? {} : { bleTransport: bleWorker.transport }),
     // Operator configuration only; never reaches a tool argument or result.
     ...(process.env.EMBODIED_MONSTERPARTY_TOKEN === undefined
       ? {}
       : { monsterPartyToken: process.env.EMBODIED_MONSTERPARTY_TOKEN }),
+    // Tune which BLE backends register: useful when only one device exists, so
+    // the other backend does not sit through a pointless scan-and-retry.
+    ...(process.env.EMBODIED_ENABLE_COYOTE === undefined ? {} : {
+      withCoyote: process.env.EMBODIED_ENABLE_COYOTE === '1',
+    }),
+    ...(process.env.EMBODIED_ENABLE_XHTKJ === undefined ? {} : {
+      withXhtkj: process.env.EMBODIED_ENABLE_XHTKJ === '1',
+    }),
+    // Without Buttplug hardware, skip the engine probe and spawn entirely.
+    ...(process.env.EMBODIED_WITH_BUTTPLUG === undefined ? {} : {
+      withButtplug: process.env.EMBODIED_WITH_BUTTPLUG === '1',
+    }),
   })
   registerIpc()
 
@@ -199,6 +248,9 @@ void app.whenReady().then(async () => {
 
   await createWindow()
 
+  if (runtime.dashboardAddress !== undefined) {
+    console.log(`[embodied] console: http://${runtime.dashboardAddress.host}:${runtime.dashboardAddress.port}/?token=${runtime.dashboardToken}`)
+  }
   if (runtime.panicAddress !== undefined) {
     console.log(`[embodied] out-of-band stop: POST http://${runtime.panicAddress.host}:${runtime.panicAddress.port}/panic`)
   }

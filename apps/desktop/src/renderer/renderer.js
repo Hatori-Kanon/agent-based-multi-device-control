@@ -152,7 +152,17 @@ function render(snapshot) {
     life.className = `life ${device.lifecycle}`
     life.textContent = device.lifecycle
     header.append(title, life)
-    if (device.canScan) {
+    const needsReconnect = device.lifecycle === 'failed' || device.lifecycle === 'disconnected'
+    if (needsReconnect) {
+      const reconnect = document.createElement('button')
+      reconnect.textContent = device.lifecycle === 'failed' ? '重连' : '连接'
+      reconnect.style.marginLeft = 'auto'
+      reconnect.style.fontSize = '12px'
+      reconnect.style.padding = '4px 10px'
+      reconnect.addEventListener('click', () => call(host.connect(device.id)))
+      header.append(reconnect)
+    }
+    if (device.canScan && device.lifecycle === 'ready') {
       const scan = document.createElement('button')
       scan.textContent = '扫描设备'
       scan.style.marginLeft = 'auto'

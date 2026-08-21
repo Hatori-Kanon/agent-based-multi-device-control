@@ -8,4 +8,5 @@ contextBridge.exposeInMainWorld('__bleHost', {
     ipcRenderer.send('ble:notify', { handle, service, characteristic, hex })
   },
   disconnected: (handle: string) => { ipcRenderer.send('ble:disconnected', { handle }) },
+  diag: (message: string) => { ipcRenderer.send('ble:diag', message) },
 })
