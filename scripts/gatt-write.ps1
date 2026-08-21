@@ -72,11 +72,11 @@ $bytes = for ($i = 0; $i -lt $Hex.Length; $i += 2) { [byte][Convert]::ToByte($He
 # object resists a plain cast.
 $buffer = [Windows.Security.Cryptography.CryptographicBuffer]::CreateFromByteArray($bytes)
 
-$option = if ($NoResponse) {
-  [Windows.Devices.Bluetooth.GenericAttributeProfile.GattWriteOption]::WriteWithoutResponse
+# PS 5.1 binds WinRT overloads only with literal arguments at the call site:
+# intermediate variables break the (IBuffer, GattWriteOption) lookup.
+if ($NoResponse) {
+  $status = Await ($charObj.WriteValueAsync($buffer, [Windows.Devices.Bluetooth.GenericAttributeProfile.GattWriteOption]::WriteWithoutResponse)) ([Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus])
 } else {
-  [Windows.Devices.Bluetooth.GenericAttributeProfile.GattWriteOption]::WriteWithResponse
+  $status = Await ($charObj.WriteValueAsync($buffer, [Windows.Devices.Bluetooth.GenericAttributeProfile.GattWriteOption]::WriteWithResponse)) ([Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus])
 }
-$optionTyped = [Windows.Devices.Bluetooth.GenericAttributeProfile.GattWriteOption]$option
-$status = Await ($charObj.WriteValueAsync($buffer, $optionTyped)) ([Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus])
-Write-Output ("write {0} -> {1} ({2}): {3}" -f $Hex, $Characteristic, $optionTyped, $status)
+Write-Output ("write {0} -> {1}: {2}" -f $Hex, $Characteristic, $status)
