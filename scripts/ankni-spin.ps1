@@ -47,17 +47,17 @@ $stopStream = 'AA080400000000B6'
 $stopAcked = Build-CommandPacket '00' '00'
 
 if ($Probe -ge 1 -and $Probe -le 4) {
-  $probe = $stream[$Probe - 1]
-  Write-Output ("probe {0} [stream]: {1} - {2}   (watch direction, then it resets)" -f $Probe, $probe.name, $probe.hex)
-  1..5 | ForEach-Object { Send-Frame $probe.hex 'live'; Start-Sleep -Milliseconds 150 }
+  $entry = $stream[$Probe - 1]
+  Write-Output ("probe {0} [stream]: {1} - {2}   (watch direction, then it resets)" -f $Probe, $entry.name, $entry.hex)
+  1..5 | ForEach-Object { Send-Frame $entry.hex 'live'; Start-Sleep -Milliseconds 150 }
   Start-Sleep -Milliseconds 400
   Send-Frame $stopStream 'live'
   Send-Frame $stopAcked 'setup'
   Write-Output "reset sent"
 } elseif ($Probe -ge 5 -and $Probe -le 8) {
-  $probe = $acked[$Probe - 5]
-  Write-Output ("probe {0} [acked]: {1} - {2}   (watch the toy, then it resets)" -f $Probe, $probe.name, $probe.hex)
-  Send-Frame $probe.hex 'setup'
+  $entry = $acked[$Probe - 5]
+  Write-Output ("probe {0} [acked]: {1} - {2}   (watch the toy, then it resets)" -f $Probe, $entry.name, $entry.hex)
+  Send-Frame $entry.hex 'setup'
   Start-Sleep -Milliseconds 400
   Send-Frame $stopStream 'live'
   Send-Frame $stopAcked 'setup'

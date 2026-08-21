@@ -132,18 +132,7 @@ export class AnkniBackend implements DeviceBackend {
   /** Raw frame from a human protocol experiment, via the adopted live channel. */
   async writeRaw(data: Uint8Array, channel: 'live' | 'setup' = 'live'): Promise<void> {
     this.assertReady()
-    const layout = this.layout
-    if (layout === undefined) throw new Error('no control layout adopted')
-    if (channel === 'setup') {
-      await this.flushRaw(() => this.peripheral!.write(layout.write, Uint8Array.from(data), false))
-      return
-    }
-    await this.flushRaw(() => this.peripheral!.write(layout.live, Uint8Array.from(data), layout.liveWithoutResponse))
-  }
-
-  private async flushRaw(write: () => Promise<void>): Promise<void> {
-    await this.writeChain.catch(() => {})
-    await write()
+    await this.enqueueRaw(channel, Uint8Array.from(data))
   }
 
   async close(): Promise<void> {
@@ -175,22 +164,48 @@ export class AnkniBackend implements DeviceBackend {
 
   private async flushFrame(frame: Uint8Array): Promise<void> {
     await this.writeChain.catch(() => {})
-    await this.deliver(frame)
+    await this.enqueueLive(frame)
+  }
+
+  /** Serialise every transport write: the ticker, raw probes, and stops must
+   * never overlap a GATT operation (Chromium rejects concurrent writes). */
+  private enqueueLive(data: Uint8Array): Promise<void> {
+    return this.enqueueWrite(layout => layout.live, data, layout => layout.liveWithoutResponse)
+  }
+
+  private enqueueRaw(ref: 'live' | 'setup', data: Uint8Array): Promise<void> {
+    if (ref === 'setup') {
+      return this.enqueueWrite(layout => layout.write, data, () => false)
+    }
+    return this.enqueueWrite(layout => layout.live, data, layout => layout.liveWithoutResponse)
+  }
+
+  private enqueueWrite(
+    pick: (layout: XhtkjLayout) => BleCharacteristicRef,
+    data: Uint8Array,
+    withoutResponse: (layout: XhtkjLayout) => boolean,
+  ): Promise<void> {
+    const run = async (): Promise<void> => {
+      const peripheral = this.peripheral
+      const layout = this.layout
+      if (peripheral === undefined || layout === undefined) return
+      this.writing = true
+      try {
+        await peripheral.write(pick(layout), data, withoutResponse(layout))
+      } catch (error) {
+        this.options.onError?.(error)
+        this.handleLinkLost()
+      } finally {
+        this.writing = false
+      }
+    }
+    const next = this.writeChain.then(run, run)
+    this.writeChain = next.catch(() => {})
+    return next
   }
 
   private async deliver(data: Uint8Array): Promise<void> {
-    const peripheral = this.peripheral
-    const layout = this.layout
-    if (peripheral === undefined || layout === undefined) return
-    this.writing = true
-    try {
-      await peripheral.write(layout.live, data, layout.liveWithoutResponse)
-    } catch (error) {
-      this.options.onError?.(error)
-      this.handleLinkLost()
-    } finally {
-      this.writing = false
-    }
+    await this.enqueueLive(data)
   }
 
   private handleLinkLost(): void {
