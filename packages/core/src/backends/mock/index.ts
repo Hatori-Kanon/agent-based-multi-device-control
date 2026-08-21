@@ -55,6 +55,8 @@ export class MockBackend implements DeviceBackend {
   readonly channels: readonly Channel[]
   /** Every write the registry performed, in order. */
   readonly writes: MockWrite[] = []
+  /** Raw frames from an experiment (writeRaw). */
+  readonly rawWrites: Uint8Array[] = []
 
   private readonly clock: Clock
   private readonly keepAliveMs: number | undefined
@@ -124,6 +126,12 @@ export class MockBackend implements DeviceBackend {
     this.refreshTimer?.cancel()
     this.refreshTimer = undefined
     this.connected = false
+    return Promise.resolve()
+  }
+
+  /** Record one raw frame from a human protocol experiment. */
+  writeRaw(data: Uint8Array): Promise<void> {
+    this.rawWrites.push(Uint8Array.from(data))
     return Promise.resolve()
   }
 

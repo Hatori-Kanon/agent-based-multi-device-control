@@ -266,6 +266,40 @@ export class DeviceRegistry {
     })
   }
 
+  /**
+   * Send one raw frame to a backend's transport, bypassing channel semantics.
+   *
+   * Human-only protocol debugging: validates a frame we do not yet know how to
+   * map onto channels. Locked runtime and malformed hex refuse; the attempt is
+   * audited either way.
+   */
+  async rawWrite(actor: AuditActor, deviceId: string, hex: string): Promise<void> {
+    const detail = { deviceId, hex }
+    const trimmed = hex.trim()
+    try {
+      if (trimmed.length === 0 || trimmed.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(trimmed)) {
+        throw new SafetyError('POLICY_ENVELOPE', 'raw frame must be non-empty even-length hex')
+      }
+      const bytes = Uint8Array.from(trimmed.match(/../g)!.map(part => Number.parseInt(part, 16)))
+      this.assertRunning()
+      if (this.locked) {
+        throw new SafetyError('LOCKED', `output is locked by a human (${this.lockedReason ?? 'emergency stop'}); a human must clear it in the app`)
+      }
+      const device = this.requireDevice(deviceId)
+      if (device.lifecycle !== 'ready') {
+        throw new SafetyError('NOT_CONNECTED', `device ${deviceId} is ${device.lifecycle}; connect it first`)
+      }
+      if (device.backend.writeRaw === undefined) {
+        throw new SafetyError('WRONG_CHANNEL_KIND', `${deviceId} has no raw frame channel`)
+      }
+      await device.queue.enqueue(() => device.backend.writeRaw!(bytes), true)
+    } catch (error) {
+      await this.recordFailure(actor, 'raw_write', detail, error)
+      throw error
+    }
+    await this.options.audit.record({ actor, action: 'raw_write', result: 'ok', detail })
+  }
+
   /** Drop a backend from the runtime: stop output, close the transport, remove it. */
   async unregister(deviceId: string): Promise<void> {
     const device = this.devices.get(deviceId)

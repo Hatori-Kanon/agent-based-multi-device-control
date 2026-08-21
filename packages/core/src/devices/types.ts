@@ -113,6 +113,15 @@ export interface DeviceBackend {
    */
   scan?(durationMs: number, signal: AbortSignal): Promise<void>
 
+  /**
+   * Send one raw frame to the transport, bypassing channel semantics.
+   *
+   * Human-only protocol debugging: a frame we do not yet know how to map onto
+   * channels can be validated on the real device. Audited like every other
+   * human control action.
+   */
+  writeRaw?(data: Uint8Array): Promise<void>
+
   /** Stop output and release the transport. */
   close(): Promise<void>
 }

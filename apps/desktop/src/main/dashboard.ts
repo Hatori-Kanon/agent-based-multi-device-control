@@ -45,6 +45,8 @@ export interface DashboardDeps {
   listDevices(): DeviceManagerEntry[]
   addDevice(protocol: DeviceProtocol): Promise<DeviceManagerEntry>
   removeDevice(key: string): Promise<void>
+  /** Human protocol experiment: one raw frame to the device transport. */
+  rawWrite(deviceId: string, hex: string): Promise<void>
   listWaveforms(): unknown[]
   importWaveform(name: string, frames: string[]): Promise<{ id: string; name: string; frames: number }>
   promoteWaveform(id: string): Promise<unknown[]>
@@ -328,6 +330,13 @@ export class DashboardServer {
       const body = await readJsonBody(request)
       await this.options.deps.removeDevice(asString(body.key, ''))
       sendJson(response, 200, { devices: this.options.deps.listDevices(), snapshot: this.options.deps.snapshot() })
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/devices/raw') {
+      const body = await readJsonBody(request)
+      await this.options.deps.rawWrite(asString(body.deviceId, ''), asString(body.hex, ''))
+      sendJson(response, 200, this.options.deps.snapshot())
       return
     }
 

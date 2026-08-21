@@ -410,8 +410,26 @@ describe('shutdown', () => {
     expect(h.toy.closeCount).toBe(1)
   })
 
-  it('unregisters a device: stops output, closes the transport, forgets it', async () => {
+  it('sends one raw frame for a human protocol experiment (audited)', async () => {
     const h = createHarness()
+    await h.registry.connect('toy', signal())
+
+    await h.registry.rawWrite('human', 'toy', 'AA080400280000DE')
+    await h.registry.settled()
+    expect([...h.toy.rawWrites[0]!]).toEqual([0xaa, 0x08, 0x04, 0x00, 0x28, 0x00, 0x00, 0xde])
+    expect(h.records().some(record => record.action === 'raw_write' && record.result === 'ok')).toBe(true)
+
+    expect((await safetyErrorFrom(
+      h.registry.rawWrite('human', 'toy', 'bad-hex'),
+    )).code).toBe('POLICY_ENVELOPE')
+
+    await h.registry.emergencyStop('hotkey')
+    expect((await safetyErrorFrom(
+      h.registry.rawWrite('human', 'toy', 'AA080400280000DE'),
+    )).code).toBe('LOCKED')
+  })
+
+  it('unregisters a device: stops output, closes the transport, forgets it', async () => {    const h = createHarness()
     await h.registry.connect('toy', signal())
     await h.registry.runPattern('model', { deviceId: 'toy', channelId: 'a', envelope: steady(30), durationSec: 60 })
     h.clock.advance(50)

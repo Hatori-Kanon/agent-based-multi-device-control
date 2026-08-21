@@ -23,7 +23,7 @@ const PANIC_ACCELERATOR = 'Control+Alt+X'
  * prints it at startup so a stale dist/main.mjs is never mistaken for current
  * code — which already cost one debugging round.
  */
-const BUILD_TOKEN = 'embodied-build-c8fb4'
+const BUILD_TOKEN = 'embodied-build-c8fb5'
 
 const here = dirname(fileURLToPath(import.meta.url))
 

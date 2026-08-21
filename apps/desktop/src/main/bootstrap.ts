@@ -451,6 +451,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     listDevices,
     addDevice: async protocol => addDevice(protocol),
     removeDevice: async key => removeDevice(key),
+    rawWrite: async (deviceId, hex) => registry.rawWrite('human', deviceId, hex),
     setCap: async (deviceId, channelId, patch) => {
       await registry.setPolicyByHuman(deviceId, channelId, patch)
     },
