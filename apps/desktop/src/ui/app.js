@@ -184,11 +184,6 @@
       method: 'POST',
       body: JSON.stringify({ deviceId, channelId: channel.id }),
     })))
-    const pattern = document.createElement('button')
-    pattern.className = 'mini'
-    pattern.textContent = '跑模式'
-    pattern.disabled = snapshot?.locked === true
-    pattern.addEventListener('click', () => runPattern(deviceId, channel.id))
     const stop = document.createElement('button')
     stop.className = 'mini'
     stop.textContent = '停止'
@@ -196,7 +191,7 @@
       method: 'POST',
       body: JSON.stringify({ deviceId, channelId: channel.id }),
     })))
-    acts.append(demo, pattern, stop)
+    acts.append(demo, stop)
 
     row.append(name, middle, acts)
     return row
