@@ -1,0 +1,129 @@
+# ── Dependencies / toolchains ──────────────────────────────────────────────
+node_modules/
+
+# Workspace-local tool caches (kept in-tree so the file sandbox permits them)
+.cache/
+.test-tmp/
+.pnpm-store/
+
+# Build output
+dist/
+out/
+build/
+*.tsbuildinfo
+
+# Test / coverage artifacts
+coverage/
+.nyc_output/
+*.lcov
+test-results/
+playwright-report/
+
+# ── Runtime data that must never be committed ────────────────────────────
+# Captured sensor frames may contain private imagery.
+frames/
+*.jpg
+*.jpeg
+*.png
+!images/**
+
+# Audit logs record real device output history.
+audit/
+*.jsonl
+
+# Session save files.
+state/
+
+# Agent-authored waveforms are session-scoped scratch.
+waveforms/session/
+
+# ── Credentials, secrets, and TLS material ────────────────────────────────
+# Local TLS material and shared secrets.
+certs/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.cer
+*.crt
+*.der
+*.ppk
+
+# Environment files (keep only the example template).
+.env
+.env.*
+!.env.example
+*.local
+
+# Package-manager configs can carry registry auth tokens.
+.npmrc
+.yarnrc
+.yarnrc.yml
+
+# Git credentials and shell secrets.
+.git-credentials
+.credential
+credentials
+*.credentials
+.ssh/
+id_rsa*
+id_ed25519*
+
+# Secret-bearing data files (extension-scoped so source like
+# secrets.ts or api_key.ts is never silently ignored).
+*secret*.json
+*secret*.yaml
+*secret*.yml
+*secret*.toml
+*credential*.json
+*credential*.yaml
+*credential*.yml
+*_key*.json
+*_key*.yaml
+*_key*.yml
+*.secret
+*.token
+*.cred
+
+# Database / app-local data stores.
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+
+# ── Logs, process markers, temp files ──────────────────────────────────────
+*.log
+*.pid
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.rej
+tmp/
+temp/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.eslintcache
+*.stylelintcache
+
+# ── Editor / IDE (keep workspace settings out of version control) ─────────
+.vscode/
+.idea/
+*.code-workspace
+
+# ── Language runtimes ──────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# ── Third-party reference clones (analysis only, not part of the build) ────
+_reference/

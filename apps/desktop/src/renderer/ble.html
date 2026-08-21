@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'">
+<title>BLE worker</title>
+</head>
+<body>
+<!--
+  Hidden worker window.
+
+  Web Bluetooth exists only in a renderer, so this page owns every GATT object
+  and the main process drives it. Commands arrive as executeJavaScript calls
+  (which can carry a synthetic user gesture, required by requestDevice);
+  notifications and disconnects are pushed back over the preload bridge.
+-->
+<script src="./ble.js"></script>
+</body>
+</html>

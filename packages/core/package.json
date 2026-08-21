@@ -1,0 +1,19 @@
+{
+  "name": "@embodied/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Platform-free core: device safety runtime, effect scheduling, audit",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.13",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
+  }
+}

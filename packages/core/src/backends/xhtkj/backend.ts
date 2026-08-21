@@ -1,0 +1,376 @@
+/**
+ * 谜姬 / XHTKJ direct-BLE backend.
+ *
+ * A second, independent path to the same device family the MonsterParty relay
+ * reaches. Because it talks to the toy directly there is **no share link and no
+ * vendor server**, which removes the single-use-token problem that makes the
+ * relay awkward for a long session.
+ *
+ * Two properties to keep in mind:
+ *
+ * - **No hardware dead-man switch.** One strength packet sets a level and the
+ *   toy holds it. If the host dies, output continues. Same category as a
+ *   Buttplug toy; the Coyote's frame stream is the exception.
+ * - **Percentage is not linear here.** The vendor maps the visible range onto
+ *   the motor's usable band, so the smallest non-zero command already lands at
+ *   20-40% of full output. The channel publishes that floor rather than
+ *   pretending otherwise.
+ *
+ * Device-side built-in modes and uploaded waveforms are **deliberately not
+ * exposed yet**. The protocol for both is implemented and tested in
+ * `protocol.ts`, but neither fits the level/waveform channel model without a
+ * lossy translation, and the host-side effect scheduler already gives an agent
+ * expressive amplitude control on every backend.
+ */
+
+import { SafetyError } from '../../devices/errors.ts'
+import type { Channel, DeviceBackend } from '../../devices/types.ts'
+import type { BleCharacteristicRef, BlePeripheral, BleTransport } from '../../ports/ble.ts'
+import type { Clock, Timer } from '../../ports/clock.ts'
+import {
+  CLEAR_PACKET,
+  DEVICE_INFORMATION_SERVICE,
+  INITIALIZE_PACKET,
+  PNP_ID_CHARACTERISTIC,
+  STOP_MODE_PACKET,
+  XHTKJ_ADVERTISING_SERVICE,
+  XHTKJ_DEVICE_SERVICE,
+  XHTKJ_NOTIFY_CHARACTERISTIC,
+  XHTKJ_WRITE_CHARACTERISTIC,
+  capabilityOf,
+  outputFloorPercent,
+  parseProductId,
+  strengthPacket,
+  type XhtkjCapability,
+} from './protocol.ts'
+
+export type XhtkjChannelId = 'primary' | 'secondary'
+
+const WRITE_REF: BleCharacteristicRef = {
+  service: XHTKJ_DEVICE_SERVICE,
+  characteristic: XHTKJ_WRITE_CHARACTERISTIC,
+}
+const NOTIFY_REF: BleCharacteristicRef = {
+  service: XHTKJ_DEVICE_SERVICE,
+  characteristic: XHTKJ_NOTIFY_CHARACTERISTIC,
+}
+const PNP_REF: BleCharacteristicRef = {
+  service: DEVICE_INFORMATION_SERVICE,
+  characteristic: PNP_ID_CHARACTERISTIC,
+}
+
+const SECONDARY_LABEL: Readonly<Record<XhtkjCapability, string>> = {
+  heat: '加热',
+  electric: '电刺激',
+  shock: '冲击',
+  vibration: '副震动',
+  generic: '副路',
+}
+
+/**
+ * Floor for the secondary output, where the encoding is clearly an amplitude.
+ *
+ * `heat` scales linearly from zero, and the electric layout's words are not a
+ * plain amplitude at all, so no floor is claimed for those. Guessing would be
+ * worse than admitting the mapping is only partly understood.
+ */
+function secondaryFloorPercent(capability: XhtkjCapability, productId: number | undefined): number {
+  switch (capability) {
+    case 'shock':
+      return 30
+    case 'vibration':
+    case 'generic':
+      return outputFloorPercent(productId)
+    case 'heat':
+    case 'electric':
+      return 0
+  }
+}
+
+/** Minimum gap between transport writes. BLE cannot absorb a 20 Hz stream. */
+const DEFAULT_MIN_WRITE_INTERVAL_MS = 100
+
+export interface XhtkjBackendOptions {
+  readonly id?: string
+  readonly name?: string
+  readonly clock: Clock
+  readonly transport: BleTransport
+  readonly minWriteIntervalMs?: number
+  readonly onError?: (error: unknown) => void
+}
+
+export class XhtkjBackend implements DeviceBackend {
+  readonly id: string
+
+  private peripheral: BlePeripheral | undefined
+  private notifyOff: (() => void) | undefined
+  private disconnectOff: (() => void) | undefined
+  private productId: number | undefined
+  private capability: XhtkjCapability = 'generic'
+  private ready = false
+
+  private primary = 0
+  private secondary = 0
+  private needsClear = true
+
+  private dirty = false
+  private writing = false
+  private scheduled = false
+  private timer: Timer | undefined
+  private writeChain: Promise<void> = Promise.resolve()
+  private nextAllowedAt = 0
+
+  /** Last notification, hex-encoded, for operator diagnostics. */
+  lastNotificationHex: string | undefined
+
+  private readonly linkLostListeners = new Set<() => void>()
+
+  constructor(private readonly options: XhtkjBackendOptions) {
+    this.id = options.id ?? 'xhtkj'
+  }
+
+  get name(): string {
+    if (this.options.name !== undefined) return this.options.name
+    return this.productId === undefined
+      ? '谜姬 BLE toy'
+      : `谜姬 BLE toy (${this.capability}, pid ${this.productId})`
+  }
+
+  /** Product id read from the standard PnP ID characteristic, when available. */
+  get reportedProductId(): number | undefined {
+    return this.productId
+  }
+
+  get reportedCapability(): XhtkjCapability {
+    return this.capability
+  }
+
+  /**
+   * Channels depend on the product id, which is only known after connect, so
+   * this is a getter and the registry re-reads it.
+   *
+   * An unidentified product exposes only the main output: inventing a secondary
+   * channel we cannot encode correctly would be worse than offering less.
+   */
+  get channels(): readonly Channel[] {
+    const primary: Channel = {
+      id: 'primary',
+      kind: 'level',
+      label: '主输出',
+      outputFloorPercent: outputFloorPercent(this.productId),
+    }
+    if (this.capability === 'generic') return [primary]
+    return [primary, {
+      id: 'secondary',
+      kind: 'level',
+      label: SECONDARY_LABEL[this.capability],
+      outputFloorPercent: secondaryFloorPercent(this.capability, this.productId),
+    }]
+  }
+
+  async connect(signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted()
+    this.resetState()
+
+    const peripheral = await this.options.transport.request({
+      // Only 0xd34e is advertised; the control and info services are not.
+      services: [XHTKJ_ADVERTISING_SERVICE],
+      optionalServices: [XHTKJ_DEVICE_SERVICE, DEVICE_INFORMATION_SERVICE],
+    }, signal)
+    this.peripheral = peripheral
+    this.disconnectOff = peripheral.onDisconnect(() => { this.handleLinkLost() })
+
+    try {
+      // Notifications are diagnostic only; a toy that refuses them still works.
+      try {
+        this.notifyOff = await peripheral.subscribe(NOTIFY_REF, data => {
+          this.lastNotificationHex = [...data].map(byte => byte.toString(16).padStart(2, '0')).join('')
+        })
+      } catch (error) {
+        this.options.onError?.(error)
+      }
+
+      // Capability detection is best effort: an unreadable id degrades to
+      // main-output-only rather than failing the connect.
+      try {
+        this.productId = parseProductId(await peripheral.read(PNP_REF))
+      } catch (error) {
+        this.options.onError?.(error)
+      }
+      this.capability = capabilityOf(this.productId)
+
+      await peripheral.write(WRITE_REF, INITIALIZE_PACKET, false)
+    } catch (error) {
+      await this.teardown()
+      throw error
+    }
+
+    this.ready = true
+    this.nextAllowedAt = this.options.clock.now()
+  }
+
+  async applyLevel(channelId: string, percent: number): Promise<void> {
+    this.assertReady()
+    const value = clampPercent(percent)
+    if (channelId === 'primary') {
+      this.primary = value
+    } else if (channelId === 'secondary') {
+      if (this.capability === 'generic') {
+        throw new SafetyError(
+          'UNKNOWN_CHANNEL',
+          `${this.id} could not identify the product, so only the main output is available`,
+        )
+      }
+      this.secondary = value
+    } else {
+      throw new SafetyError('UNKNOWN_CHANNEL', `${this.id} has channels "primary" and "secondary"; received "${channelId}"`)
+    }
+    this.dirty = true
+    this.pump()
+  }
+
+  async stopAll(): Promise<void> {
+    this.primary = 0
+    this.secondary = 0
+    if (this.peripheral?.connected !== true) return
+    // A stop must not wait out the rate limit.
+    this.cancelSchedule()
+    await this.writeChain.catch(() => {})
+    this.dirty = false
+    try {
+      await this.write(STOP_MODE_PACKET)
+      await this.write(CLEAR_PACKET)
+      this.needsClear = true
+    } catch (error) {
+      this.options.onError?.(error)
+    }
+  }
+
+  /** Resolve once no write is in flight. Tests advance the clock for the rest. */
+  async settled(): Promise<void> {
+    while (this.writing) await this.writeChain.catch(() => {})
+  }
+
+  onLinkLost(listener: () => void): () => void {
+    this.linkLostListeners.add(listener)
+    return () => { this.linkLostListeners.delete(listener) }
+  }
+
+  async close(): Promise<void> {
+    if (this.peripheral?.connected === true) {
+      try {
+        await this.stopAll()
+      } catch (error) {
+        this.options.onError?.(error)
+      }
+    }
+    await this.teardown()
+  }
+
+  /** Coalescing, rate-limited writer. Only the newest target is ever sent. */
+  private pump(): void {
+    if (!this.dirty || this.writing || this.scheduled) return
+    if (this.peripheral?.connected !== true) return
+    const wait = this.nextAllowedAt - this.options.clock.now()
+    if (wait > 0) {
+      this.scheduled = true
+      this.timer = this.options.clock.timeout(wait, () => {
+        this.scheduled = false
+        this.timer = undefined
+        this.pump()
+      })
+      return
+    }
+    this.dirty = false
+    this.writing = true
+    this.writeChain = this.sendStrength().finally(() => {
+      this.writing = false
+      this.nextAllowedAt = this.options.clock.now() + (this.options.minWriteIntervalMs ?? DEFAULT_MIN_WRITE_INTERVAL_MS)
+      this.pump()
+    })
+  }
+
+  private async sendStrength(): Promise<void> {
+    try {
+      if (this.needsClear) {
+        await this.write(CLEAR_PACKET)
+        this.needsClear = false
+      }
+      const secondary = this.capability === 'generic' ? undefined : this.secondary / 100
+      await this.write(strengthPacket(this.primary / 100, secondary, this.productId))
+    } catch (error) {
+      // Re-arm so the next pump retries rather than losing the target.
+      this.dirty = true
+      this.options.onError?.(error)
+    }
+  }
+
+  private async write(packet: Uint8Array): Promise<void> {
+    const peripheral = this.peripheral
+    if (peripheral?.connected !== true) throw new SafetyError('NOT_CONNECTED', `${this.id} is not connected`)
+    // With response: this transport is command-per-change, not a stream.
+    await peripheral.write(WRITE_REF, packet, false)
+  }
+
+  private cancelSchedule(): void {
+    this.timer?.cancel()
+    this.timer = undefined
+    this.scheduled = false
+  }
+
+  private handleLinkLost(): void {
+    if (!this.ready && this.peripheral === undefined) return
+    this.cancelSchedule()
+    this.ready = false
+    this.dirty = false
+    this.primary = 0
+    this.secondary = 0
+    for (const listener of [...this.linkLostListeners]) {
+      try {
+        listener()
+      } catch (error) {
+        this.options.onError?.(error)
+      }
+    }
+  }
+
+  private resetState(): void {
+    this.productId = undefined
+    this.capability = 'generic'
+    this.ready = false
+    this.primary = 0
+    this.secondary = 0
+    this.needsClear = true
+    this.dirty = false
+    this.lastNotificationHex = undefined
+  }
+
+  private async teardown(): Promise<void> {
+    this.cancelSchedule()
+    this.ready = false
+    this.notifyOff?.()
+    this.notifyOff = undefined
+    this.disconnectOff?.()
+    this.disconnectOff = undefined
+    const peripheral = this.peripheral
+    this.peripheral = undefined
+    if (peripheral?.connected === true) {
+      try {
+        await peripheral.disconnect()
+      } catch (error) {
+        this.options.onError?.(error)
+      }
+    }
+  }
+
+  private assertReady(): void {
+    if (!this.ready || this.peripheral?.connected !== true) {
+      throw new SafetyError('NOT_CONNECTED', `${this.id} is not connected; connect it first`)
+    }
+  }
+}
+
+function clampPercent(percent: number): number {
+  if (!Number.isFinite(percent) || percent <= 0) return 0
+  return Math.min(100, Math.round(percent))
+}
