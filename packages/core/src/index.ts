@@ -124,6 +124,13 @@ export type {
 export { MockBackend } from './backends/mock/index.ts'
 export type { MockBackendOptions, MockWrite } from './backends/mock/index.ts'
 
+export { AnkniBackend } from './backends/ankni/backend.ts'
+export type { AnkniBackendOptions, AnkniChannelId } from './backends/ankni/backend.ts'
+export { ANKNI_STOP_FRAME, ANKNI_FRAME_LENGTH, encodeAnkniFrame } from './backends/ankni/protocol.ts'
+export type { AnkniFrame } from './backends/ankni/protocol.ts'
+export { adoptControlLayout, ALT_LAYOUT, CLASSIC_LAYOUT } from './backends/xhtkj/layout.ts'
+export type { AdoptedLayout, XhtkjLayout } from './backends/xhtkj/layout.ts'
+
 export {
   B0_LENGTH,
   B1_LENGTH,

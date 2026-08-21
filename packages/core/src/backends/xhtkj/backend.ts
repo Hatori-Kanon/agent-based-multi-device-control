@@ -27,19 +27,15 @@ import { SafetyError } from '../../devices/errors.ts'
 import type { Channel, DeviceBackend } from '../../devices/types.ts'
 import type { BleCharacteristicRef, BlePeripheral, BleTransport } from '../../ports/ble.ts'
 import type { Clock, Timer } from '../../ports/clock.ts'
+import { adoptControlLayout, CLASSIC_LAYOUT, type XhtkjLayout } from './layout.ts'
 import {
   CLEAR_PACKET,
   DEVICE_INFORMATION_SERVICE,
-  INITIALIZE_PACKET,
   PNP_ID_CHARACTERISTIC,
   STOP_MODE_PACKET,
   XHTKJ_ADVERTISING_SERVICE,
   XHTKJ_ALT_SERVICE,
-  XHTKJ_ALT_STREAM_CHARACTERISTIC,
-  XHTKJ_ALT_WRITE_CHARACTERISTIC,
   XHTKJ_DEVICE_SERVICE,
-  XHTKJ_NOTIFY_CHARACTERISTIC,
-  XHTKJ_WRITE_CHARACTERISTIC,
   capabilityOf,
   outputFloorPercent,
   parseProductId,
@@ -49,49 +45,10 @@ import {
 
 export type XhtkjChannelId = 'primary' | 'secondary'
 
-const WRITE_REF: BleCharacteristicRef = {
-  service: XHTKJ_DEVICE_SERVICE,
-  characteristic: XHTKJ_WRITE_CHARACTERISTIC,
-}
-const NOTIFY_REF: BleCharacteristicRef = {
-  service: XHTKJ_DEVICE_SERVICE,
-  characteristic: XHTKJ_NOTIFY_CHARACTERISTIC,
-}
 const PNP_REF: BleCharacteristicRef = {
   service: DEVICE_INFORMATION_SERVICE,
   characteristic: PNP_ID_CHARACTERISTIC,
 }
-
-/** One known control-service layout of the 谜姬 family. */
-interface XhtkjLayout {
-  /** Acked setup channel: initialise and other confirmed commands. */
-  readonly write: BleCharacteristicRef
-  /** Live policy channel: strength, clear, and stop traffic. */
-  readonly live: BleCharacteristicRef
-  /** Live traffic is fire-and-forget (stream toys) rather than acked. */
-  readonly liveWithoutResponse: boolean
-  readonly notify: BleCharacteristicRef | undefined
-}
-
-/** Classic 谜姬 layout (0xff10/ff11/ff12): one channel for everything. */
-const CLASSIC_LAYOUT: XhtkjLayout = {
-  write: WRITE_REF,
-  live: WRITE_REF,
-  liveWithoutResponse: false,
-  notify: NOTIFY_REF,
-}
-/**
- * ANKNI clone layout (0xdddd): ddd1 = fire-and-forget stream, ddd2 = acked
- * commands, ddd3 = read, no notify. Layout confirmed on a real ANKNI ZKRXB.
- */
-const ALT_LAYOUT: XhtkjLayout = {
-  write: { service: XHTKJ_ALT_SERVICE, characteristic: XHTKJ_ALT_WRITE_CHARACTERISTIC },
-  live: { service: XHTKJ_ALT_SERVICE, characteristic: XHTKJ_ALT_STREAM_CHARACTERISTIC },
-  liveWithoutResponse: true,
-  notify: undefined,
-}
-/** Tried in order; the first one that accepts the INITIALIZE write wins. */
-const XHTKJ_LAYOUTS: readonly XhtkjLayout[] = [CLASSIC_LAYOUT, ALT_LAYOUT]
 
 const SECONDARY_LABEL: Readonly<Record<XhtkjCapability, string>> = {
   heat: '加热',
@@ -238,44 +195,18 @@ export class XhtkjBackend implements DeviceBackend {
       this.capability = capabilityOf(this.productId)
 
       // Adopt the control layout by handshake: clones (ANKNI ZKRXB...) serve
-      // 0xdddd instead of 0xff10 and expose no notify characteristic, so the
-      // classic layout must fail over cleanly. Probe failures are expected
-      // here (a clone has no 0xff10 at all) and stay out of the error panel;
-      // only a notify failure on the ADOPTED layout is worth reporting.
-      let adopted: XhtkjLayout | undefined
-      let lastError: unknown
-      let probeNotifyError: unknown
-      for (const layout of XHTKJ_LAYOUTS) {
-        this.notifyOff?.()
-        this.notifyOff = undefined
-        if (layout.notify !== undefined) {
-          try {
-            this.notifyOff = await peripheral.subscribe(layout.notify, data => {
-              this.lastNotificationHex = [...data].map(byte => byte.toString(16).padStart(2, '0')).join('')
-            })
-          } catch (error) {
-            probeNotifyError = error
-          }
-        }
-        try {
-          await peripheral.write(layout.write, INITIALIZE_PACKET, false)
-          adopted = layout
-          break
-        } catch (error) {
-          lastError = error
-        }
-      }
-      if (adopted === undefined) {
-        await this.teardown()
-        throw new SafetyError(
-          'NOT_CONNECTED',
-          `initialize handshake failed on every known layout (classic 0xff10 and ANKNI 0xdddd): ${lastError instanceof Error ? lastError.message : String(lastError)}`,
-        )
-      }
-      if (adopted.notify !== undefined && this.notifyOff === undefined && probeNotifyError !== undefined) {
-        this.options.onError?.(probeNotifyError)
-      }
-      this.layout = adopted
+      // 0xdddd instead of 0xff10 and expose no notify characteristic. Probe
+      // failures stay out of the error panel; only a notify failure on the
+      // ADOPTED layout is reported (see adoptControlLayout).
+      const adopted = await adoptControlLayout(
+        peripheral,
+        data => {
+          this.lastNotificationHex = [...data].map(byte => byte.toString(16).padStart(2, '0')).join('')
+        },
+        error => { this.options.onError?.(error) },
+      )
+      this.layout = adopted.layout
+      this.notifyOff = adopted.notifyOff
     } catch (error) {
       await this.teardown()
       throw error

@@ -11,6 +11,7 @@ import { randomBytes } from 'node:crypto'
 import { join } from 'node:path'
 import {
   AuditLog,
+  AnkniBackend,
   ButtplugBackend,
   CoyoteBackend,
   DeviceRegistry,
@@ -108,7 +109,7 @@ export interface HostRuntime {
 }
 
 /** Protocols an operator can add at run time. */
-export const DEVICE_PROTOCOLS = ['coyote', 'xhtkj', 'mock'] as const
+export const DEVICE_PROTOCOLS = ['coyote', 'xhtkj', 'ankni', 'mock'] as const
 export type DeviceProtocol = (typeof DEVICE_PROTOCOLS)[number]
 
 /** One entry of the persisted device manifest. */
@@ -132,7 +133,7 @@ export interface DeviceManagerEntry {
 }
 
 /** File format version; bumped when the well-known device list changes. */
-const MANIFEST_VERSION = 2
+const MANIFEST_VERSION = 3
 
 interface DeviceManifestFile {
   readonly version?: number
@@ -147,7 +148,7 @@ interface DeviceManifestFile {
 const WELL_KNOWN_DEVICES: readonly DeviceManifestEntry[] = [
   { key: 'coyote', protocol: 'coyote' },
   { key: 'xhtkj', protocol: 'xhtkj' },
-  { key: 'zkrxb', protocol: 'xhtkj', bleName: 'ANKNI ZKRXB', label: 'ANKNI ZKRXB（旋转）' },
+  { key: 'zkrxb', protocol: 'ankni', bleName: 'ANKNI ZKRXB', label: 'ANKNI ZKRXB（旋转）' },
 ]
 
 function isDeviceProtocol(value: unknown): value is DeviceProtocol {
@@ -256,8 +257,14 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
         manifest = [...WELL_KNOWN_DEVICES]
         await saveManifest()
       } else if (manifestVersion < MANIFEST_VERSION) {
-        // Introduce units that postdate the file (e.g. the rotation toy) once;
-        // the bumped version keeps later removals in place.
+        // v2 → v3: the ZKRXB rotation unit speaks the ANKNI stream protocol.
+        if (manifestVersion < 3) {
+          manifest = manifest.map(entry =>
+            entry.key === 'zkrxb' && entry.protocol === 'xhtkj' ? { ...entry, protocol: 'ankni' } : entry,
+          )
+        }
+        // Introduce units that postdate the file; the bumped version keeps
+        // later removals (and this migration) from running again.
         manifest = [...manifest, ...WELL_KNOWN_DEVICES.filter(entry => !manifest.some(existing => existing.key === entry.key))]
         await saveManifest()
       }
@@ -296,6 +303,18 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
           transport,
           id: entry.key,
           name: entry.label ?? '谜姬 / XHTKJ 直连',
+          ...(entry.bleName === undefined ? {} : { bleName: entry.bleName }),
+          onError: recordError,
+        })
+      }
+      case 'ankni': {
+        const transport = options.bleTransport
+        if (transport === undefined) throw new Error('ankni needs a BLE transport')
+        return new AnkniBackend({
+          clock,
+          transport,
+          id: entry.key,
+          name: entry.label ?? '安可尼 流式玩具',
           ...(entry.bleName === undefined ? {} : { bleName: entry.bleName }),
           onError: recordError,
         })
