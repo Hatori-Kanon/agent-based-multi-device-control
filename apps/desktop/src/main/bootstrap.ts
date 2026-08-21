@@ -22,6 +22,8 @@ import {
   systemClock,
   type BleTransport,
   type Clock,
+  type DeviceBackend,
+  type DeviceLifecycle,
   type RegistrySnapshot,
   type SerializedWaveform,
 } from '@embodied/core'
@@ -57,12 +59,11 @@ export interface HostRuntimeOptions {
    *
    * A connect failure is reported rather than fatal: the operator may simply
    * not have the box powered on, and the rest of the runtime is still useful.
+   * Which BLE units exist is the operator's manifest (state/devices.json),
+   * edited through the console (添加/移除设备); a missing manifest is seeded
+   * with one Coyote and one 谜姬 on first BLE run.
    */
   readonly bleTransport?: BleTransport
-  /** Register the Coyote backend over BLE. Defaults to true when BLE is present. */
-  readonly withCoyote?: boolean
-  /** Register the 谜姬 direct-BLE backend. Defaults to true when BLE is present. */
-  readonly withXhtkj?: boolean
   /**
    * MonsterParty share-link token.
    *
@@ -97,6 +98,46 @@ export interface HostRuntime {
   /** Persist the durable waveform library. */
   saveWaveforms(): Promise<void>
   shutdown(): Promise<void>
+  /** Devices the operator added (protocol + label + live lifecycle). */
+  listDevices(): DeviceManagerEntry[]
+  /** Add one device of the chosen protocol; registers and connects it. */
+  addDevice(protocol: DeviceProtocol): Promise<DeviceManagerEntry>
+  /** Stop, close, and forget a device. */
+  removeDevice(key: string): Promise<void>
+}
+
+/** Protocols an operator can add at run time. */
+export const DEVICE_PROTOCOLS = ['coyote', 'xhtkj', 'mock'] as const
+export type DeviceProtocol = (typeof DEVICE_PROTOCOLS)[number]
+
+/** One entry of the persisted device manifest. */
+export interface DeviceManifestEntry {
+  readonly key: string
+  readonly protocol: DeviceProtocol
+  /** Display name override; the backend default is used when omitted. */
+  readonly label?: string
+  /** Scan filter override (Coyote family name); use when several units share a name. */
+  readonly bleName?: string
+}
+
+/** Manifest entry merged with live registry state, for the UI. */
+export interface DeviceManagerEntry {
+  readonly key: string
+  readonly protocol: DeviceProtocol
+  readonly label: string
+  readonly lifecycle: DeviceLifecycle | 'unregistered'
+  readonly canScan: boolean
+  readonly channels: readonly string[]
+}
+
+function isDeviceProtocol(value: unknown): value is DeviceProtocol {
+  return typeof value === 'string' && (DEVICE_PROTOCOLS as readonly string[]).includes(value)
+}
+
+function isManifestEntry(value: unknown): value is DeviceManifestEntry {
+  if (typeof value !== 'object' || value === null) return false
+  const entry = value as Record<string, unknown>
+  return typeof entry.key === 'string' && entry.key.length > 0 && isDeviceProtocol(entry.protocol)
 }
 
 /**
@@ -161,6 +202,31 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
   }
 
   const registry = new DeviceRegistry({ clock, audit, policy, waveforms, onError: recordError })
+  const controller = new AbortController()
+
+  // ── Device manifest: which units exist and how to reach them ────────────
+  // Seeded with coyote + xhtkj on the first BLE run (today's behavior); from
+  // then on the persisted list is the operator's, added to and removed from
+  // through the console.
+  let manifest: DeviceManifestEntry[] = []
+  const saveManifest = async (): Promise<void> => {
+    await documents.write('devices', JSON.stringify(manifest, null, 2))
+  }
+  {
+    const raw = await documents.read('devices')
+    if (raw !== undefined) {
+      try {
+        const parsed: unknown = JSON.parse(raw)
+        if (Array.isArray(parsed)) manifest = parsed.filter(isManifestEntry)
+      } catch (error) {
+        recordError(error)
+      }
+    }
+    if (manifest.length === 0 && options.bleTransport !== undefined) {
+      manifest = [{ key: 'coyote', protocol: 'coyote' }, { key: 'xhtkj', protocol: 'xhtkj' }]
+      await saveManifest()
+    }
+  }
 
   const connectIds: string[] = []
   if (options.withMockDevices !== false) {
@@ -169,25 +235,63 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       connectIds.push(backend.id)
     }
   }
-  if (options.bleTransport !== undefined) {
-    if (options.withCoyote !== false) {
-      const coyote = new CoyoteBackend({
-        clock,
-        transport: options.bleTransport,
-        // Read fresh on every call so a cap change reaches the hardware.
-        maxPercent: channel => policy.get('coyote', channel).maxPercent,
-        maxWaveIntensity: channel => policy.get('coyote', channel).maxWaveIntensity,
-        onError: recordError,
-      })
-      registry.register(coyote)
-      connectIds.push(coyote.id)
-    }
 
-    if (options.withXhtkj !== false) {
-      // Direct BLE to the 谜姬 family: no share link, no vendor server.
-      const xhtkj = new XhtkjBackend({ clock, transport: options.bleTransport, onError: recordError })
-      registry.register(xhtkj)
-      connectIds.push(xhtkj.id)
+  /** Build the backend for one manifest entry. */
+  const createBackend = (entry: DeviceManifestEntry): DeviceBackend => {
+    switch (entry.protocol) {
+      case 'coyote': {
+        const transport = options.bleTransport
+        if (transport === undefined) throw new Error('coyote needs a BLE transport')
+        return new CoyoteBackend({
+          clock,
+          transport,
+          id: entry.key,
+          name: entry.label ?? 'DG-LAB Coyote 3.0',
+          ...(entry.bleName === undefined ? {} : { bleName: entry.bleName }),
+          // Read fresh on every call so a cap change reaches the hardware.
+          maxPercent: channel => policy.get(entry.key, channel).maxPercent,
+          maxWaveIntensity: channel => policy.get(entry.key, channel).maxWaveIntensity,
+          onError: recordError,
+        })
+      }
+      case 'xhtkj': {
+        const transport = options.bleTransport
+        if (transport === undefined) throw new Error('xhtkj needs a BLE transport')
+        return new XhtkjBackend({
+          clock,
+          transport,
+          id: entry.key,
+          name: entry.label ?? '谜姬 / XHTKJ 直连',
+          onError: recordError,
+        })
+      }
+      case 'mock':
+        return new MockBackend({
+          id: entry.key,
+          name: entry.label ?? 'Mock 设备',
+          clock,
+          keepAliveMs: 400,
+          refreshMs: 100,
+          channels: [
+            { id: 'a', kind: 'level', label: 'A 通道' },
+            { id: 'b', kind: 'level', label: 'B 通道' },
+          ],
+        })
+    }
+  }
+
+  for (const entry of manifest) {
+    // BLE protocols need a transport; on start-dev (none) they are skipped but
+    // stay in the manifest so a later BLE run picks them back up.
+    if (entry.protocol !== 'mock' && options.bleTransport === undefined) {
+      console.log(`[devices] skipping ${entry.key} (${entry.protocol}): no BLE transport configured`)
+      continue
+    }
+    try {
+      registry.register(createBackend(entry))
+      connectIds.push(entry.key)
+    } catch (error) {
+      recordError(error)
     }
   }
 
@@ -224,7 +328,66 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     }
   }
 
-  const controller = new AbortController()
+  // ── Device management: the operator adds and removes units at run time ──
+  let deviceOps: Promise<unknown> = Promise.resolve()
+  const runDeviceOp = <T>(op: () => Promise<T>): Promise<T> => {
+    const next = deviceOps.then(op, op)
+    deviceOps = next.catch(() => {})
+    return next
+  }
+
+  const listDevices = (): DeviceManagerEntry[] => {
+    const byId = new Map(registry.snapshot().devices.map(device => [device.id, device]))
+    return manifest.map(entry => {
+      const live = byId.get(entry.key)
+      return {
+        key: entry.key,
+        protocol: entry.protocol,
+        label: entry.label ?? live?.name ?? entry.key,
+        lifecycle: live?.lifecycle ?? 'disconnected',
+        canScan: live?.canScan ?? false,
+        channels: live === undefined ? [] : live.channels.map(channel => channel.id),
+      }
+    })
+  }
+
+  const nextDeviceKey = (protocol: DeviceProtocol): string => {
+    const taken = new Set<string>([...manifest.map(entry => entry.key), 'mock-pulse', 'mock-hold'])
+    for (let n = taken.has(protocol) ? 2 : 1; n < 100; n += 1) {
+      const key = n === 1 ? protocol : `${protocol}-${n}`
+      if (!taken.has(key)) return key
+    }
+    return `${protocol}-${Date.now()}`
+  }
+
+  const addDevice = async (protocol: DeviceProtocol): Promise<DeviceManagerEntry> => {
+    if (protocol !== 'mock' && options.bleTransport === undefined) {
+      throw new Error(`${protocol} needs a BLE transport; start-dev configures none`)
+    }
+    return runDeviceOp(async () => {
+      const entry: DeviceManifestEntry = { key: nextDeviceKey(protocol), protocol }
+      registry.register(createBackend(entry))
+      manifest = [...manifest, entry]
+      await saveManifest()
+      try {
+        // A miss (toy off, not advertising) keeps the entry so the UI can
+        // retry with 重连 instead of re-adding.
+        await registry.connect(entry.key, controller.signal)
+      } catch (error) {
+        recordError(error)
+      }
+      return listDevices().find(device => device.key === entry.key)!
+    })
+  }
+
+  const removeDevice = async (key: string): Promise<void> => {
+    await runDeviceOp(async () => {
+      await registry.unregister(key)
+      manifest = manifest.filter(entry => entry.key !== key)
+      await saveManifest()
+    })
+  }
+
   for (const id of connectIds) {
     try {
       await registry.connect(id, controller.signal)
@@ -262,6 +425,9 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     snapshot: () => registry.snapshot(),
     panic,
     unlock: async note => { await registry.unlock('human', note) },
+    listDevices,
+    addDevice: async protocol => addDevice(protocol),
+    removeDevice: async key => removeDevice(key),
     setCap: async (deviceId, channelId, patch) => {
       await registry.setPolicyByHuman(deviceId, channelId, patch)
     },
@@ -342,6 +508,9 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     snapshot: () => registry.snapshot(),
     panic,
     saveWaveforms,
+    listDevices,
+    addDevice,
+    removeDevice,
     async shutdown(): Promise<void> {
       if (stopped) return
       stopped = true

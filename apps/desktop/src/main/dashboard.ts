@@ -16,10 +16,14 @@ import type { AddressInfo } from 'node:net'
 import { dirname, join, normalize, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ChannelPolicy } from '@embodied/core'
+import type { DeviceManagerEntry, DeviceProtocol } from './bootstrap.ts'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
 const MAX_BODY_BYTES = 256 * 1024
+
+/** Protocols the operator may add through the console. */
+const ADDABLE_PROTOCOLS: readonly string[] = ['coyote', 'xhtkj', 'mock']
 
 /** Every capability the console needs; satisfied by HostRuntime plus audit. */
 export interface DashboardDeps {
@@ -38,6 +42,9 @@ export interface DashboardDeps {
   stop(deviceId?: string, channelId?: string): Promise<void>
   connect(deviceId: string): Promise<void>
   scan(deviceId: string, durationMs: number): Promise<void>
+  listDevices(): DeviceManagerEntry[]
+  addDevice(protocol: DeviceProtocol): Promise<DeviceManagerEntry>
+  removeDevice(key: string): Promise<void>
   listWaveforms(): unknown[]
   importWaveform(name: string, frames: string[]): Promise<{ id: string; name: string; frames: number }>
   promoteWaveform(id: string): Promise<unknown[]>
@@ -286,6 +293,34 @@ export class DashboardServer {
 
     if (request.method === 'GET' && pathname === '/api/errors') {
       sendJson(response, 200, this.options.deps.recentErrors())
+      return
+    }
+
+    if (request.method === 'GET' && pathname === '/api/devices') {
+      sendJson(response, 200, { devices: this.options.deps.listDevices() })
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/devices') {
+      const body = await readJsonBody(request)
+      const protocol = body.protocol
+      if (typeof protocol !== 'string' || !ADDABLE_PROTOCOLS.includes(protocol)) {
+        sendError(response, 400, `protocol must be one of: ${ADDABLE_PROTOCOLS.join(', ')}`)
+        return
+      }
+      const device = await this.options.deps.addDevice(protocol as DeviceProtocol)
+      sendJson(response, 200, {
+        device,
+        devices: this.options.deps.listDevices(),
+        snapshot: this.options.deps.snapshot(),
+      })
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/devices/remove') {
+      const body = await readJsonBody(request)
+      await this.options.deps.removeDevice(asString(body.key, ''))
+      sendJson(response, 200, { devices: this.options.deps.listDevices(), snapshot: this.options.deps.snapshot() })
       return
     }
 

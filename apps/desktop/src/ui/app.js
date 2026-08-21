@@ -9,6 +9,8 @@
     lockBanner: document.getElementById('lockBanner'),
     unlock: document.getElementById('unlock'),
     devices: document.getElementById('devices'),
+    addDevice: document.getElementById('addDevice'),
+    addProtocol: document.getElementById('addProtocol'),
     wfName: document.getElementById('wfName'),
     wfFrames: document.getElementById('wfFrames'),
     wfImport: document.getElementById('wfImport'),
@@ -19,6 +21,8 @@
 
   let snapshot = null
   let waveforms = []
+  /** Keys of manifest devices: only these get a 移除 button. */
+  let managedKeys = new Set()
   const editing = new Set()
 
   function fail(message) {
@@ -242,6 +246,29 @@
         header.append(scan)
       }
 
+      if (managedKeys.has(device.id)) {
+        const remove = document.createElement('button')
+        remove.className = 'mini'
+        remove.textContent = '移除'
+        remove.style.borderColor = '#7d2642'
+        remove.style.color = '#ef8095'
+        remove.addEventListener('click', () => {
+          if (!window.confirm(`移除 ${device.name}？输出会立即停止并断开连接。`)) return
+          call(api('/api/devices/remove', {
+            method: 'POST',
+            body: JSON.stringify({ key: device.id }),
+          }).then(async result => {
+            if (result && result.snapshot) {
+              snapshot = result.snapshot
+              renderDevices()
+            }
+            await refresh()
+            return result
+          }))
+        })
+        header.append(remove)
+      }
+
       if (device.channels.length === 0) {
         const empty = document.createElement('div')
         empty.className = 'ch'
@@ -321,6 +348,17 @@
     method: 'POST',
     body: JSON.stringify({ note: 'unlocked from web console' }),
   })))
+  el.addDevice.addEventListener('click', () => call(api('/api/devices', {
+    method: 'POST',
+    body: JSON.stringify({ protocol: el.addProtocol.value }),
+  }).then(async result => {
+    if (result && result.snapshot) {
+      snapshot = result.snapshot
+      renderDevices()
+    }
+    await refresh()
+    return result
+  })))
 
   el.wfImport.addEventListener('click', async () => {
     try {
@@ -336,8 +374,12 @@
 
   async function refresh() {
     try {
-      const snap = await api('/api/snapshot')
+      const [snap, manager] = await Promise.all([
+        api('/api/snapshot'),
+        api('/api/devices').catch(() => ({ devices: [] })),
+      ])
       snapshot = snap
+      managedKeys = new Set(manager.devices.map(device => device.key))
       renderDevices()
     } catch (error) {
       el.conn.textContent = '连接失败'

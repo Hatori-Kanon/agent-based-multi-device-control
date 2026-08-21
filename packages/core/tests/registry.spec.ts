@@ -409,6 +409,25 @@ describe('shutdown', () => {
     await h.registry.shutdown()
     expect(h.toy.closeCount).toBe(1)
   })
+
+  it('unregisters a device: stops output, closes the transport, forgets it', async () => {
+    const h = createHarness()
+    await h.registry.connect('toy', signal())
+    await h.registry.runPattern('model', { deviceId: 'toy', channelId: 'a', envelope: steady(30), durationSec: 60 })
+    h.clock.advance(50)
+    await h.registry.settled()
+    expect(h.toy.deviceLevel('a')).toBe(30)
+
+    await h.registry.unregister('toy')
+    await h.registry.settled()
+    expect(h.toy.deviceLevel('a')).toBe(0)
+    expect(h.toy.closeCount).toBe(1)
+    expect(h.registry.snapshot().devices.some(device => device.id === 'toy')).toBe(false)
+    expect((await safetyErrorFrom(
+      h.registry.setLevel('model', { deviceId: 'toy', channelId: 'a', percent: 10, durationSec: 5 }),
+    )).code).toBe('UNKNOWN_DEVICE')
+    expect(h.records().some(record => record.action === 'device_removed')).toBe(true)
+  })
 })
 
 describe('audit trail', () => {

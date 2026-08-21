@@ -23,7 +23,7 @@ const PANIC_ACCELERATOR = 'Control+Alt+X'
  * prints it at startup so a stale dist/main.mjs is never mistaken for current
  * code — which already cost one debugging round.
  */
-const BUILD_TOKEN = 'embodied-build-c8f8a'
+const BUILD_TOKEN = 'embodied-build-c8f9a'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -222,14 +222,8 @@ void app.whenReady().then(async () => {
     ...(process.env.EMBODIED_MONSTERPARTY_TOKEN === undefined
       ? {}
       : { monsterPartyToken: process.env.EMBODIED_MONSTERPARTY_TOKEN }),
-    // Tune which BLE backends register: useful when only one device exists, so
-    // the other backend does not sit through a pointless scan-and-retry.
-    ...(process.env.EMBODIED_ENABLE_COYOTE === undefined ? {} : {
-      withCoyote: process.env.EMBODIED_ENABLE_COYOTE === '1',
-    }),
-    ...(process.env.EMBODIED_ENABLE_XHTKJ === undefined ? {} : {
-      withXhtkj: process.env.EMBODIED_ENABLE_XHTKJ === '1',
-    }),
+    // Which BLE units exist is the manifest (state/devices.json), managed from
+    // the console's 设备管理 (add/remove); no env tuning needed.
     // Without Buttplug hardware, skip the engine probe and spawn entirely.
     ...(process.env.EMBODIED_WITH_BUTTPLUG === undefined ? {} : {
       withButtplug: process.env.EMBODIED_WITH_BUTTPLUG === '1',

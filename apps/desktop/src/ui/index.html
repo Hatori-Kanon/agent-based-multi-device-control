@@ -130,6 +130,17 @@
     <button id="unlock">解锁</button>
   </div>
 
+  <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; padding:10px 14px; background:#14141b; border:1px solid #262631; border-radius:12px;">
+    <span style="font-size:12px; color:#9a9aa6;">设备管理</span>
+    <select id="addProtocol">
+      <option value="coyote">郊狼 · DG-LAB Coyote（BLE 直连）</option>
+      <option value="xhtkj">谜姬 / XHTKJ（BLE 直连）</option>
+      <option value="mock">模拟设备（Mock）</option>
+    </select>
+    <button class="mini" id="addDevice">添加设备</button>
+    <span class="hint">添加时请只打开一台对应协议的设备；删除设备会立即停止输出并断开</span>
+  </div>
+
   <div id="devices"></div>
 
   <div class="panel">

@@ -178,7 +178,7 @@ describe('host runtime with a BLE transport', () => {
     expect(xhtkj?.channels.map(channel => channel.id)).toEqual(['primary'])
   })
 
-  it('honours the per-backend enable flags', async () => {
+  it('seeds coyote + 谜姬 from the manifest and persists removals', async () => {
     const clock = new FakeClock()
     const transport = new MockBleTransport({ clock, name: COYOTE_BLE_NAME })
     runtime = await createHostRuntime({
@@ -186,16 +186,59 @@ describe('host runtime with a BLE transport', () => {
       clock,
       withPanicServer: false,
       bleTransport: transport,
-      withCoyote: false,
-      withXhtkj: false,
     })
+    expect(runtime.snapshot().devices.map(device => device.id)).toContain('coyote')
+    expect(runtime.snapshot().devices.map(device => device.id)).toContain('xhtkj')
 
+    // Removing 谜姬 persists: the next run on the same data dir starts without it.
+    await runtime.removeDevice('xhtkj')
+    await runtime.shutdown()
+    runtime = await createHostRuntime({
+      dataDir: root,
+      clock,
+      withPanicServer: false,
+      bleTransport: transport,
+    })
     const ids = runtime.snapshot().devices.map(device => device.id)
-    expect(ids).not.toContain('coyote')
+    expect(ids).toContain('coyote')
     expect(ids).not.toContain('xhtkj')
-    // The mocks are unaffected.
     expect(ids).toContain('mock-pulse')
     expect(ids).toContain('mock-hold')
+    expect(runtime.listDevices().map(entry => entry.key)).toEqual(['coyote'])
+  })
+
+  it('adds a second unit of a protocol with a fresh key and registers it', async () => {
+    const clock = new FakeClock()
+    const transport = new MockBleTransport({ clock, name: COYOTE_BLE_NAME })
+    runtime = await createHostRuntime({
+      dataDir: root,
+      clock,
+      withPanicServer: false,
+      bleTransport: transport,
+    })
+
+    const added = await runtime.addDevice('coyote')
+    expect(added.key).toBe('coyote-2')
+    expect(added.lifecycle).toBe('ready')
+    expect(runtime.snapshot().devices.map(device => device.id)).toContain('coyote-2')
+
+    // The transport addresses each unit by its own filter name.
+    expect(transport.peripheralFor(filter => filter.name === COYOTE_BLE_NAME)).toBeDefined()
+    expect(runtime.listDevices().map(entry => entry.key)).toEqual(['coyote', 'xhtkj', 'coyote-2'])
+  })
+
+  it('allows adding and removing a mock device without a BLE transport (start-dev)', async () => {
+    const clock = new FakeClock()
+    runtime = await createHostRuntime({ dataDir: root, clock, withPanicServer: false })
+    expect(runtime.listDevices()).toEqual([])
+    const added = await runtime.addDevice('mock')
+    expect(added.key).toBe('mock')
+    expect(runtime.snapshot().devices.map(device => device.id)).toContain('mock')
+    const second = await runtime.addDevice('mock')
+    expect(second.key).toBe('mock-2')
+    await runtime.removeDevice('mock')
+    expect(runtime.snapshot().devices.map(device => device.id)).not.toContain('mock')
+    expect(runtime.snapshot().devices.map(device => device.id)).toContain('mock-2')
   })
 
   it('lets a failed device reconnect through the registry', async () => {

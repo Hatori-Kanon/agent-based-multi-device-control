@@ -11,16 +11,15 @@
  * 2. **The 100 ms `B0` stream *is* the dead-man switch.** Stop writing and the
  *    box stops. Nothing here may ever "latch" output into the device, and the
  *    host process dying is therefore self-limiting.
- * 3. **Strength is only written when we want it to change.** Sending absolute
- *    strength on every frame would fight the physical wheel, taking away a
- *    control the human holds in their hand.
+ * 3. **Strength is only written when we want it to change.** The stream is the
+ *    only authority on target strength: the physical wheel is deliberately not
+ *    adopted (that feature was removed — a wheel report now makes the stream
+ *    re-assert the commanded target instead of following the hand), so the
+ *    cap and level the client commands are what the box plays.
  *
- * On the wheel specifically: an uncommanded change is adopted as the new target
- * and reported, so the stream stops overriding it. That is enough for a steady
- * level, but a modulating envelope will still move the strength on its next
- * differing sample. **The wheel is therefore not a reliable way to reduce
- * output while a pattern runs — the three emergency-stop paths are.** This is a
- * deliberate product decision, not an oversight.
+ * The wheel therefore has no influence over what the box plays. The client
+ * (console UI, agent) decides cap and level; the emergency-stop paths are the
+ * escape hatches if the client is wrong.
  *
  * One frame carries *both* channels, so the two channels are composed together
  * rather than written separately — which is exactly why keep-alive lives in the
@@ -46,7 +45,6 @@ import {
   percentToStrength,
   SILENT_FREQ,
   SILENT_INTENSITY,
-  strengthToPercent,
   type StrengthMode,
 } from './protocol.ts'
 
@@ -92,6 +90,12 @@ export interface CoyoteBackendOptions {
   readonly name?: string
   readonly clock: Clock
   readonly transport: BleTransport
+  /**
+   * Advertised name to scan for. Defaults to the Coyote family name; a second
+   * unit can be targeted by a different name (or by powering only that unit
+   * during add).
+   */
+  readonly bleName?: string
   /** Percentage ceiling per channel; becomes the `BF` hardware soft cap. */
   readonly maxPercent: (channelId: CoyoteChannelId) => number
   /** Waveform intensity ceiling per channel, applied to every emitted frame. */
@@ -103,12 +107,6 @@ export interface CoyoteBackendOptions {
   readonly frameMs?: number
   readonly plainFrame?: PulseFrame
   readonly onError?: (error: unknown) => void
-  /**
-   * A strength change the host did not command — the physical wheel or the
-   * vendor app. Already adopted as the new target so the stream stops fighting
-   * it; the host decides whether to also stop the pattern.
-   */
-  readonly onExternalStrength?: (channelId: CoyoteChannelId, percent: number) => void
 }
 
 interface CoyoteChannelState {
@@ -116,8 +114,6 @@ interface CoyoteChannelState {
   target: number
   /** Strength the box last reported. `-1` until the first report. */
   known: number
-  /** True once the box has acknowledged a change we initiated. */
-  baseline: boolean
   waveform: Waveform | undefined
   cursor: number
 }
@@ -125,7 +121,7 @@ interface CoyoteChannelState {
 function freshChannel(): CoyoteChannelState {
   // `known: -1` can never equal a target, so the first frame always asserts an
   // absolute strength and the box cannot keep a previous session's level.
-  return { target: 0, known: -1, baseline: false, waveform: undefined, cursor: 0 }
+  return { target: 0, known: -1, waveform: undefined, cursor: 0 }
 }
 
 export class CoyoteBackend implements DeviceBackend {
@@ -166,7 +162,7 @@ export class CoyoteBackend implements DeviceBackend {
     this.writeFailures = 0
 
     const peripheral = await this.options.transport.request({
-      name: COYOTE_BLE_NAME,
+      name: this.options.bleName ?? COYOTE_BLE_NAME,
       services: [COYOTE_SERVICE, COYOTE_BATTERY_SERVICE],
     }, signal)
     this.peripheral = peripheral
@@ -348,15 +344,9 @@ export class CoyoteBackend implements DeviceBackend {
     for (const [id, strength] of [['a', message.strengthA], ['b', message.strengthB]] as const) {
       const state = this.state[id]
       state.known = strength
-      if (acked) state.baseline = true
-      // A report with sequence 0 that disagrees with our target means someone
-      // turned the wheel. Adopt it so the stream stops overriding a control the
-      // human is physically holding — but only once our own baseline is known,
-      // or a leftover level from a previous session would look like an override.
-      if (message.seq === 0 && state.baseline && strength !== state.target) {
-        state.target = strength
-        this.options.onExternalStrength?.(id, strengthToPercent(strength))
-      }
+      // An uncommanded report (sequence 0) is the physical wheel or a leftover
+      // level. The stream is the only authority on target: the next frame
+      // re-asserts the commanded strength rather than following the hand.
     }
   }
 

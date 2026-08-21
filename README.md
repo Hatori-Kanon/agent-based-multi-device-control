@@ -129,13 +129,7 @@ $env:EMBODIED_DATA_DIR = "E:\embodied-data"   # 可选：固定数据目录，�
 pnpm --filter @embodied/desktop start
 ```
 
-**只调试一台 BLE 设备时**，把另一个 BLE 后端关掉，省得它空扫两轮：
-
-```powershell
-$env:EMBODIED_ENABLE_XHTKJ = "0"   # 只有郊狼时
-# 或 $env:EMBODIED_ENABLE_COYOTE = "0"   # 只有谜姬时
-$env:EMBODIED_WITH_BUTTPLUG = "0"  # 没有 Buttplug 设备时，跳过 Intiface 探测
-```
+**设备清单（manifest）**：哪些 BLE 单元存在由持久化清单决定（`<dataDir>/state/devices.json`，首次 BLE 运行自动写入一台郊狼 + 一台谜姬）。控制台顶部「设备管理」可随时**添加/移除**设备：添加时选择协议（郊狼 / 谜姬直连 / 模拟），移除会立即停止输出并断开。多台同协议单元在添加时只打开一台即可准确配对。`EMBODIED_WITH_BUTTPLUG = "0"` 可以在没有 Buttplug 设备时跳过 Intiface 探测。
 
 MonsterParty 中继需要分享链接 token：`$env:EMBODIED_MONSTERPARTY_TOKEN = "<token>"`。
 
@@ -146,7 +140,7 @@ Electron 窗口加载的就是控制台网页，它由运行时内置的 HTTP �
 - **这是最终终端的雏形**：HTTP API（`/api/snapshot`、`/api/panic`、`/api/unlock`、`/api/cap`、`/api/pattern`、`/api/stop`、`/api/connect`、`/api/scan`、`/api/waveforms/*`、`/api/audit`）就是终端的能力面，M4b 的 Android WebView / 局域网手机浏览器复用的就是这套接口和这份静态 UI，零改动。UI 是纯静态三个文件（`apps/desktop/src/ui/`），无框架无构建。
 - 所有请求都要 `x-control-token`；凭据写在 `<dataDir>/state/dashboard.json`。
 - 带外急停（`POST /panic`）是**独立服务器、独立 token**，即使控制台出问题也不受影响。
-- 控制台功能：设备卡片（生命周期、重连/扫描）、每通道强度/脉宽/时长上限滑块（改动即下发郊狼 `BF` 并审计）、波形下拉选择、15 秒试跑与自定义模式（prompt 依次问模式/强度/时长/周期/抖动）、波形库（导入 hex、会话→库提升）、审计日志尾部、大急停按钮 + LOCKED 横幅。
+- 控制台功能：设备管理（添加/移除，添加时选协议）、设备卡片（生命周期、重连/扫描、移除）、每通道强度/脉宽/时长上限滑块（改动即下发郊狼 `BF` 并审计）、波形下拉选择、15 秒试跑与自定义模式（prompt 依次问模式/强度/时长/周期/抖动）、波形库（导入 hex、会话→库提升）、审计日志尾部、大急停按钮 + LOCKED 横幅。
 
 点"试跑"会在对应通道跑 15 秒的 `wave` 包络——用来手工确认整条链路（策略校验 → 调度 → 串行写入 → 审计）真的通了。郊狼开机并允许蓝牙后会作为 `coyote` 出现，谜姬作为 `xhtkj`；连接失败或断开的设备会显示「重连」按钮，不必重启 app。
 

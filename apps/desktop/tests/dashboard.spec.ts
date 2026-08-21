@@ -114,6 +114,47 @@ describe('DashboardServer', () => {
     expect(body.devices.every(device => device.lifecycle === 'ready')).toBe(true)
   })
 
+  it('adds and removes manifest devices over the API', async () => {
+    const host = await start()
+    const token = host.dashboardToken
+
+    let response = await fetch(`${base(host)}/api/devices`, { headers: headers(token) })
+    expect(response.status).toBe(200)
+    let body: { devices: Array<{ key: string }>; snapshot?: { devices: Array<{ id: string }> } } = await response.json()
+    expect(body.devices).toEqual([])
+
+    response = await fetch(`${base(host)}/api/devices`, {
+      method: 'POST',
+      headers: headers(token, true),
+      body: JSON.stringify({ protocol: 'mock' }),
+    })
+    expect(response.status).toBe(200)
+    body = await response.json()
+    const devices = body.devices
+    expect(devices.map(device => device.key)).toContain('mock')
+    expect(body.snapshot!.devices.some(device => device.id === 'mock')).toBe(true)
+
+    response = await fetch(`${base(host)}/api/devices/remove`, {
+      method: 'POST',
+      headers: headers(token, true),
+      body: JSON.stringify({ key: 'mock' }),
+    })
+    expect(response.status).toBe(200)
+    body = await response.json()
+    expect(body.snapshot!.devices.some(device => device.id === 'mock')).toBe(false)
+    expect(body.devices).toEqual([])
+  })
+
+  it('rejects an unknown add protocol with 400', async () => {
+    const host = await start()
+    const response = await fetch(`${base(host)}/api/devices`, {
+      method: 'POST',
+      headers: headers(host.dashboardToken, true),
+      body: JSON.stringify({ protocol: 'telepath' }),
+    })
+    expect(response.status).toBe(400)
+  })
+
   it('runs a pattern, stops a channel, and changes a cap', async () => {
     const host = await start()
     const token = host.dashboardToken

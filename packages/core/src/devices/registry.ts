@@ -266,6 +266,34 @@ export class DeviceRegistry {
     })
   }
 
+  /** Drop a backend from the runtime: stop output, close the transport, remove it. */
+  async unregister(deviceId: string): Promise<void> {
+    const device = this.devices.get(deviceId)
+    if (device === undefined) {
+      throw new SafetyError('UNKNOWN_DEVICE', `no such device: ${deviceId}`)
+    }
+    device.linkLostOff?.()
+    device.linkLostOff = undefined
+    device.channelsChangedOff?.()
+    device.channelsChangedOff = undefined
+    for (const state of device.channels.values()) {
+      state.runner.cancel()
+      state.percent = 0
+      state.waveform = undefined
+    }
+    try {
+      await device.queue.enqueue(() => device.backend.close(), true)
+    } finally {
+      this.devices.delete(deviceId)
+    }
+    await this.options.audit.record({
+      actor: 'human',
+      action: 'device_removed',
+      result: 'ok',
+      detail: { deviceId },
+    })
+  }
+
   async connect(deviceId: string, signal: AbortSignal): Promise<void> {
     this.assertRunning()
     const device = this.requireDevice(deviceId)

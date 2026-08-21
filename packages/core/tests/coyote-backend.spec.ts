@@ -20,7 +20,6 @@ import {
   percentToStrength,
   type AuditRecord,
   type CoyoteBackendOptions,
-  type CoyoteChannelId,
   type MockBleWrite,
   type Waveform,
 } from '../src/index.ts'
@@ -65,7 +64,6 @@ function signal(): AbortSignal {
 function harness(overrides: Partial<CoyoteBackendOptions> = {}) {
   const clock = new FakeClock()
   const errors: unknown[] = []
-  const external: { channelId: CoyoteChannelId; percent: number }[] = []
   const transport = new MockBleTransport({ clock, name: COYOTE_BLE_NAME, ...(overrides.transport ? {} : {}) })
   const backend = new CoyoteBackend({
     clock,
@@ -73,10 +71,9 @@ function harness(overrides: Partial<CoyoteBackendOptions> = {}) {
     maxPercent: () => 40,
     maxWaveIntensity: () => 80,
     onError: error => { errors.push(error) },
-    onExternalStrength: (channelId, percent) => { external.push({ channelId, percent }) },
     ...overrides,
   })
-  return { clock, transport, backend, errors, external }
+  return { clock, transport, backend, errors }
 }
 
 function b0Writes(writes: readonly MockBleWrite[]): DecodedB0[] {
@@ -303,13 +300,13 @@ describe('Coyote waveform stage', () => {
 describe('Coyote physical wheel', () => {
   const NOTIFY = { service: COYOTE_SERVICE, characteristic: '0000150b-0000-1000-8000-00805f9b34fb' }
 
-  it('adopts an uncommanded strength change instead of fighting it', async () => {
+  it('ignores an uncommanded strength change and re-asserts the commanded target', async () => {
     const h = harness()
     await h.backend.connect(signal())
     await h.backend.settled()
     const peripheral = h.transport.peripheral!
 
-    // Establish the baseline by acknowledging our own zero.
+    // Acknowledge our own zero so the box knows the baseline.
     const firstSeq = b0Writes(peripheral.writes)[0]!.seq
     peripheral.notify(NOTIFY, Uint8Array.from([0xb1, firstSeq, 0, 0]))
 
@@ -319,17 +316,18 @@ describe('Coyote physical wheel', () => {
     const commanded = b0Writes(peripheral.writes).at(-1)!
     peripheral.notify(NOTIFY, Uint8Array.from([0xb1, commanded.seq, commanded.strengthA, 0]))
 
-    // The operator turns the wheel down: sequence 0, value we did not ask for.
+    // The operator turns the wheel: sequence 0, a value we did not command.
+    // The wheel is no longer adopted — the stream stays in charge.
     peripheral.notify(NOTIFY, Uint8Array.from([0xb1, 0, 40, 0]))
-    expect(h.external).toEqual([{ channelId: 'a', percent: 20 }])
 
     h.clock.advance(100)
     await h.backend.settled()
-    // Having adopted it, the stream must not re-assert the old target.
-    expect(b0Writes(peripheral.writes).at(-1)?.modeA).toBe(MODE.none)
+    const frame = b0Writes(peripheral.writes).at(-1)!
+    expect(frame.modeA).toBe(MODE.absolute)
+    expect(frame.strengthA).toBe(percentToStrength(30))
   })
 
-  it('ignores a stale level report before our own baseline is known', async () => {
+  it('ignores a stale level report and drives it to zero', async () => {
     const h = harness()
     await h.backend.connect(signal())
     await h.backend.settled()
@@ -337,7 +335,6 @@ describe('Coyote physical wheel', () => {
 
     // A box still holding 50 from a previous session reports it with seq 0.
     peripheral.notify(NOTIFY, Uint8Array.from([0xb1, 0, 100, 0]))
-    expect(h.external).toEqual([])
 
     h.clock.advance(100)
     await h.backend.settled()
