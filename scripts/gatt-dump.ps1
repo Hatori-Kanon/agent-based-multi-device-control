@@ -46,7 +46,7 @@ $null = [Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceService, Wi
 $null = [Windows.Devices.Bluetooth.GenericAttributeProfile.GattCharacteristic, Windows.Devices.Bluetooth, ContentType = WindowsRuntime]
 $null = [Windows.Devices.Bluetooth.GenericAttributeProfile.GattCharacteristicProperties, Windows.Devices.Bluetooth, ContentType = WindowsRuntime]
 
-$address = [System.UInt64]::Parse(('0x' + $mac), [System.Globalization.NumberStyles]::HexNumber)
+$address = [Convert]::ToUInt64($mac, 16)
 $leDevice = Await ([Windows.Devices.Bluetooth.BluetoothLEDevice]::FromBluetoothAddressAsync($address)) ([Windows.Devices.Bluetooth.BluetoothLEDevice])
 Write-Output ("connection: {0}" -f $leDevice.ConnectionStatus)
 
