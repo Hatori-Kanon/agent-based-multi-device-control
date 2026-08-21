@@ -83,7 +83,13 @@ describe('XHTKJ connect', () => {
     const filter = h.transport.requests[0]!
     // Only 0xd34e is advertised, so only it may appear in the match.
     expect(filter.services).toEqual([XHTKJ_ADVERTISING_SERVICE])
-    expect(filter.optionalServices).toEqual([XHTKJ_DEVICE_SERVICE, DEVICE_INFORMATION_SERVICE])
+    // Every control layout is granted up front (Web Bluetooth denies access
+    // to undeclared services).
+    expect(filter.optionalServices).toEqual([
+      XHTKJ_DEVICE_SERVICE,
+      DEVICE_INFORMATION_SERVICE,
+      XHTKJ_ALT_SERVICE,
+    ])
   })
 
   it('pins the scan to a specific unit by advertised name', async () => {

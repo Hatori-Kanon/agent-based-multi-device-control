@@ -202,9 +202,11 @@ export class XhtkjBackend implements DeviceBackend {
     this.resetState()
 
     const peripheral = await this.options.transport.request({
-      // Only 0xd34e is advertised; the control and info services are not.
+      // Only 0xd34e is advertised; the control and info services are not, so
+      // every one of them must be granted up front (Web Bluetooth refuses
+      // access to undeclared services).
       services: [XHTKJ_ADVERTISING_SERVICE],
-      optionalServices: [XHTKJ_DEVICE_SERVICE, DEVICE_INFORMATION_SERVICE],
+      optionalServices: [XHTKJ_DEVICE_SERVICE, DEVICE_INFORMATION_SERVICE, XHTKJ_ALT_SERVICE],
       ...(this.options.bleName === undefined ? {} : { name: this.options.bleName }),
     }, signal)
     this.peripheral = peripheral
