@@ -131,6 +131,25 @@ export interface DeviceManagerEntry {
   readonly channels: readonly string[]
 }
 
+/** File format version; bumped when the well-known device list changes. */
+const MANIFEST_VERSION = 2
+
+interface DeviceManifestFile {
+  readonly version?: number
+  readonly devices?: unknown
+}
+
+/**
+ * Well-known units baked into new manifests (and introduced once into old ones
+ * by the version migration). Fresh installs get these cards; the migration runs
+ * exactly once per manifest, so a later 移除 sticks.
+ */
+const WELL_KNOWN_DEVICES: readonly DeviceManifestEntry[] = [
+  { key: 'coyote', protocol: 'coyote' },
+  { key: 'xhtkj', protocol: 'xhtkj' },
+  { key: 'zkrxb', protocol: 'xhtkj', bleName: 'ANKNI ZKRXB', label: 'ANKNI ZKRXB（旋转）' },
+]
+
 function isDeviceProtocol(value: unknown): value is DeviceProtocol {
   return typeof value === 'string' && (DEVICE_PROTOCOLS as readonly string[]).includes(value)
 }
@@ -206,26 +225,42 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
   const controller = new AbortController()
 
   // ── Device manifest: which units exist and how to reach them ────────────
-  // Seeded with coyote + xhtkj on the first BLE run (today's behavior); from
-  // then on the persisted list is the operator's, added to and removed from
-  // through the console.
+  // New manifests are seeded with the well-known units; older files are
+  // migrated once by the manifest version. From then on the persisted list is
+  // the operator's, added to and removed from through the console.
   let manifest: DeviceManifestEntry[] = []
+  let manifestVersion = 0
   const saveManifest = async (): Promise<void> => {
-    await documents.write('devices', JSON.stringify(manifest, null, 2))
+    const file: { version: number; devices: DeviceManifestEntry[] } = { version: MANIFEST_VERSION, devices: manifest }
+    await documents.write('devices', JSON.stringify(file, null, 2))
   }
   {
     const raw = await documents.read('devices')
     if (raw !== undefined) {
       try {
         const parsed: unknown = JSON.parse(raw)
-        if (Array.isArray(parsed)) manifest = parsed.filter(isManifestEntry)
+        if (Array.isArray(parsed)) {
+          // v1 files were a bare array.
+          manifest = parsed.filter(isManifestEntry)
+        } else if (typeof parsed === 'object' && parsed !== null) {
+          const file = parsed as DeviceManifestFile
+          manifest = Array.isArray(file.devices) ? file.devices.filter(isManifestEntry) : []
+          manifestVersion = typeof file.version === 'number' ? file.version : 1
+        }
       } catch (error) {
         recordError(error)
       }
     }
-    if (manifest.length === 0 && options.bleTransport !== undefined) {
-      manifest = [{ key: 'coyote', protocol: 'coyote' }, { key: 'xhtkj', protocol: 'xhtkj' }]
-      await saveManifest()
+    if (options.bleTransport !== undefined) {
+      if (manifest.length === 0) {
+        manifest = [...WELL_KNOWN_DEVICES]
+        await saveManifest()
+      } else if (manifestVersion < MANIFEST_VERSION) {
+        // Introduce units that postdate the file (e.g. the rotation toy) once;
+        // the bumped version keeps later removals in place.
+        manifest = [...manifest, ...WELL_KNOWN_DEVICES.filter(entry => !manifest.some(existing => existing.key === entry.key))]
+        await saveManifest()
+      }
     }
   }
 

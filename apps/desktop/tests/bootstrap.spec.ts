@@ -201,6 +201,10 @@ describe('host runtime with a BLE transport', () => {
     })
     expect(runtime.snapshot().devices.map(device => device.id)).toContain('coyote')
     expect(runtime.snapshot().devices.map(device => device.id)).toContain('xhtkj')
+    // The well-known rotation unit is seeded with its pinned name.
+    const zkrxb = runtime.snapshot().devices.find(device => device.id === 'zkrxb')
+    expect(zkrxb).toBeDefined()
+    expect(zkrxb?.name).toContain('ANKNI ZKRXB')
 
     // Removing 谜姬 persists: the next run on the same data dir starts without it.
     await runtime.removeDevice('xhtkj')
@@ -216,7 +220,7 @@ describe('host runtime with a BLE transport', () => {
     expect(ids).not.toContain('xhtkj')
     expect(ids).toContain('mock-pulse')
     expect(ids).toContain('mock-hold')
-    expect(runtime.listDevices().map(entry => entry.key)).toEqual(['coyote'])
+    expect(runtime.listDevices().map(entry => entry.key)).toEqual(['coyote', 'zkrxb'])
   })
 
   it('adds a second unit of a protocol with a fresh key and registers it', async () => {
@@ -239,7 +243,7 @@ describe('host runtime with a BLE transport', () => {
     expect(runtime.snapshot().devices.find(device => device.id === 'coyote-2')?.lifecycle).toBe('ready')
     // The transport addresses each unit by its own filter name.
     expect(transport.peripheralFor(filter => filter.name === COYOTE_BLE_NAME)).toBeDefined()
-    expect(runtime.listDevices().map(entry => entry.key)).toEqual(['coyote', 'xhtkj', 'coyote-2'])
+    expect(runtime.listDevices().map(entry => entry.key)).toEqual(['coyote', 'xhtkj', 'zkrxb', 'coyote-2'])
   })
 
   it('allows adding and removing a mock device without a BLE transport (start-dev)', async () => {
