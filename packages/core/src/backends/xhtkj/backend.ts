@@ -34,6 +34,8 @@ import {
   PNP_ID_CHARACTERISTIC,
   STOP_MODE_PACKET,
   XHTKJ_ADVERTISING_SERVICE,
+  XHTKJ_ALT_SERVICE,
+  XHTKJ_ALT_WRITE_CHARACTERISTIC,
   XHTKJ_DEVICE_SERVICE,
   XHTKJ_NOTIFY_CHARACTERISTIC,
   XHTKJ_WRITE_CHARACTERISTIC,
@@ -58,6 +60,25 @@ const PNP_REF: BleCharacteristicRef = {
   service: DEVICE_INFORMATION_SERVICE,
   characteristic: PNP_ID_CHARACTERISTIC,
 }
+
+/** One known control-service layout of the 谜姬 family. */
+interface XhtkjLayout {
+  readonly write: BleCharacteristicRef
+  readonly notify: BleCharacteristicRef | undefined
+}
+
+/** Classic 谜姬 layout (0xff10/ff11/ff12). */
+const CLASSIC_LAYOUT: XhtkjLayout = { write: WRITE_REF, notify: NOTIFY_REF }
+/**
+ * ANKNI-clone layout (nakani, 0xdddd/ddd1/ddd2/ddd3): no notify path at all.
+ * The clone's control service was confirmed on a real ANKNI ZKRXB unit.
+ */
+const ALT_LAYOUT: XhtkjLayout = {
+  write: { service: XHTKJ_ALT_SERVICE, characteristic: XHTKJ_ALT_WRITE_CHARACTERISTIC },
+  notify: undefined,
+}
+/** Tried in order; the first one that accepts the INITIALIZE write wins. */
+const XHTKJ_LAYOUTS: readonly XhtkjLayout[] = [CLASSIC_LAYOUT, ALT_LAYOUT]
 
 const SECONDARY_LABEL: Readonly<Record<XhtkjCapability, string>> = {
   heat: '加热',
@@ -114,6 +135,8 @@ export class XhtkjBackend implements DeviceBackend {
   private productId: number | undefined
   private capability: XhtkjCapability = 'generic'
   private ready = false
+  /** Control-service layout adopted by the connect handshake. */
+  private layout: XhtkjLayout = CLASSIC_LAYOUT
 
   private primary = 0
   private secondary = 0
@@ -188,15 +211,6 @@ export class XhtkjBackend implements DeviceBackend {
     this.disconnectOff = peripheral.onDisconnect(() => { this.handleLinkLost() })
 
     try {
-      // Notifications are diagnostic only; a toy that refuses them still works.
-      try {
-        this.notifyOff = await peripheral.subscribe(NOTIFY_REF, data => {
-          this.lastNotificationHex = [...data].map(byte => byte.toString(16).padStart(2, '0')).join('')
-        })
-      } catch (error) {
-        this.options.onError?.(error)
-      }
-
       // Capability detection is best effort: an unreadable id degrades to
       // main-output-only rather than failing the connect.
       try {
@@ -206,15 +220,39 @@ export class XhtkjBackend implements DeviceBackend {
       }
       this.capability = capabilityOf(this.productId)
 
-      try {
-        await peripheral.write(WRITE_REF, INITIALIZE_PACKET, false)
-      } catch (error) {
+      // Adopt the control layout by handshake: clones (ANKNI ZKRXB...) serve
+      // 0xdddd instead of 0xff10 and expose no notify characteristic, so the
+      // classic layout must fail over cleanly.
+      let adopted: XhtkjLayout | undefined
+      let lastError: unknown
+      for (const layout of XHTKJ_LAYOUTS) {
+        this.notifyOff?.()
+        this.notifyOff = undefined
+        if (layout.notify !== undefined) {
+          try {
+            this.notifyOff = await peripheral.subscribe(layout.notify, data => {
+              this.lastNotificationHex = [...data].map(byte => byte.toString(16).padStart(2, '0')).join('')
+            })
+          } catch (error) {
+            this.options.onError?.(error)
+          }
+        }
+        try {
+          await peripheral.write(layout.write, INITIALIZE_PACKET, false)
+          adopted = layout
+          break
+        } catch (error) {
+          lastError = error
+        }
+      }
+      if (adopted === undefined) {
         await this.teardown()
         throw new SafetyError(
           'NOT_CONNECTED',
-          `initialize handshake failed (device ${this.id} may use a different service layout): ${error instanceof Error ? error.message : String(error)}`,
+          `initialize handshake failed on every known layout (classic 0xff10 and ANKNI 0xdddd): ${lastError instanceof Error ? lastError.message : String(lastError)}`,
         )
       }
+      this.layout = adopted
     } catch (error) {
       await this.teardown()
       throw error
@@ -324,7 +362,7 @@ export class XhtkjBackend implements DeviceBackend {
     const peripheral = this.peripheral
     if (peripheral?.connected !== true) throw new SafetyError('NOT_CONNECTED', `${this.id} is not connected`)
     // With response: this transport is command-per-change, not a stream.
-    await peripheral.write(WRITE_REF, packet, false)
+    await peripheral.write(this.layout.write, packet, false)
   }
 
   private cancelSchedule(): void {

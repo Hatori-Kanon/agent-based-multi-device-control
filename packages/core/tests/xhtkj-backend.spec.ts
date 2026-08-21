@@ -11,6 +11,8 @@ import {
   PolicyStore,
   SafetyError,
   XHTKJ_ADVERTISING_SERVICE,
+  XHTKJ_ALT_SERVICE,
+  XHTKJ_ALT_WRITE_CHARACTERISTIC,
   XHTKJ_DEVICE_SERVICE,
   XHTKJ_WRITE_CHARACTERISTIC,
   XhtkjBackend,
@@ -29,6 +31,15 @@ const PNP_KEY = `${DEVICE_INFORMATION_SERVICE}/${PNP_ID_CHARACTERISTIC}`.toLower
 /** PnP ID value whose bytes 3-4 encode the given product id, little endian. */
 function pnpFor(productId: number): Uint8Array {
   return Uint8Array.from([0x02, 0x5e, 0x04, productId & 0xff, (productId >> 8) & 0xff, 0x01, 0x00])
+}
+
+async function safetyErrorFrom(promise: Promise<unknown>): Promise<SafetyError> {
+  try {
+    await promise
+  } catch (error) {
+    return error as SafetyError
+  }
+  throw new Error('expected the promise to reject')
 }
 
 function signal(): AbortSignal {
@@ -82,6 +93,50 @@ describe('XHTKJ connect', () => {
     const filter = h.transport.requests[0]!
     expect(filter.name).toBe('ANKNI ZKRXB')
     expect(filter.services).toEqual([XHTKJ_ADVERTISING_SERVICE])
+  })
+
+  it('fails over to the ANKNI clone control layout (0xdddd) when 0xff10 is absent', async () => {
+    const clock = new FakeClock()
+    const errors: unknown[] = []
+    const transport = new MockBleTransport({
+      clock,
+      name: 'ANKNI ZKRXB',
+      reads: { [PNP_KEY]: pnpFor(0x2000) },
+      // The classic 谜姬 service does not exist on the clone.
+      failWrite: ref => (
+        ref.service === XHTKJ_DEVICE_SERVICE
+          ? new Error('NotFoundError: GATT service 0000ff10-0000-1000-8000-00805f9b34fb not found')
+          : undefined
+      ),
+    })
+    const backend = new XhtkjBackend({ clock, transport, onError: error => { errors.push(error) } })
+
+    await backend.connect(signal())
+    expect(backend.reportedProductId).toBe(0x2000)
+    expect(backend.reportedCapability).toBe('vibration')
+
+    // Output now goes through the clone's write characteristic.
+    await backend.applyLevel('primary', 30)
+    clock.advance(200)
+    await backend.settled()
+    const strength = (transport.peripheral?.writes ?? []).find(write => write.data[2] === COMMAND.strength)
+    expect(strength?.service).toBe(XHTKJ_ALT_SERVICE)
+    expect(strength?.characteristic).toBe(XHTKJ_ALT_WRITE_CHARACTERISTIC)
+  })
+
+  it('refuses with named errors when no control layout answers the handshake', async () => {
+    const clock = new FakeClock()
+    const transport = new MockBleTransport({
+      clock,
+      name: 'UNKNOWN TOY',
+      reads: { [PNP_KEY]: pnpFor(0x2000) },
+      failWrite: () => new Error('NotFoundError: no such characteristic'),
+    })
+    const backend = new XhtkjBackend({ clock, transport })
+
+    const error = await safetyErrorFrom(backend.connect(signal()))
+    expect(error.code).toBe('NOT_CONNECTED')
+    expect(error.message).toContain('every known layout')
   })
 
   it('reads the product id and initialises the session', async () => {

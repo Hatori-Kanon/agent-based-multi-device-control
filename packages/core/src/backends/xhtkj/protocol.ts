@@ -28,6 +28,10 @@ export const XHTKJ_ADVERTISING_SERVICE = bleUuid(0xd34e)
 export const XHTKJ_DEVICE_SERVICE = bleUuid(0xff10)
 export const XHTKJ_WRITE_CHARACTERISTIC = bleUuid(0xff12)
 export const XHTKJ_NOTIFY_CHARACTERISTIC = bleUuid(0xff11)
+/** ANKNI-clone control layout (ZKRXB & friends): no 0xff10, no notify. */
+export const XHTKJ_ALT_SERVICE = bleUuid(0xdddd)
+export const XHTKJ_ALT_WRITE_CHARACTERISTIC = bleUuid(0xddd2)
+export const XHTKJ_ALT_READ_CHARACTERISTIC = bleUuid(0xddd3)
 /** Standard Device Information service, never advertised. */
 export const DEVICE_INFORMATION_SERVICE = bleUuid(0x180a)
 /** Standard PnP ID characteristic; bytes 3-4 carry the vendor product id. */
