@@ -124,36 +124,48 @@
     },
 
     async read(handle, service, char) {
-      const target = await characteristic(handle, service, char)
-      const view = await target.readValue()
-      return bufferToHex(view)
+      try {
+        const target = await characteristic(handle, service, char)
+        const view = await target.readValue()
+        return bufferToHex(view)
+      } catch (error) {
+        throw new Error(`read failed: ${describe(error)}`)
+      }
     },
 
     async write(handle, service, char, hex, withoutResponse) {
-      const target = await characteristic(handle, service, char)
-      const data = hexToBuffer(hex)
-      // A 10 Hz command stream must not wait for a GATT acknowledgement, but
-      // fall back when the device only advertises the acknowledged form.
-      if (withoutResponse && target.properties.writeWithoutResponse) {
-        await target.writeValueWithoutResponse(data)
-      } else {
-        await target.writeValueWithResponse(data)
+      try {
+        const target = await characteristic(handle, service, char)
+        const data = hexToBuffer(hex)
+        // A 10 Hz command stream must not wait for a GATT acknowledgement, but
+        // fall back when the device only advertises the acknowledged form.
+        if (withoutResponse && target.properties.writeWithoutResponse) {
+          await target.writeValueWithoutResponse(data)
+        } else {
+          await target.writeValueWithResponse(data)
+        }
+        return true
+      } catch (error) {
+        throw new Error(`write failed: ${describe(error)}`)
       }
-      return true
     },
 
     async subscribe(handle, service, char) {
-      const target = await characteristic(handle, service, char)
-      const entry = link(handle)
-      const k = key(service, char)
-      if (entry.notifiers.has(k)) return true
-      const listener = event => {
-        host?.notify(handle, service, char, bufferToHex(event.target.value))
+      try {
+        const target = await characteristic(handle, service, char)
+        const entry = link(handle)
+        const k = key(service, char)
+        if (entry.notifiers.has(k)) return true
+        const listener = event => {
+          host?.notify(handle, service, char, bufferToHex(event.target.value))
+        }
+        target.addEventListener('characteristicvaluechanged', listener)
+        entry.notifiers.set(k, listener)
+        await target.startNotifications()
+        return true
+      } catch (error) {
+        throw new Error(`subscribe failed: ${describe(error)}`)
       }
-      target.addEventListener('characteristicvaluechanged', listener)
-      entry.notifiers.set(k, listener)
-      await target.startNotifications()
-      return true
     },
 
     async unsubscribe(handle, service, char) {
