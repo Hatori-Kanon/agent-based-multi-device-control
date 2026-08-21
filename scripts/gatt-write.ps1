@@ -69,7 +69,7 @@ if ($charObj -eq $null) { Write-Output "characteristic $Characteristic not found
 $bytes = for ($i = 0; $i -lt $Hex.Length; $i += 2) { [byte][Convert]::ToByte($Hex.Substring($i, 2), 16) }
 $writer = New-Object Windows.Storage.Streams.DataWriter
 $writer.WriteBytes($bytes)
-$buffer = $writer.DetachBuffer()
+$buffer = [Windows.Storage.Streams.IBuffer]$writer.DetachBuffer()
 $writer.Dispose()
 
 $option = if ($NoResponse) {
@@ -77,5 +77,6 @@ $option = if ($NoResponse) {
 } else {
   [Windows.Devices.Bluetooth.GenericAttributeProfile.GattWriteOption]::WriteWithResponse
 }
-$status = Await ($charObj.WriteValueAsync($buffer, $option)) ([Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus])
-Write-Output ("write {0} -> {1} ({2}): {3}" -f $Hex, $Characteristic, $option, $status)
+$optionTyped = [Windows.Devices.Bluetooth.GenericAttributeProfile.GattWriteOption]$option
+$status = Await ($charObj.WriteValueAsync($buffer, $optionTyped)) ([Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus])
+Write-Output ("write {0} -> {1} ({2}): {3}" -f $Hex, $Characteristic, $optionTyped, $status)
