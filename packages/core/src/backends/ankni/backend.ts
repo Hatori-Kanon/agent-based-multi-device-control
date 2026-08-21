@@ -19,7 +19,7 @@
 
 import { SafetyError } from '../../devices/errors.ts'
 import type { Channel, DeviceBackend } from '../../devices/types.ts'
-import type { BlePeripheral, BleTransport } from '../../ports/ble.ts'
+import type { BleCharacteristicRef, BlePeripheral, BleTransport } from '../../ports/ble.ts'
 import type { Clock, Timer } from '../../ports/clock.ts'
 import { adoptControlLayout, type XhtkjLayout } from '../xhtkj/layout.ts'
 import {
@@ -157,9 +157,8 @@ export class AnkniBackend implements DeviceBackend {
   }
 
   private async pushFrame(): Promise<void> {
-    if (this.writing) return
-    const frame = encodeAnkniFrame({ main: this.target })
-    await this.deliver(frame)
+    // Every frame joins the write chain: no skipping, no overlapping GATT ops.
+    await this.enqueueLive(encodeAnkniFrame({ main: this.target }))
   }
 
   private async flushFrame(frame: Uint8Array): Promise<void> {
@@ -207,7 +206,6 @@ export class AnkniBackend implements DeviceBackend {
   private async deliver(data: Uint8Array): Promise<void> {
     await this.enqueueLive(data)
   }
-
   private handleLinkLost(): void {
     if (this.ticker === undefined && this.peripheral === undefined) return
     this.ticker?.cancel()
