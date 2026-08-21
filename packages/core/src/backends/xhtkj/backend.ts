@@ -206,7 +206,15 @@ export class XhtkjBackend implements DeviceBackend {
       }
       this.capability = capabilityOf(this.productId)
 
-      await peripheral.write(WRITE_REF, INITIALIZE_PACKET, false)
+      try {
+        await peripheral.write(WRITE_REF, INITIALIZE_PACKET, false)
+      } catch (error) {
+        await this.teardown()
+        throw new SafetyError(
+          'NOT_CONNECTED',
+          `initialize handshake failed (device ${this.id} may use a different service layout): ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
     } catch (error) {
       await this.teardown()
       throw error

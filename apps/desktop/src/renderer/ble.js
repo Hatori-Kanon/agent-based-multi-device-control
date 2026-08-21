@@ -116,6 +116,7 @@
 
       device.addEventListener('gattserverdisconnected', () => {
         links.delete(handle)
+        host?.diag(`connect: gatt disconnected (${device.id})`)
         host?.disconnected(handle)
       })
 
