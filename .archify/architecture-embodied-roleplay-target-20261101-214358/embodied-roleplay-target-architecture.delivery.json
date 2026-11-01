@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "76319990-811e-46b4-a269-d79fbb25f437",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "E:\\Harness\\DSH\\Agent-based-multi-device-control\\.archify\\architecture-embodied-roleplay-target-20261101-214358\\candidate.json",
+  "output": "E:\\Harness\\DSH\\Agent-based-multi-device-control\\.archify\\architecture-embodied-roleplay-target-20261101-214358\\embodied-roleplay-target-architecture.html",
+  "specification": {
+    "sha256": "0d0332f5399dc695399c2584a7297c793f6d997d9effac035db37bd49c9bebee",
+    "bytes": 8214
+  },
+  "artifact": {
+    "sha256": "44b5490dae0d3b00fb8d3d16335e6f202edc8fdcf59f99dc8ff8d78edf16940f",
+    "bytes": 783560
+  }
+}

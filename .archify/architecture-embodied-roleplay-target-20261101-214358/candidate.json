@@ -1,0 +1,247 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Embodied Roleplay · 目标架构（M2 设计态）",
+    "locale": "zh-CN",
+    "output": ".archify/architecture-embodied-roleplay-target-20261101-214358/embodied-roleplay-target-architecture.html",
+    "quality_profile": "showcase"
+  },
+  "components": [
+    {
+      "id": "human",
+      "type": "external",
+      "label": "操作员",
+      "sublabel": "控制台 / 选项 / 热键",
+      "icon": "person",
+      "pos": [20, 60],
+      "size": [100, 60]
+    },
+    {
+      "id": "ui",
+      "type": "frontend",
+      "label": "控制台 UI",
+      "sublabel": "台词流 · 选项 · 调试",
+      "pos": [150, 60],
+      "size": [120, 60]
+    },
+    {
+      "id": "host",
+      "type": "backend",
+      "label": "Electron 宿主",
+      "sublabel": "窗口/热键/控制台/急停",
+      "pos": [310, 60],
+      "size": [120, 64]
+    },
+    {
+      "id": "llm",
+      "type": "cloud",
+      "label": "LLM 服务",
+      "sublabel": "OpenAI 兼容 · 多 provider",
+      "pos": [790, 60],
+      "size": [120, 60]
+    },
+    {
+      "id": "turn",
+      "type": "backend",
+      "label": "回合引擎",
+      "sublabel": "单调度器 · 状态机 · 优先级",
+      "tag": "M2 新增",
+      "pos": [310, 200],
+      "size": [120, 64]
+    },
+    {
+      "id": "director",
+      "type": "backend",
+      "label": "导演角色",
+      "sublabel": "BeatPlan · 0–3 选项",
+      "tag": "M2 新增",
+      "pos": [470, 200],
+      "size": [120, 64]
+    },
+    {
+      "id": "writer",
+      "type": "backend",
+      "label": "写作角色",
+      "sublabel": "纯文本 · 流式台词",
+      "tag": "M2 新增",
+      "pos": [790, 340],
+      "size": [120, 64]
+    },
+    {
+      "id": "gateway",
+      "type": "backend",
+      "label": "模型网关",
+      "sublabel": "tool calling · 回退链",
+      "tag": "M2 新增",
+      "pos": [790, 200],
+      "size": [120, 64]
+    },
+    {
+      "id": "executor",
+      "type": "backend",
+      "label": "执行器",
+      "sublabel": "intent→设备 · 夹紧 · 审计",
+      "tag": "M2 新增",
+      "pos": [310, 340],
+      "size": [120, 64]
+    },
+    {
+      "id": "runtime",
+      "type": "security",
+      "label": "设备运行时",
+      "sublabel": "Registry/Effect/Policy",
+      "pos": [470, 340],
+      "size": [120, 64]
+    },
+    {
+      "id": "waveform",
+      "type": "database",
+      "label": "波形子系统",
+      "sublabel": "库/DSL · 运行时调制",
+      "pos": [630, 340],
+      "size": [120, 64]
+    },
+    {
+      "id": "content",
+      "type": "database",
+      "label": "内容与状态",
+      "sublabel": "DLC/剧本 · 快照 · 账本",
+      "tag": "M2 新增",
+      "pos": [630, 200],
+      "size": [120, 64]
+    },
+    {
+      "id": "sensors",
+      "type": "backend",
+      "label": "感知与 probe",
+      "sublabel": "亮度/帧差/电平 · 被动探测",
+      "tag": "M2 新增",
+      "pos": [150, 480],
+      "size": [120, 64]
+    },
+    {
+      "id": "blebridge",
+      "type": "backend",
+      "label": "BLE 桥",
+      "sublabel": "BridgedBleTransport",
+      "pos": [310, 480],
+      "size": [120, 64]
+    },
+    {
+      "id": "worker",
+      "type": "frontend",
+      "label": "隐藏渲染窗口",
+      "sublabel": "Web Bluetooth",
+      "pos": [470, 480],
+      "size": [120, 64]
+    },
+    {
+      "id": "devices",
+      "type": "external",
+      "label": "BLE 外设",
+      "sublabel": "郊狼/谜姬/安可尼",
+      "pos": [640, 480],
+      "size": [120, 64]
+    },
+    {
+      "id": "ext",
+      "type": "external",
+      "label": "外部引擎/云",
+      "sublabel": "Intiface · MonsterParty",
+      "pos": [800, 480],
+      "size": [120, 64]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "隐藏渲染进程（Web Bluetooth）",
+      "wraps": ["worker"]
+    },
+    {
+      "kind": "region",
+      "label": "外部硬件与服务",
+      "wraps": ["devices", "ext"]
+    }
+  ],
+  "connections": [
+    { "id": "human-to-ui", "from": "human", "to": "ui" },
+    { "id": "human-to-host", "from": "human", "to": "host", "label": "Control+Alt+X", "variant": "emphasis", "fromSide": "top", "toSide": "top", "via": [[70, 25], [370, 25]] },
+    { "id": "ui-to-host", "from": "ui", "to": "host", "label": "HTTP" },
+    { "id": "host-to-turn", "from": "host", "to": "turn", "label": "调度" },
+    { "id": "turn-to-director", "from": "turn", "to": "director" },
+    { "id": "director-to-writer", "from": "director", "to": "writer" },
+    { "id": "writer-to-gateway", "from": "writer", "to": "gateway" },
+    { "id": "gateway-to-llm", "from": "gateway", "to": "llm", "label": "chat" },
+    { "id": "director-to-executor", "from": "director", "to": "executor", "label": "BeatPlan" },
+    { "id": "executor-to-runtime", "from": "executor", "to": "runtime", "label": "命令" },
+    { "id": "runtime-to-waveform", "from": "runtime", "to": "waveform", "label": "取帧" },
+    { "id": "runtime-to-blebridge", "from": "runtime", "to": "blebridge", "label": "BleTransport" },
+    { "id": "blebridge-to-worker", "from": "blebridge", "to": "worker", "label": "IPC" },
+    { "id": "worker-to-devices", "from": "worker", "to": "devices", "label": "GATT" },
+    { "id": "runtime-to-ext", "from": "runtime", "to": "ext", "label": "WS" },
+    { "id": "content-to-director", "from": "content", "to": "director" },
+    { "id": "content-to-writer", "from": "content", "to": "writer", "label": "人设" },
+    { "id": "sensors-to-turn", "from": "sensors", "to": "turn", "label": "特征", "fromSide": "left", "toSide": "top", "via": [[120, 512], [120, 180], [370, 180]] },
+    { "id": "executor-to-sensors", "from": "executor", "to": "sensors", "label": "窗口" }
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "设计态声明",
+      "items": [
+        "本图是目标架构，不是现状；M2 新增：回合引擎、导演、写作、执行器、模型网关、内容与状态、感知与 probe",
+        "已有部分复用：设备运行时、波形子系统、BLE 桥/隐藏窗口、控制台",
+        "与现状图对照看，差距就是 M2 的工程量"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "控制流水线",
+      "items": [
+        "单调度器、单回合互斥：玩家输入/自动运行/时间检查点都进同一优先级队列",
+        "导演出 BeatPlan：执行器立即派发动作，写作并行流式出台词",
+        "执行器不读台词；写作不生成控制；plan 是唯一事实源",
+        "选项由导演给 0–3 条，超时默认 passive（不行动）"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "内容与状态",
+      "items": [
+        "内容包两种模式：freeform（纯文档）/ scenario（阶段、意图、时间预算、收尾）",
+        "剧本只声明 feedbackIntents 与 region；设备映射与夹紧在运行时",
+        "会话快照 + 跨会话账本（可选 metaReactions）+ append-only 审计",
+        "崩溃恢复读最近快照，未完成回合不重放"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "感知",
+      "items": [
+        "采集端只发廉价特征（亮度/帧差/电平），1–2Hz，不调模型",
+        "被动 probe：动作前 1.5s 与动作后 2.5s 对比；观察不单独触发回合",
+        "模型只在本回合通过 look 按需取图；HR 接口预留、算法暂缓"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "波形",
+      "items": [
+        "资产：内置/导入/自创（DSL）+ 内容包 waveforms；library 与 session 两级",
+        "运行时调制：rate / intensityScale / phaseOffset / blend，多通道错相",
+        "只在发射端按 maxWaveIntensity 夹紧；幅度仍由 BF/cap 封顶"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "安全与模型",
+      "items": [
+        "不新增安全层：只有 policy、LOCKED、带外急停；会话级上限选项写入 BF",
+        "MVP 单模型 tool calling；配置层可把导演/写作拆成不同模型",
+        "任何跨会话“惩罚/态度”都是内容包声明，引擎不判断"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "eaff64cd-a5b2-49dc-89ae-2afb0e6ccb86",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "E:\\Harness\\DSH\\Agent-based-multi-device-control\\.archify\\architecture-ai-for-coyote-20261101-160515\\candidate.json",
+  "output": "E:\\Harness\\DSH\\Agent-based-multi-device-control\\.archify\\architecture-ai-for-coyote-20261101-160515\\ai-for-coyote-architecture.html",
+  "specification": {
+    "sha256": "013b8d3ea97dc0913f3226780f9151eab0947b1ecc145ab754cd329ad34b526b",
+    "bytes": 8406
+  },
+  "artifact": {
+    "sha256": "9431b8ac730f0102d2bce8b57ec0ceb69b8cdae21ed1407956c61e6e1087b1ac",
+    "bytes": 779160
+  }
+}

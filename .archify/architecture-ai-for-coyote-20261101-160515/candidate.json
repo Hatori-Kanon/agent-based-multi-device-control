@@ -1,0 +1,238 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "AI-for-Coyote（Coyote in Cradle）架构",
+    "locale": "zh-CN",
+    "output": ".archify/architecture-ai-for-coyote-20261101-160515/ai-for-coyote-architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/indhg/AI-for-Coyote.git",
+      "provider": "github",
+      "revision": "9cce657b8cd694632eb40108ae165eef14954d96"
+    }
+  },
+  "components": [
+    {
+      "id": "player",
+      "type": "external",
+      "label": "玩家",
+      "sublabel": "摄像头与麦克风前的人",
+      "icon": "person",
+      "pos": [20, 320],
+      "size": [100, 60]
+    },
+    {
+      "id": "shell",
+      "type": "backend",
+      "label": "桌面壳",
+      "sublabel": "pywebview · 单实例 · 管进程",
+      "pos": [165, 100],
+      "size": [120, 64],
+      "sources": [
+        { "path": "desktop/shell.py", "line": 127, "end_line": 172 }
+      ]
+    },
+    {
+      "id": "ui",
+      "type": "frontend",
+      "label": "React 控制台",
+      "sublabel": "Vite 构建 · WS 实时同步",
+      "pos": [165, 320],
+      "size": [120, 60],
+      "sources": [
+        { "path": "frontend/src/App.tsx", "line": 60, "end_line": 90 },
+        { "path": "frontend/src/api.ts", "line": 30, "end_line": 45 }
+      ]
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "FastAPI 主程序",
+      "sublabel": "AppState · REST + /ws",
+      "pos": [345, 320],
+      "size": [140, 60],
+      "sources": [
+        { "path": "backend/main.py", "line": 310, "end_line": 344 },
+        { "path": "backend/main.py", "line": 806, "end_line": 819 }
+      ]
+    },
+    {
+      "id": "loop",
+      "type": "backend",
+      "label": "游戏循环",
+      "sublabel": "观察→描写→动作→发言",
+      "pos": [550, 320],
+      "size": [140, 70],
+      "sources": [
+        { "path": "backend/game_loop.py", "line": 442, "end_line": 519 }
+      ]
+    },
+    {
+      "id": "safety",
+      "type": "security",
+      "label": "安全层",
+      "sublabel": "SafetyManager · 唯一出口",
+      "pos": [765, 320],
+      "size": [145, 70],
+      "sources": [
+        { "path": "backend/safety.py", "line": 84, "end_line": 115 },
+        { "path": "backend/safety.py", "line": 238, "end_line": 250 }
+      ]
+    },
+    {
+      "id": "sensors",
+      "type": "backend",
+      "label": "感知采集",
+      "sublabel": "Camera 截帧 · AudioManager 电平",
+      "pos": [550, 500],
+      "size": [140, 64],
+      "sources": [
+        { "path": "backend/camera.py", "line": 94, "end_line": 119 },
+        { "path": "backend/audio.py", "line": 87, "end_line": 145 }
+      ]
+    },
+    {
+      "id": "relay_cli",
+      "type": "backend",
+      "label": "中继客户端",
+      "sublabel": "RelayClient · device.op 帧",
+      "pos": [765, 500],
+      "size": [145, 64],
+      "sources": [
+        { "path": "backend/relay_client.py", "line": 92, "end_line": 148 },
+        { "path": "backend/device_ops.py", "line": 25, "end_line": 100 }
+      ]
+    },
+    {
+      "id": "relay_srv",
+      "type": "messagebus",
+      "label": "中继服务器",
+      "sublabel": "Bun · ws://:9998",
+      "pos": [985, 500],
+      "size": [140, 64],
+      "sources": [
+        { "path": "relay/v4-server.ts", "line": 118, "end_line": 135 },
+        { "path": "relay/README.md", "line": 109, "end_line": 136 }
+      ]
+    },
+    {
+      "id": "app",
+      "type": "external",
+      "label": "DG-LAB 4.0 App",
+      "sublabel": "手机 · 扫码接入 · 持 BLE",
+      "pos": [1165, 470],
+      "size": [120, 70],
+      "sources": [
+        { "path": "relay/README.md", "line": 120, "end_line": 136 }
+      ]
+    },
+    {
+      "id": "coyote",
+      "type": "external",
+      "label": "郊狼 V3 主机",
+      "sublabel": "A / B 双通道",
+      "pos": [1165, 650],
+      "size": [120, 64]
+    },
+    {
+      "id": "llm",
+      "type": "cloud",
+      "label": "OpenAI 兼容模型",
+      "sublabel": "chat/completions · 可配视觉端点",
+      "pos": [550, 100],
+      "size": [140, 64],
+      "sources": [
+        { "path": "backend/llm.py", "line": 25, "end_line": 30 },
+        { "path": "backend/llm.py", "line": 245, "end_line": 266 }
+      ]
+    },
+    {
+      "id": "config",
+      "type": "database",
+      "label": "配置与内容",
+      "sublabel": "YAML · 角色三件套 · DLC",
+      "pos": [345, 100],
+      "size": [140, 64],
+      "sources": [
+        { "path": "backend/config.py", "line": 29, "end_line": 105 },
+        { "path": "content/pure/触手-角色提示词-纯爱.md" }
+      ]
+    },
+    {
+      "id": "sensor_hw",
+      "type": "external",
+      "label": "摄像头 / 麦克风",
+      "sublabel": "可选 · 缺依赖自动禁用",
+      "pos": [165, 500],
+      "size": [145, 64]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Python 主程序 · FastAPI :8000",
+      "wraps": ["api", "loop", "safety", "sensors", "relay_cli"]
+    },
+    {
+      "kind": "region",
+      "label": "手机 + 硬件",
+      "wraps": ["app", "coyote"]
+    }
+  ],
+  "connections": [
+    { "id": "player-to-ui", "from": "player", "to": "ui" },
+    { "id": "ui-to-api", "from": "ui", "to": "api", "label": "HTTP", "variant": "emphasis" },
+    { "id": "api-to-loop", "from": "api", "to": "loop", "label": "回合" },
+    { "id": "loop-to-safety", "from": "loop", "to": "safety", "label": "动作" },
+    { "id": "safety-to-relay-cli", "from": "safety", "to": "relay_cli", "label": "已校验命令", "fromSide": "bottom", "toSide": "top" },
+    { "id": "relay-cli-to-srv", "from": "relay_cli", "to": "relay_srv", "label": "控制帧" },
+    { "id": "relay-srv-to-app", "from": "relay_srv", "to": "app" },
+    { "id": "app-to-coyote", "from": "app", "to": "coyote", "label": "BLE", "fromSide": "bottom", "toSide": "top" },
+    { "id": "shell-to-ui", "from": "shell", "to": "ui", "label": "内嵌窗口", "fromSide": "bottom", "toSide": "top" },
+    { "id": "config-to-api", "from": "config", "to": "api", "label": "配置 · 角色 · 波形", "fromSide": "bottom", "toSide": "top" },
+    { "id": "loop-to-llm", "from": "loop", "to": "llm", "label": "chat/completions", "fromSide": "top", "toSide": "bottom" },
+    { "id": "sensors-to-loop", "from": "sensors", "to": "loop", "label": "观察注入", "fromSide": "top", "toSide": "bottom" },
+    { "id": "api-to-sensors", "from": "api", "to": "sensors", "label": "启停", "fromSide": "bottom", "toSide": "left" },
+    { "id": "sensor-hw-to-sensors", "from": "sensor_hw", "to": "sensors", "label": "画面 / 声音" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "运行形态：四个进程",
+      "items": [
+        "桌面壳用 pywebview 拉起 bun 中继(:9998) 与 Python 后端(:8000)，关窗按进程树清理子进程",
+        "FastAPI 直接托管前端 dist，桌面窗口与浏览器打开的是同一个控制台网页",
+        "dry_run 默认 true：没有配对设备时动作只做校验与记录，不发送真实帧"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "安全层：五道闸",
+      "items": [
+        "每通道硬上限 + 运行时上限（默认 100，页面可调到 200），AI 与手动命令同一出口",
+        "单条增减 ≤ max_strength_step(40)；临时强度 ≤ max_temp_duration_s(10s) 到点归零",
+        "过热时该通道上限临时降到 20；App/中继断开自动清零",
+        "急停 = 全通道清零 + 清波形 + 暂停 AI 循环；estop 期间拒绝一切动作"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "上行状态：App 是状态源",
+      "items": [
+        "被控方上报 devices.snapshot / slots.patch（含 comfortLimit、slotState）/ custom.action",
+        "RelayClient 事件回调 → AppState → SafetyManager.update_device_state 采纳 App 舒适上限",
+        "首次配对成功后缓 3 秒，AI 主动开场并给出第一个轻微动作"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "内容与设备通道",
+      "items": [
+        "角色 = 提示词 + 语料 + 设定三件套（content/pure），换角色不改代码",
+        "DLC 以 zip 导入 content/pack/ 并回写 character.yaml，热加载生效",
+        "device_channels.yaml 把 A/B 通道绑定到具体配件与强度基准，提示词据此描写"
+      ]
+    }
+  ]
+}
