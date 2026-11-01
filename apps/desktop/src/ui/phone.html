@@ -2,77 +2,216 @@
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#08090c">
 <!--
-  Phone emergency-stop / status page (A1-T9).
+  手机急停页（A1-T9，v2「墨金」重做）。
 
-  The page itself is exempt from the control token (a page navigation cannot
-  carry headers, and a phone needs to load it before it can paste the token).
-  Every API call it makes does send `x-control-token`, so an anonymous visitor
-  can look at the page but cannot stop the session.
+  只做视觉与文案排版：内联脚本里的 token 读取、接口路径、成功/失败反馈与
+  「单次点按即急停」的防误触策略都保持原样，协议没有改动。
 
-  This page deliberately does NOT capture camera or audio: phone browsers need
-  a secure context (HTTPS) for getUserMedia, and M2 keeps capture on the PC's
-  USB camera (plan §8.1 conflict #4).
+  token 约定（与其它两页一致）：页面本身不带 token 也能打开（页面导航没法带
+  请求头），所有 API 调用都带 `x-control-token`；本页从地址栏 ?token= 读一次，
+  存进本机 localStorage，之后只从输入框取值。
+
+  本页不采集摄像头/麦克风：手机浏览器要 HTTPS 才给 getUserMedia，M2 的采集
+  仍然留在 PC 的 USB 摄像头上（实施计划 §8.1 冲突 #4）。
+
+  CSP 说明（刻意保持最小）：静态白名单只放行 phone.html（没有 phone.js），
+  急停逻辑只能写在页内，所以 script-src 需要 'unsafe-inline'——这与改造前
+  逐字一致；新增的只有 style-src 的 'self'，因为共享样式表是同源 /style.css。
+  没有放开 img-src / script-src 'self'：本页不加载图片，也没有外部脚本。
 -->
 <meta http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'">
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'">
 <title>Embodied 手机急停</title>
+<link rel="stylesheet" href="/style.css">
 <style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; min-height: 100vh;
-    font: 16px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
-    background: #0d0d12; color: #e8e8ee;
-    display: flex; align-items: center; justify-content: center;
+  /* 本页只补 style.css 没覆盖的排版；颜色、圆角、字体全部取自设计令牌。 */
+
+  /* style.css 的 app 外壳默认 overflow:hidden；手机急停页需要能上下滚动。 */
+  body.phone-page {
+    overflow-y: auto;
+    overflow-x: hidden;
   }
-  main { width: min(92vw, 420px); padding: 20px 0; }
-  h1 { font-size: 18px; margin: 0 0 16px; letter-spacing: .04em; }
-  #locked-banner {
-    display: none; margin-bottom: 16px; padding: 12px 16px;
-    background: #3d1420; border: 1px solid #8d2642; border-radius: 12px;
-    font-weight: 650;
+
+  /* 手机优先的窄列：内容短时垂直居中，屏幕矮到放不下时从顶部开始并可滚动。 */
+  .phone-page .phone {
+    justify-content: flex-start;
+    gap: 16px;
+    max-width: 440px;
+    margin: 0 auto;
+    padding-top: 30px;
   }
-  #locked-banner.on { display: block; }
-  #status { color: #9a9aa6; font-size: 13px; min-height: 22px; margin-bottom: 18px; }
-  #panic-button {
-    display: block; width: 100%; min-height: 30vh;
-    font-size: 30px; font-weight: 800; letter-spacing: .16em;
-    background: #8d1230; border: 2px solid #c22b4f; color: #fff;
-    border-radius: 22px; cursor: pointer;
+
+  @media (min-height: 780px) {
+    .phone-page .phone {
+      justify-content: center;
+      /* 内容意外变高（很长的一行错误）时退回顶部对齐，避免顶部被裁掉。 */
+      justify-content: safe center;
+    }
   }
-  #panic-button:hover { background: #a81738; }
-  #panic-button:active { transform: translateY(1px); }
-  #panic-button:disabled { opacity: .45; cursor: default; }
-  .token-row { display: flex; gap: 8px; margin-top: 18px; }
+
+  .phone-head {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 9px;
+  }
+
+  .phone-tagline {
+    color: var(--muted);
+    font-size: 12px;
+    letter-spacing: 0.2em;
+  }
+
+  /* 已锁定横幅：借用全站 .lock-banner，只改成本页需要的宽度/边距。 */
+  .phone-page #locked-banner {
+    width: 100%;
+    margin: 0;
+    font-size: 12.5px;
+    line-height: 1.6;
+    text-align: left;
+  }
+
+  /* 圆钮在手机竖屏上占满一列；桌面宽度下稍微放大一点，避免显得太小。 */
+  .phone-page .phone-dial {
+    width: min(74vw, 320px);
+    margin: 2px 0;
+  }
+
+  @media (min-width: 760px) {
+    .phone-page .phone-dial {
+      width: 340px;
+    }
+  }
+
+  /* 锁定后按钮禁用，给一个明确的「不可再按」视觉。 */
+  .phone-page .phone-stop:disabled {
+    opacity: 0.55;
+    filter: saturate(0.65);
+    cursor: not-allowed;
+    transform: none;
+  }
+
+  .phone-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    min-height: 48px;
+  }
+
+  #status {
+    color: var(--muted);
+    font-size: 12.5px;
+    line-height: 1.6;
+    max-width: 34ch;
+    word-break: break-word;
+  }
+
+  .phone-page .phone-note {
+    max-width: 36ch;
+    font-size: 12px;
+  }
+
+  /* token 卡片：只在需要人工粘贴 token 时出现，但始终保留在流里。 */
+  .phone-token {
+    width: 100%;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    background: linear-gradient(180deg, rgba(24, 28, 36, 0.82), rgba(17, 20, 26, 0.82));
+    text-align: left;
+  }
+
+  .phone-token-label {
+    display: block;
+    margin-bottom: 8px;
+    font-size: 10.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--faint);
+  }
+
+  .token-row {
+    display: flex;
+    gap: 8px;
+  }
+
   .token-row input {
-    flex: 1; min-width: 0; background: #1b1b24; border: 1px solid #34343f; color: inherit;
-    border-radius: 8px; padding: 8px 10px; font: inherit; font-size: 13px;
+    flex: 1;
+    min-width: 0;
   }
-  .token-row button {
-    background: #23232d; border: 1px solid #3a3a46; color: inherit;
-    border-radius: 8px; padding: 8px 14px; font: inherit; font-size: 13px; cursor: pointer;
+
+  #message {
+    min-height: 18px;
+    margin-top: 8px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.6;
+    word-break: break-word;
   }
-  #message { color: #8a8a96; font-size: 12px; margin-top: 10px; min-height: 18px; }
-  footer { color: #5f5f6a; font-size: 11px; margin-top: 16px; }
+
+  /* 成功/失败反馈用一个轻量色条区分，不改文案。 */
+  #message.ok {
+    color: var(--ok);
+  }
+
+  #message.bad {
+    color: var(--bad);
+  }
+
+  .phone-foot {
+    color: var(--faint);
+    font-size: 11px;
+    line-height: 1.6;
+  }
 </style>
 </head>
-<body>
-<main>
-  <h1>Embodied 手机急停</h1>
-  <div id="locked-banner">输出已被锁定。需要在 PC 控制台解锁后才能重新输出。</div>
-  <div id="status">正在读取状态…</div>
+<body class="phone-page">
+<main class="phone">
+  <header class="phone-head">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-title">Embodied</span>
+      <span class="brand-sub">手机急停</span>
+    </div>
+    <p class="phone-tagline">带外急停通道 · 控制端</p>
+  </header>
 
-  <button id="panic-button">紧急停止</button>
-
-  <div class="token-row">
-    <input id="token" type="password" autocomplete="off" spellcheck="false"
-           placeholder="控制台 token（控制台 URL 的 ?token= 后面那段）">
-    <button id="save-token">保存</button>
+  <div id="locked-banner" class="lock-banner" role="alert">
+    <span>输出已被锁定。需要在 PC 控制台解锁后才能重新输出。</span>
   </div>
-  <div id="message"></div>
-  <footer>刷新频率 1 秒。所有请求都要带控制台 token；本页不采集摄像头/麦克风。</footer>
+
+  <div class="phone-dial">
+    <button id="panic-button" class="phone-stop" type="button">
+      紧急停止
+      <small>点按立即生效</small>
+    </button>
+  </div>
+
+  <div class="phone-state" aria-live="polite">
+    <span id="status-pill" class="pill off">正在读取</span>
+    <span id="status">正在读取状态…</span>
+  </div>
+
+  <p class="phone-note">
+    这是带外急停通道：与模型、设备自身的停止逻辑相互独立。触发后所有输出立即清零并锁定，
+    需要在 PC 控制台解锁后才能恢复输出。本页不采集摄像头/麦克风。
+  </p>
+
+  <section class="phone-token">
+    <label class="phone-token-label" for="token">控制台 token</label>
+    <div class="token-row">
+      <input id="token" type="password" autocomplete="off" spellcheck="false"
+             placeholder="控制台 URL 里 ?token= 后面那段">
+      <button id="save-token" class="btn btn-sm" type="button">保存</button>
+    </div>
+    <p id="message" role="status" aria-live="polite"></p>
+  </section>
+
+  <footer class="phone-foot">状态每秒刷新 · token 只保存在本机浏览器</footer>
 </main>
 <script>
   (() => {
@@ -80,21 +219,35 @@
     const tokenInput = document.getElementById('token')
     const panicButton = document.getElementById('panic-button')
     const lockedBanner = document.getElementById('locked-banner')
+    const statusPill = document.getElementById('status-pill')
     const statusLine = document.getElementById('status')
     const messageLine = document.getElementById('message')
 
-    // The console hands out URLs shaped /?token=...; the phone page accepts the
-    // same query so an operator can just scan/paste the whole address once.
+    // 控制台发出去的 URL 形如 /?token=...；手机端可以把整个地址粘进来。
+    // localStorage 在隐私模式/存储被禁用时会抛异常——急停页不能因此整段脚本中断。
     const fromQuery = new URLSearchParams(location.search).get('token')
-    tokenInput.value = fromQuery || localStorage.getItem(STORAGE_KEY) || ''
-    if (fromQuery) localStorage.setItem(STORAGE_KEY, fromQuery)
+    let stored = ''
+    try { stored = localStorage.getItem(STORAGE_KEY) || '' } catch { stored = '' }
+    tokenInput.value = fromQuery || stored
+    try { if (fromQuery) localStorage.setItem(STORAGE_KEY, fromQuery) } catch { /* 存不了也不影响急停 */ }
 
     function token() { return tokenInput.value.trim() }
-    function say(text) { messageLine.textContent = text }
+
+    // 反馈文案保持原样，只把成功/失败映射到颜色。
+    function say(text, tone) {
+      messageLine.textContent = text
+      messageLine.className = tone === undefined ? '' : tone
+    }
+
+    // 状态行左侧的药丸：读取中/未配置=off，在线=ok，已急停/失败=bad。
+    function setPill(kind, text) {
+      statusPill.className = 'pill ' + kind
+      statusPill.textContent = text
+    }
 
     document.getElementById('save-token').addEventListener('click', () => {
-      localStorage.setItem(STORAGE_KEY, token())
-      say('token 已保存到本机浏览器')
+      try { localStorage.setItem(STORAGE_KEY, token()) } catch { /* 存不了只影响下次自动填充 */ }
+      say('token 已保存到本机浏览器', 'ok')
       void refresh()
     })
 
@@ -105,12 +258,14 @@
 
     async function api(path, init) {
       const headers = { 'x-control-token': token(), ...(init && init.headers ? init.headers : {}) }
-      return fetch(path, { ...(init || {}), headers })
+      // 超时是必要的：没有它，一次挂起的 fetch 会让状态行永远停在「正在读取」。
+      return fetch(path, { ...(init || {}), signal: AbortSignal.timeout(6000), headers })
     }
 
     async function refresh() {
       if (token().length === 0) {
         renderLocked(false)
+        setPill('off', '未配置')
         statusLine.textContent = '请先填入控制台 token'
         return
       }
@@ -118,25 +273,42 @@
         const response = await api('/api/snapshot')
         if (response.status === 401) {
           renderLocked(false)
+          setPill('bad', 'token 无效')
           statusLine.textContent = 'token 无效或已更换，请重新填入'
           return
         }
+        // 非 2xx（例如 500）不是快照：绝不能当成「未锁定/可输出」来渲染。
+        if (!response.ok) {
+          throw new Error(`控制台返回 HTTP ${response.status}`)
+        }
         const snapshot = await response.json()
-        // The banner is driven by the snapshot payload, not by local state:
-        // another device may have triggered the stop.
-        renderLocked(snapshot && snapshot.locked === true)
-        const count = snapshot && Array.isArray(snapshot.devices) ? snapshot.devices.length : 0
-        statusLine.textContent = snapshot && snapshot.locked === true
-          ? '输出已锁定 · ' + count + ' 台设备'
-          : '可输出 · ' + count + ' 台设备'
+        // 形状校验：只有带 devices 数组的才是快照，其余一律按「状态未知」处理。
+        if (snapshot === null || typeof snapshot !== 'object' || !Array.isArray(snapshot.devices)) {
+          throw new Error('控制台返回了非快照响应')
+        }
+        // 横幅由快照驱动而不是本地状态：别的设备也可能已经急停。
+        renderLocked(snapshot.locked === true)
+        const count = snapshot.devices.length
+        if (snapshot.locked === true) {
+          setPill('bad', '已急停')
+          statusLine.textContent = '输出已锁定 · ' + count + ' 台设备'
+        } else {
+          setPill('ok', '在线')
+          statusLine.textContent = '可输出 · ' + count + ' 台设备'
+        }
       } catch (error) {
+        // 与改动前一致：网络失败只报错，不改按钮/横幅状态（避免把「已锁定」
+        // 误判成「可再次急停」），但急停按钮必须保持可点——它可能在重试。
+        setPill('bad', '连接失败')
         statusLine.textContent = '连接失败：' + (error && error.message ? error.message : String(error))
+        if (!lockedBanner.classList.contains('on')) panicButton.disabled = false
       }
     }
 
     async function panic() {
       if (token().length === 0) {
-        say('急停需要控制台 token；请先填入并保存')
+        say('急停需要控制台 token；请先填入并保存', 'bad')
+        setPill('off', '未配置')
         return
       }
       panicButton.disabled = true
@@ -149,13 +321,18 @@
         })
         if (!response.ok) {
           const body = await response.json().catch(() => ({}))
-          say('急停失败：' + (body.error || response.status))
+          say('急停失败：' + (body.error || response.status), 'bad')
           return
         }
-        say('已急停。输出锁定，需在 PC 控制台解锁。')
+        setPill('bad', '已急停')
+        say('已急停。输出锁定，需在 PC 控制台解锁。', 'ok')
       } catch (error) {
-        say('急停失败：' + (error && error.message ? error.message : String(error)))
+        say('急停失败：' + (error && error.message ? error.message : String(error)), 'bad')
       } finally {
+        // 失败重试是带外急停的生命线：除非快照已确认锁定，否则按钮必须恢复可点。
+        // 旧实现依赖 refresh() 成功来解禁，网络抖动时会让按钮永久禁用。
+        panicButton.disabled = lockedBanner.classList.contains('on')
+        // 失败时也刷新一次，把按钮的禁用状态交还给快照（例如锁定其实已生效）。
         void refresh()
       }
     }

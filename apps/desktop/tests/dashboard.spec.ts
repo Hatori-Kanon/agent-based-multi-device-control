@@ -101,6 +101,18 @@ describe('DashboardServer', () => {
     // connect-src, connect-src falls back to 'none' and every fetch is blocked
     // by the browser — the console shows "Failed to fetch" and nothing loads.
     expect(html).toMatch(/connect-src 'self'/)
+
+    // The shared design system rides the same static allowlist. If it 404s the
+    // pages silently fall back to browser defaults — the pre-redesign "naked
+    // HTML" look — so this pins both the file and the link that loads it.
+    const style = await fetch(`${base(host)}/style.css`)
+    expect(style.status).toBe(200)
+    expect(style.headers.get('content-type')).toContain('text/css')
+    expect(await style.text()).toContain('--gold')
+    expect(html).toContain('href="/style.css"')
+    // No off-host assets: the CSP forbids them, and a stray CDN link would
+    // break the theme on a machine without internet access.
+    expect(html).not.toMatch(/(?:src|href)="https?:/u)
   })
 
   it('answers nothing without the token', async () => {
@@ -1043,6 +1055,7 @@ describe('play page (B2-T12)', () => {
     const html = await page.text()
     expect(html).toContain('Embodied 游玩')
     expect(html).toContain('/play.js')
+    expect(html).toContain('href="/style.css"')
     expect(html).toMatch(/connect-src 'self'/)
     // Safety chrome is in the markup: a persistent stop button and the LOCKED
     // banner. The debug panel ships hidden — off is the default view.

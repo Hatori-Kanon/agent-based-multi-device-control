@@ -15,13 +15,23 @@ import { join } from 'node:path'
 import { createHostRuntime } from './main/bootstrap.ts'
 import indexHtml from './ui/index.html?text'
 import appJs from './ui/app.js?text'
+import styleCss from './ui/style.css?text'
 // B2-T12: the play page is part of the same in-memory bundle, so start-dev.bat
 // reaches /play without Electron and without a disk lookup.
 import playHtml from './ui/play.html?text'
 import playJs from './ui/play.js?text'
+// The phone stop page is the third static file; keeping it in the map means the
+// bundle really is self-contained (no disk lookup for a page that must work
+// when the operator's phone is the only client).
+import phoneHtml from './ui/phone.html?text'
 
 const dataDir = process.env.EMBODIED_DATA_DIR ?? join(process.cwd(), '.dev-data')
 const port = Number(process.env.EMBODIED_DASHBOARD_PORT ?? 0)
+// UI iteration switch: read index/play/style straight from `src/ui` on every
+// request instead of the copies baked into this bundle. Only useful while
+// developing the pages; the default stays self-contained so start-dev.bat
+// works from any working directory.
+const uiFromDisk = process.env.EMBODIED_UI_FROM_DISK === '1'
 
 const runtime = await createHostRuntime({
   dataDir,
@@ -29,13 +39,21 @@ const runtime = await createHostRuntime({
   withButtplug: false,
   dashboardPort: port,
   // The UI files ride inside this bundle, so the dev server is self-contained
-  // and works from any working directory.
-  dashboardStaticFiles: {
-    'index.html': indexHtml,
-    'app.js': appJs,
-    'play.html': playHtml,
-    'play.js': playJs,
-  },
+  // and works from any working directory. `EMBODIED_UI_FROM_DISK=1` drops that
+  // map so every request re-reads `src/ui/` — that is the switch for iterating
+  // on the pages without rebuilding.
+  ...(uiFromDisk
+    ? {}
+    : {
+        dashboardStaticFiles: {
+          'index.html': indexHtml,
+          'app.js': appJs,
+          'style.css': styleCss,
+          'play.html': playHtml,
+          'play.js': playJs,
+          'phone.html': phoneHtml,
+        },
+      }),
   onError: error => { console.error('[dev-server]', error) },
 })
 

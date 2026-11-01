@@ -140,3 +140,6 @@ coyote-hub/
 analysis/hw9-capture/[0-9]*/
 analysis/hw9-capture/_tools/pylibs/
 analysis/hw9-capture/_tools/_pkgs/
+
+# Local UI screenshots / preview harness (never shipped)
+.ui-shots/

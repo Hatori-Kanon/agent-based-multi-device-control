@@ -5,225 +5,259 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'">
 <title>Embodied 控制台</title>
+<link rel="stylesheet" href="/style.css">
 <style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; padding: 18px 22px 60px;
-    font: 14px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
-    background: #0d0d12; color: #e8e8ee;
-  }
-  header.top { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; flex-wrap: wrap; }
-  h1 { font-size: 17px; margin: 0; letter-spacing: .04em; }
-  .status-pill { font-size: 12px; color: #8a8a96; border: 1px solid #2a2a34; border-radius: 999px; padding: 2px 10px; }
-  .status-pill.on { color: #5fd08a; border-color: #2c5c3d; }
-  .spacer { flex: 1; }
+  /* 本页特有的少量补充；设计令牌与组件样式全部来自 /style.css。 */
 
-  #panic {
-    font-size: 17px; font-weight: 800; letter-spacing: .08em;
-    background: #8d1230; border: 1px solid #c22b4f; color: #fff;
-    border-radius: 12px; padding: 14px 30px; cursor: pointer;
-  }
-  #panic:hover { background: #a81738; }
-  #panic:active { transform: translateY(1px); }
-
-  #lockBanner {
-    display: none; align-items: center; gap: 12px;
-    background: #3d1420; border: 1px solid #8d2642; border-radius: 10px;
-    padding: 10px 16px; margin-bottom: 16px;
-  }
-  #lockBanner.on { display: flex; }
-  #lockBanner span { flex: 1; }
-  button {
-    font: inherit; color: inherit; background: #23232d; border: 1px solid #3a3a46;
-    border-radius: 8px; padding: 6px 12px; cursor: pointer;
-  }
-  button:hover { background: #2b2b37; }
-  button:disabled { opacity: .4; cursor: default; }
-  button.mini { font-size: 12px; padding: 4px 10px; }
-
-  .device {
-    background: #14141b; border: 1px solid #262631; border-radius: 12px;
-    margin-bottom: 16px; overflow: hidden;
-  }
-  .device > header {
-    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-    padding: 12px 16px; background: #191922; border-bottom: 1px solid #262631;
-  }
-  .device h2 { font-size: 14px; margin: 0; font-weight: 650; }
-  .life { font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid #3a3a46; color: #8a8a96; }
-  .life.ready { color: #5fd08a; border-color: #2c5c3d; }
-  .life.failed { color: #ef8095; border-color: #7d2642; }
-  .life.connecting { color: #e6c267; border-color: #6b5a24; }
-
-  .ch { display: grid; grid-template-columns: 168px 1fr auto; gap: 14px; padding: 14px 16px; align-items: center; }
-  .ch + .ch { border-top: 1px solid #1f1f28; }
-  .ch-name { font-size: 13px; }
-  .ch-name small { display: block; color: #767682; font-size: 11px; margin-top: 1px; }
-
-  .meter { height: 9px; border-radius: 5px; background: #1e1e28; overflow: hidden; margin-bottom: 9px; }
-  .meter i {
-    display: block; height: 100%;
-    background: linear-gradient(90deg, #3d7fc4, #6fb4ef);
-    transition: width .15s linear;
-  }
-  .caps { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; font-size: 11.5px; color: #9a9aa6; }
-  .caps label { display: flex; align-items: center; gap: 6px; }
-  input[type=range] { width: 96px; accent-color: #4d8fd4; }
-  input[type=number] {
-    width: 64px; background: #1b1b24; border: 1px solid #34343f; color: inherit;
-    border-radius: 6px; padding: 3px 7px; font: inherit; font-size: 12px;
-  }
-  select {
-    background: #1b1b24; border: 1px solid #34343f; color: inherit;
-    border-radius: 6px; padding: 3px 6px; font: inherit; font-size: 12px; max-width: 170px;
-  }
-  .val { font-variant-numeric: tabular-nums; color: #d9d9e2; min-width: 40px; }
-  .acts { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
-  .hint { color: #5f5f6a; font-size: 11px; }
-
-  .panel { background: #14141b; border: 1px solid #262631; border-radius: 12px; margin-bottom: 16px; padding: 14px 16px; }
-  .panel h3 { margin: 0 0 10px; font-size: 13px; font-weight: 650; }
-  .panel h3 small { color: #767682; font-weight: 400; margin-left: 8px; }
-
-  .wf-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px; }
-  .wf-card { background: #191922; border: 1px solid #262631; border-radius: 10px; padding: 10px 12px; }
-  .wf-card .row1 { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-  .wf-card .name { font-weight: 650; font-size: 13px; }
-  .wf-card .scope { font-size: 10.5px; color: #767682; }
-  .wf-card .scope.session { color: #e6c267; }
-  .wf-card .meta { color: #767682; font-size: 11px; margin-top: 4px; }
-  .wf-card .tags { margin-top: 6px; }
-  .tag { font-size: 10px; background: #232330; color: #a8a8b6; border-radius: 5px; padding: 1px 6px; margin-right: 4px; }
-
-  .import-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
-  .import-row input[type=text] {
-    background: #1b1b24; border: 1px solid #34343f; color: inherit; border-radius: 6px;
-    padding: 5px 9px; font: inherit; font-size: 12px; width: 180px;
-  }
-  textarea {
-    width: 100%; min-height: 64px; background: #1b1b24; border: 1px solid #34343f;
-    color: inherit; border-radius: 8px; padding: 8px 10px; font: 12px/1.5 ui-monospace, Consolas, monospace;
+  /* 设备卡容器：让多台设备之间的间距由容器统一控制，而不是依赖 .device 的底边距 */
+  #devices {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
   }
 
-  #audit { max-height: 260px; overflow-y: auto; font: 11px/1.6 ui-monospace, Consolas, monospace; background: #0b0b10; border-radius: 8px; padding: 8px 10px; }
-  #audit div { white-space: pre-wrap; word-break: break-all; }
-  .r-rejected { color: #e6c267; }
-  .r-error { color: #ef8095; }
-  .a-human { color: #6fb4ef; }
-  #err { color: #ef8095; min-height: 18px; margin-top: 8px; font-size: 12px; }
-
-  #sensors { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: #9a9aa6; }
-  #sensors .sensor { display: flex; align-items: center; gap: 6px; }
-  #sensors .q-ok { color: #5fd08a; }
-  #sensors .q-bad { color: #ef8095; }
-  #sensors .q-warn { color: #e6c267; }
-  #debugProbes { max-height: 240px; overflow-y: auto; font: 11px/1.7 ui-monospace, Consolas, monospace; }
-  #debugProbes div { white-space: pre-wrap; word-break: break-all; color: #b6b6c4; }
-  #debugToggle.on { color: #e6c267; border-color: #6b5a24; }
-
-  .modal {
-    position: fixed; inset: 0; z-index: 20;
-    background: rgba(0,0,0,.55);
-    display: flex; align-items: center; justify-content: center;
+  #devices .device {
+    margin-bottom: 0;
   }
-  .modal-box {
-    background: #191922; border: 1px solid #3a3a46; border-radius: 12px;
-    padding: 18px 20px; min-width: 300px; max-width: 90vw;
-  }
-  .modal-box h3 { margin: 0 0 12px; font-size: 14px; }
-  .modal-box .radio {
-    display: flex; align-items: center; gap: 8px; padding: 6px 0;
-    font-size: 13px; cursor: pointer;
-  }
-  .modal-box input[type=radio] { accent-color: #4d8fd4; }
 
-  footer { margin-top: 20px; color: #5f5f6a; font-size: 11.5px; }
-  code { background: #1b1b24; padding: 1px 5px; border-radius: 5px; color: #b6b6c4; }
+  /* 通道行中栏：强度条与上限控件共享同一列，窄屏也不挤到按钮 */
+  .ch-mid {
+    min-width: 0;
+  }
+
+  /* 设备头部的按钮成组靠右，和原来的 .mini 按钮样式保持一致 */
+  .device > header .device-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-left: auto;
+  }
+
+  .device > header .device-actions .mini {
+    margin-left: 0;
+  }
+
+  /* 波形导入区保持紧凑，避免把中栏拉得过高 */
+  #wfFrames {
+    min-height: 56px;
+  }
+
+  .wf-grid .empty {
+    grid-column: 1 / -1;
+  }
+
+  /* 右栏的遥测面板收在 rail 内滚动；面板标题右侧的小字不要换行 */
+  .rail-right .card-title small {
+    white-space: nowrap;
+  }
+
+  /* 三个遥测面板默认收起时，右栏用一张入口卡占位，避免出现大片纯黑 */
+  .rail-right .rail-home {
+    display: flex;
+    flex: none;
+    flex-direction: column;
+  }
+
+  .rail-home-body {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .rail-home-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .rail-home-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 11px 13px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    background: rgba(255, 255, 255, 0.025);
+    color: var(--text);
+    font: inherit;
+    font-size: 12.5px;
+    text-align: left;
+    cursor: pointer;
+    transition: border-color 0.16s var(--ease), background 0.16s var(--ease), transform 0.16s var(--ease);
+  }
+
+  .rail-home-item:hover {
+    border-color: var(--line-gold);
+    background: rgba(247, 217, 122, 0.06);
+    transform: translateY(-1px);
+  }
+
+  .rail-home-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding-top: 14px;
+    border-top: 1px dashed var(--line);
+  }
+
+  /* 打开一个（或几个）遥测面板时，让面板吃满右栏高度，避免面板下方留空 */
+  .rail-right > .card:not(.rail-home) {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .rail-right > .card:not(.rail-home) .audit,
+  .rail-right > .card:not(.rail-home) .log,
+  .rail-right > .card:not(.rail-home) .debug-list {
+    flex: 1;
+    min-height: 0;
+    max-height: none;
+  }
 </style>
 </head>
 <body>
-  <header class="top">
-    <h1>Embodied 控制台</h1>
-    <span class="status-pill" id="conn">连接中…</span>
-    <span class="spacer"></span>
-    <button id="playOpen" title="打开游玩页（新窗口）">游玩</button>
-    <button id="logsToggle">日志</button>
-    <button id="auditToggle">审计</button>
-    <button id="debugToggle" aria-pressed="false" title="显示 probe 数值与解析结果（默认关闭；不影响审计与模型上下文）">调试</button>
-    <button id="panic">紧急停止</button>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <span class="brand-title">Embodied</span>
+      <span class="brand-sub">控制台</span>
+    </div>
+    <div class="topbar-meta">
+      <span class="pill" id="conn">连接中…</span>
+      <span class="pill off" id="lockState">未锁定</span>
+    </div>
+    <span class="topbar-spacer"></span>
+    <nav class="nav" aria-label="遥测面板">
+      <button class="nav-tab" id="logsToggle" type="button" aria-pressed="false" title="显示后台环形缓冲日志">日志</button>
+      <button class="nav-tab" id="auditToggle" type="button" aria-pressed="false" title="显示 append-only 审计日志">审计</button>
+      <button class="nav-tab" id="debugToggle" type="button" aria-pressed="false" title="显示 probe 数值与解析结果（默认关闭；不影响审计与模型上下文）">调试</button>
+    </nav>
+    <div class="topbar-actions">
+      <button class="btn btn-accent btn-sm" id="playOpen" type="button" title="打开游玩页（新窗口）">游玩</button>
+      <button class="btn btn-danger btn-sm" id="panic" type="button">紧急停止</button>
+    </div>
   </header>
 
-  <div id="lockBanner">
+  <div class="lock-banner" id="lockBanner" role="alert">
     <span><strong>输出已被锁定。</strong>所有写入都会被拒绝，直到你在这里解锁。</span>
-    <button id="unlock">解锁</button>
+    <button class="btn btn-sm" id="unlock" type="button">解锁</button>
   </div>
 
-  <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; padding:10px 14px; background:#14141b; border:1px solid #262631; border-radius:12px;">
-    <span style="font-size:12px; color:#9a9aa6;">设备管理</span>
-    <button class="mini" id="addDevice">添加设备</button>
-    <span class="hint">设备不会自动连接：启动与添加后都停在「连接」，点设备卡上的「连接」才开始扫描</span>
-  </div>
+  <main class="main main-console">
+    <aside class="rail rail-left">
+      <section class="card">
+        <h2 class="card-title">设备管理<small>手动连接</small></h2>
+        <button class="btn btn-accent btn-sm btn-block" id="addDevice" type="button">＋ 添加设备</button>
+        <p class="hint" style="margin-top:10px">设备不会自动连接：启动与添加后都停在「连接」，点设备卡上的「连接」才开始扫描。</p>
+      </section>
 
-  <div class="modal" id="addDialog" style="display:none">
-    <div class="modal-box">
-      <h3>添加设备</h3>
-      <label class="radio"><input type="radio" name="addProto" value="coyote" checked>郊狼 · DG-LAB Coyote（BLE 直连）</label>
-      <label class="radio"><input type="radio" name="addProto" value="xhtkj">谜姬 / XHTKJ（BLE 直连）</label>
-      <label class="radio"><input type="radio" name="addProto" value="ankni">安可尼旋转棒 · ANKNI（流式直连）</label>
-      <label class="radio"><input type="radio" name="addProto" value="mock">模拟设备（Mock）</label>
-      <div class="hint" style="margin:10px 0">添加时请只打开一台对应协议的设备；移除设备会立即停止输出并断开</div>
-      <div style="display:flex; gap:10px; justify-content:flex-end">
-        <button id="addCancel">取消</button>
-        <button id="addConfirm">添加</button>
-      </div>
+      <section class="card">
+        <h2 class="card-title">感知<small>可用性</small></h2>
+        <div id="sensors"><span class="hint">加载中…</span></div>
+      </section>
+
+      <section class="card">
+        <h2 class="card-title">运行状态<small>本地 dashboard</small></h2>
+        <dl class="stats">
+          <dt>设备</dt><dd id="statDevices">—</dd>
+          <dt>通道</dt><dd id="statChannels">—</dd>
+          <dt>锁定</dt><dd id="statLocked">—</dd>
+          <dt>刷新</dt><dd>0.5s · 轮询</dd>
+          <dt>审计</dt><dd>append-only</dd>
+        </dl>
+      </section>
+
+      <section class="card" id="errorsPanel" style="display:none">
+        <h2 class="card-title">运行时错误<small>最近记录</small></h2>
+        <div class="errors" id="errors"></div>
+      </section>
+    </aside>
+
+    <div class="column">
+      <!-- 设备卡每 500ms 重建一次，不能整块当作 live region（读屏器会反复朗读）。
+           需要播报的状态在顶栏药丸与锁定横幅上。 -->
+      <div id="devices"></div>
+
+      <section class="card">
+        <h2 class="card-title">波形库<small>agent 创作的波形存于「会话」作用域；「存入库」是人工动作</small></h2>
+        <div class="import-row">
+          <input type="text" id="wfName" placeholder="波形名称" aria-label="新波形名称">
+          <button class="mini" id="wfImport" type="button">导入</button>
+          <span class="hint">粘贴每帧 16 位十六进制，空白或逗号分隔</span>
+        </div>
+        <textarea id="wfFrames" rows="2" aria-label="波形帧序列（每帧 16 位十六进制）" placeholder="0A0A0A0A00000000 0A0A0A0A64646464"></textarea>
+        <div class="wf-grid" id="wfGrid" style="margin-top:10px"></div>
+      </section>
     </div>
-  </div>
 
-  <div id="devices"></div>
+    <aside class="rail rail-right">
+      <section class="card rail-home" id="railHome">
+        <h2 class="card-title">遥测<small>默认收起</small></h2>
+        <div class="rail-home-body">
+          <p class="hint">审计、日志与调试默认关闭，避免和操作区抢注意力。打开任意面板后，这里让位给具体内容。</p>
+          <div class="rail-home-list">
+            <button class="rail-home-item" id="railOpenLogs" type="button">
+              <span>运行日志</span><span class="tag">环形缓冲</span>
+            </button>
+            <button class="rail-home-item" id="railOpenAudit" type="button">
+              <span>审计日志</span><span class="tag gold">append-only</span>
+            </button>
+            <button class="rail-home-item" id="railOpenDebug" type="button">
+              <span>调试探针</span><span class="tag">默认关闭</span>
+            </button>
+          </div>
+          <div class="rail-home-foot">
+            <span class="eyebrow">全局急停</span>
+            <span class="kbd">Ctrl + Alt + X</span>
+          </div>
+        </div>
+      </section>
 
-  <div class="panel" id="logPanel" style="display:none">
-    <h3>运行日志<small>后台环形缓冲（BLE 扫描、选择器决策、设备诊断）；终端只显示关键启动信息</small></h3>
-    <div id="logs" style="font: 11px/1.6 ui-monospace, Consolas, monospace; white-space: pre-wrap; word-break: break-all; background:#0b0b10; border-radius:8px; padding:8px 10px; max-height:220px; overflow-y:auto; color:#9a9aa6"></div>
-  </div>
+      <section class="card" id="auditPanel" style="display:none">
+        <h2 class="card-title">审计<small>append-only · 模型不可写删</small></h2>
+        <div class="audit" id="audit"><div class="hint">加载中…</div></div>
+      </section>
 
-  <div class="panel" id="sensorsPanel">
-    <h3>感知<small>默认只显示可用性与质量；probe 数值属于调试信息，关闭调试时不渲染</small></h3>
-    <div id="sensors"><span class="hint">加载中…</span></div>
-  </div>
+      <section class="card" id="logPanel" style="display:none">
+        <h2 class="card-title">运行日志<small>后台环形缓冲</small></h2>
+        <div class="log" id="logs"></div>
+      </section>
 
-  <div class="panel" id="debugPanel" style="display:none">
-    <h3>调试<small>probe 数值与解析结果只在本机控制台显示；不写审计、不进模型上下文</small></h3>
-    <div id="debugProbes"></div>
-  </div>
+      <section class="card" id="debugPanel" style="display:none">
+        <h2 class="card-title">调试<small>仅本机可见 · 不写审计</small></h2>
+        <div class="debug-list" id="debugProbes"></div>
+      </section>
+    </aside>
+  </main>
 
-  <div class="panel">
-    <h3>波形库<small>agent 创作的波形存于「会话」作用域；「存入库」是人工动作</small></h3>
-    <div class="import-row">
-      <input type="text" id="wfName" placeholder="波形名称">
-      <button class="mini" id="wfImport">导入</button>
-      <span class="hint">粘贴每帧 16 位十六进制，空白或逗号分隔</span>
-    </div>
-    <textarea id="wfFrames" placeholder="0A0A0A0A00000000 0A0A0A0A64646464"></textarea>
-    <div class="wf-grid" id="wfGrid" style="margin-top:10px"></div>
-  </div>
-
-  <div class="panel" id="errorsPanel" style="display:none">
-    <h3>运行时错误<small>设备连接失败等原因会显示在这里</small></h3>
-    <div id="errors" style="font: 11.5px/1.6 ui-monospace, Consolas, monospace; color:#ef8095"></div>
-  </div>
-
-  <div class="panel" id="auditPanel" style="display:none">
-    <h3>审计日志<small>append-only；模型没有任何工具能写或删它</small></h3>
-    <div id="audit"><div class="hint">加载中…</div></div>
-  </div>
-
-  <footer>
-    <div>全局急停热键 <code>Ctrl+Alt+X</code> · 带外急停端点见启动窗口日志</div>
-    <div>上限只能人工修改；每次改动都会重新下发郊狼的 <code>BF</code> 硬件软上限并写入审计。</div>
-    <div id="err"></div>
+  <footer class="bottombar">
+    <span class="eyebrow" style="margin-right:12px">安全边界</span>
+    <span class="hint" style="margin-left:0">全局急停热键 <span class="kbd">Ctrl+Alt+X</span> · 上限只能人工修改 · 每次改动都会重新下发郊狼的 <span class="kbd">BF</span> 硬件软上限并写入审计 · 带外急停端点见启动窗口日志</span>
   </footer>
+</div>
 
-  <script src="/app.js"></script>
+<div class="toast" id="err" role="status" aria-live="polite"></div>
+
+<div class="modal" id="addDialog" style="display:none">
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="addDialogTitle">
+    <h3 id="addDialogTitle">添加设备</h3>
+    <p class="hint" style="margin-bottom:10px">添加时请只打开一台对应协议的设备；移除设备会立即停止输出并断开。</p>
+    <label class="radio"><input type="radio" name="addProto" value="coyote" checked>郊狼 · DG-LAB Coyote<span class="tag">BLE 直连</span></label>
+    <label class="radio"><input type="radio" name="addProto" value="xhtkj">谜姬 / XHTKJ<span class="tag">BLE 直连</span></label>
+    <label class="radio"><input type="radio" name="addProto" value="ankni">安可尼旋转棒 · ANKNI<span class="tag">流式直连</span></label>
+    <label class="radio"><input type="radio" name="addProto" value="mock">模拟设备<span class="tag">Mock</span></label>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="addCancel" type="button">取消</button>
+      <button class="btn btn-accent" id="addConfirm" type="button">添加</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
 </body>
 </html>

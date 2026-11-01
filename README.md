@@ -9,6 +9,22 @@ Agent 主持的具身角色扮演系统：摄像头/麦克风感知 + 多设备�
 - M2 设计与执行：总纲 [`设计文档.md`](设计文档.md) §0.5/§10；任务与偏差记录 [`M2-实施计划.md`](M2-实施计划.md)；冻结前设计审计 [`analysis/m2-design-audit.md`](analysis/m2-design-audit.md)；48 项独立验收 [`analysis/m2-acceptance.md`](analysis/m2-acceptance.md)；各波次只读审查 [`analysis/m2-wave3-review-control.md`](analysis/m2-wave3-review-control.md)、[`-perception`](analysis/m2-wave3-review-perception.md)、[`analysis/m2-wave4-review.md`](analysis/m2-wave4-review.md)。
 - **仍需操作者在真机上人工验收的**：摄像头 Demo A1/A2、真 Chromium 下的游玩页/控制台、真实郊狼 `BF` 重写、真实 LLM key、真 kill-重启、手机急停——步骤见计划 §5.4 与验收报告 §6。
 
+## 界面
+
+四个界面共用一套「墨金」设计系统（近黑底 + 金色强调 + 细描边圆角卡片），纯静态 HTML/CSS/JS，
+没有打包器、没有外链字体与 CDN——CSP 仍是 `default-src 'none'`。
+
+| 界面 | 入口 | 用途 |
+|---|---|---|
+| 控制台 | `/` | 三栏驾驶舱：设备与通道上限（金色滑杆）、波形库、感知可用性、审计/日志/调试，顶部常驻急停 |
+| 游玩页 | `/play` | 大厅（海报式开局：内容包 / 时长 / 会话上限）→ 舞台（大字台词 + 对话流 + 选项 + 右轨状态） |
+| 手机急停 | `/phone` | 手机上的红色圆钮带外急停，一键清零并锁定 |
+| 设备运行时 | Electron 主窗口 | 设备/波形/审计的最小管理窗口，与主界面同色系 |
+
+- 设计令牌与类名约定：[`前端界面设计.md`](前端界面设计.md)（`apps/desktop/src/ui/style.css` 是唯一来源）。
+- 重做记录与验收：[`analysis/ui-redesign.md`](analysis/ui-redesign.md)。
+- 改 UI 不用重新构建：`EMBODIED_UI_FROM_DISK=1 pnpm --filter @embodied/desktop dev` 会让 dev-server 每次请求从 `src/ui` 读文件。
+
 ## 文档
 
 | 文件 | 内容 |

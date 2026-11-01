@@ -5,6 +5,7 @@
   const token = new URLSearchParams(location.search).get('token') ?? ''
   const el = {
     conn: document.getElementById('conn'),
+    lockState: document.getElementById('lockState'),
     panic: document.getElementById('panic'),
     lockBanner: document.getElementById('lockBanner'),
     unlock: document.getElementById('unlock'),
@@ -23,10 +24,17 @@
     wfImport: document.getElementById('wfImport'),
     wfGrid: document.getElementById('wfGrid'),
     sensors: document.getElementById('sensors'),
+    statDevices: document.getElementById('statDevices'),
+    statChannels: document.getElementById('statChannels'),
+    statLocked: document.getElementById('statLocked'),
     playOpen: document.getElementById('playOpen'),
     debugToggle: document.getElementById('debugToggle'),
     debugPanel: document.getElementById('debugPanel'),
     debugProbes: document.getElementById('debugProbes'),
+    railHome: document.getElementById('railHome'),
+    railOpenLogs: document.getElementById('railOpenLogs'),
+    railOpenAudit: document.getElementById('railOpenAudit'),
+    railOpenDebug: document.getElementById('railOpenDebug'),
     audit: document.getElementById('audit'),
     err: document.getElementById('err'),
   }
@@ -48,18 +56,31 @@
   let managedKeys = new Set()
   const editing = new Set()
 
+  /** 三个遥测面板都收起时显示右栏入口卡；有面板打开时让位。 */
+  function syncRailHome() {
+    el.railHome.style.display = logsOpen || auditOpen || debugEnabled ? 'none' : ''
+  }
+
+  /** 错误提示：用底部的 .toast 呈现，几秒后自动收起。 */
+  let errorTimer = 0
   function fail(message) {
     el.err.textContent = message
-    setTimeout(() => { if (el.err.textContent === message) el.err.textContent = '' }, 6000)
+    el.err.classList.add('on')
+    clearTimeout(errorTimer)
+    errorTimer = setTimeout(() => { el.err.classList.remove('on') }, 6000)
   }
 
   async function api(path, options = {}) {
+    const timeoutMs = typeof options.timeoutMs === 'number' ? options.timeoutMs : 8000
+    const { timeoutMs: _ignored, ...init } = options
     const response = await fetch(path, {
-      ...options,
+      ...init,
+      // 每个请求都带超时：一次挂起的 fetch 会让 500ms 轮询不断叠加挂起请求。
+      signal: init.signal ?? AbortSignal.timeout(timeoutMs),
       headers: {
         'x-control-token': token,
-        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-        ...(options.headers ?? {}),
+        ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(init.headers ?? {}),
       },
     })
     if (!response.ok) {
@@ -68,7 +89,9 @@
         const body = await response.json()
         if (body.error) message = body.error
       } catch { /* not JSON */ }
-      throw new Error(message)
+      const error = new Error(message)
+      error.status = response.status
+      throw error
     }
     return response.json()
   }
@@ -102,9 +125,19 @@
     input.value = String(channel[field])
     const readout = document.createElement('span')
     readout.className = 'val'
-    readout.textContent = `${channel[field]}${suffix}`
+    // 金色轨道进度由 --fill 驱动；读数和填充在拖动时即时同步。
+    const sync = () => {
+      const pct = max > 0 ? (Number(input.value) / max) * 100 : 0
+      input.style.setProperty('--fill', `${Math.min(100, Math.max(0, pct))}%`)
+      readout.textContent = `${input.value}${suffix}`
+    }
+    sync()
     input.addEventListener('pointerdown', () => editing.add(key))
-    input.addEventListener('input', () => { readout.textContent = `${input.value}${suffix}` })
+    input.addEventListener('input', sync)
+    // 失焦/松手都算编辑结束：只靠 change 的话，点一下没改值会让 editing
+    // 永久卡住，500ms 的整卡重绘就被永久跳过。
+    input.addEventListener('blur', () => { editing.delete(key) })
+    input.addEventListener('pointerup', () => { editing.delete(key) })
     input.addEventListener('change', () => {
       editing.delete(key)
       call(api('/api/cap', {
@@ -147,8 +180,9 @@
     name.innerHTML = `${channel.label}<small>${channel.id} · ${channel.kind}${channel.outputFloorPercent > 0 ? ` · 最小非零≈${channel.outputFloorPercent}%` : ''}</small>`
 
     const middle = document.createElement('div')
+    middle.className = 'ch-mid'
     const meter = document.createElement('div')
-    meter.className = 'meter'
+    meter.className = 'meter tall'
     const fill = channel.maxPercent > 0 ? (channel.percent / channel.maxPercent) * 100 : 0
     meter.innerHTML = `<i style="width:${Math.min(100, fill)}%"></i>`
 
@@ -170,6 +204,7 @@
     durInput.value = String(channel.maxDurationSec)
     const durKey = `${deviceId}:${channel.id}:dur`
     durInput.addEventListener('focus', () => editing.add(durKey))
+    durInput.addEventListener('blur', () => editing.delete(durKey))
     durInput.addEventListener('change', () => {
       editing.delete(durKey)
       call(api('/api/cap', {
@@ -180,11 +215,12 @@
     dur.append('时长上限', durInput, 's')
     caps.append(dur)
 
+    // 当前输出：带标签显示，避免一排滑杆末尾出现孤零零的「0%」。
     const state = document.createElement('span')
-    state.className = 'val'
+    state.className = channel.percent > 0 ? 'tag gold' : 'tag'
     state.textContent = channel.effect
-      ? `${channel.effect.preset} · ${Math.ceil(channel.effect.remainingMs / 1000)}s`
-      : `${channel.percent}%`
+      ? `输出中 · ${channel.effect.preset} · ${Math.ceil(channel.effect.remainingMs / 1000)}s`
+      : `输出 ${channel.percent}%`
     caps.append(state)
     middle.append(meter, caps)
 
@@ -192,6 +228,7 @@
     acts.className = 'acts'
     const demo = document.createElement('button')
     demo.className = 'mini'
+    demo.type = 'button'
     demo.textContent = '试跑 15s'
     demo.disabled = snapshot?.locked === true
     demo.addEventListener('click', () => call(api('/api/demo', {
@@ -200,6 +237,7 @@
     })))
     const stop = document.createElement('button')
     stop.className = 'mini'
+    stop.type = 'button'
     stop.textContent = '停止'
     stop.addEventListener('click', () => call(api('/api/stop', {
       method: 'POST',
@@ -230,52 +268,75 @@
   }
 
   function renderDevices() {
-    if (editing.size > 0) return
-    el.lockBanner.classList.toggle('on', snapshot.locked === true)
+    const locked = snapshot.locked === true
+    el.lockBanner.classList.toggle('on', locked)
+    el.lockState.textContent = locked ? '已锁定' : '未锁定'
+    el.lockState.className = locked ? 'pill bad' : 'pill off'
+    el.statLocked.textContent = locked ? '已锁定' : '未锁定'
+    el.statLocked.className = locked ? 'q-bad' : 'q-ok'
+    el.statDevices.textContent = `${snapshot.devices.length} 台`
+    const channelCount = snapshot.devices.reduce((total, device) => total + device.channels.length, 0)
+    el.statChannels.textContent = `${channelCount} 路`
     el.conn.textContent = `已连接 · ${snapshot.devices.length} 设备`
-    el.conn.classList.add('on')
+    el.conn.className = 'pill on'
 
-    el.devices.replaceChildren(...snapshot.devices.map(device => {
+    // 正在设备卡里操作（滑杆拖动、下拉展开、输入框聚焦）时不要重建卡片：
+    // 500ms 轮询会把展开的 <select> 和光标一起收掉。状态栏与锁定横幅上面已经更新。
+    // 只有「表单控件」聚焦才算编辑——按钮聚焦不能让整张卡停止刷新。
+    const active = document.activeElement
+    const editingFocus = active !== null && el.devices.contains(active)
+      && (active.tagName === 'INPUT' || active.tagName === 'SELECT' || active.tagName === 'TEXTAREA')
+    if (editing.size > 0 || editingFocus) return
+    // 按钮焦点在重建后会丢：记下「第几张卡 + 按钮文字」，重建后放回等价按钮，
+    // 否则键盘用户在设备卡里每 500ms 就被弹回页面开头。
+    const focusHint = active !== null && el.devices.contains(active) && active.tagName === 'BUTTON'
+      ? { card: [...el.devices.querySelectorAll('.device')].indexOf(active.closest('.device')), label: active.textContent }
+      : null
+
+    const cards = snapshot.devices.map(device => {
       const card = document.createElement('div')
       card.className = 'device'
       const header = document.createElement('header')
       const title = document.createElement('h2')
       title.textContent = device.name
       const life = document.createElement('span')
-      // A lost link is just "disconnected" to the operator; the app retries only
-      // when they press 连接.
+      // 链路丢失对操作者只意味着「断开」；连接按钮才会重新开始扫描。
       const shownLife = device.lifecycle === 'failed' ? 'disconnected' : device.lifecycle
       life.className = `life ${shownLife}`
       life.textContent = shownLife
-      header.append(title, life)
+      const actions = document.createElement('div')
+      actions.className = 'device-actions'
+      header.append(title, life, actions)
 
       if (device.lifecycle === 'failed' || device.lifecycle === 'disconnected') {
         const connect = document.createElement('button')
         connect.className = 'mini'
+        connect.type = 'button'
         connect.textContent = '连接'
         connect.addEventListener('click', () => call(api('/api/connect', {
           method: 'POST',
           body: JSON.stringify({ deviceId: device.id }),
         })))
-        header.append(connect)
+        actions.append(connect)
       }
       if (device.canScan && device.lifecycle === 'ready') {
         const scan = document.createElement('button')
         scan.className = 'mini'
+        scan.type = 'button'
         scan.textContent = '扫描设备'
         scan.addEventListener('click', () => call(api('/api/scan', {
           method: 'POST',
           body: JSON.stringify({ deviceId: device.id, durationMs: 5000 }),
         })))
-        header.append(scan)
+        actions.append(scan)
       }
 
       if (managedKeys.has(device.id)) {
         const remove = document.createElement('button')
         remove.className = 'mini'
+        remove.type = 'button'
         remove.textContent = '移除'
-        remove.style.borderColor = '#7d2642'
-        remove.style.color = '#ef8095'
+        remove.style.color = 'var(--bad)'
         remove.addEventListener('click', async () => {
           if (!window.confirm(`移除 ${device.name}？输出会立即停止并断开连接。`)) return
           try {
@@ -288,23 +349,46 @@
             fail(error.message ?? String(error))
           }
         })
-        header.append(remove)
+        actions.append(remove)
       }
 
       if (device.channels.length === 0) {
         const empty = document.createElement('div')
-        empty.className = 'ch'
-        empty.style.color = '#5f5f6a'
-        empty.textContent = device.canScan ? '未发现设备，点“扫描设备”' : '无可用通道'
+        empty.className = 'empty'
+        empty.textContent = device.canScan ? '未发现设备，点「扫描设备」' : '无可用通道'
         card.append(header, empty)
         return card
       }
       card.append(header, ...device.channels.map(channel => channelRow(device.id, channel)))
       return card
-    }))
+    })
+
+    if (cards.length === 0) {
+      const empty = document.createElement('div')
+      empty.className = 'empty'
+      empty.textContent = '还没有设备。用左栏「添加设备」选择协议后手动连接。'
+      el.devices.replaceChildren(empty)
+      return
+    }
+    el.devices.replaceChildren(...cards)
+    // 重建后把焦点放回同一张卡上文字相同的按钮。
+    if (focusHint !== null && focusHint.card >= 0) {
+      const card = el.devices.querySelectorAll('.device')[focusHint.card]
+      const target = card === undefined
+        ? undefined
+        : [...card.querySelectorAll('button')].find(button => button.textContent === focusHint.label)
+      if (target !== undefined) target.focus()
+    }
   }
 
   function renderWaveforms() {
+    if (waveforms.length === 0) {
+      const empty = document.createElement('div')
+      empty.className = 'empty'
+      empty.textContent = '还没有波形：粘贴帧序列导入，或让 agent 在会话里创作后「存入库」。'
+      el.wfGrid.replaceChildren(empty)
+      return
+    }
     el.wfGrid.replaceChildren(...waveforms.map(entry => {
       const card = document.createElement('div')
       card.className = 'wf-card'
@@ -334,6 +418,7 @@
       if (entry.scope === 'session') {
         const promote = document.createElement('button')
         promote.className = 'mini'
+        promote.type = 'button'
         promote.style.marginTop = '8px'
         promote.textContent = '存入库'
         promote.addEventListener('click', () => call(api('/api/waveforms/promote', {
@@ -350,6 +435,13 @@
     if (!auditOpen) return
     try {
       const records = await api('/api/audit')
+      if (records.length === 0) {
+        const empty = document.createElement('div')
+        empty.className = 'hint'
+        empty.textContent = '（暂无审计记录）'
+        el.audit.replaceChildren(empty)
+        return
+      }
       el.audit.replaceChildren(...records.slice().reverse().map(record => {
         const line = document.createElement('div')
         line.className = `r-${record.result ?? 'ok'} a-${record.actor ?? 'system'}`
@@ -371,15 +463,29 @@
     method: 'POST',
     body: JSON.stringify({ note: 'unlocked from web console' }),
   })))
-  el.addDevice.addEventListener('click', () => { el.addDialog.style.display = 'flex' })
-  el.addCancel.addEventListener('click', () => { el.addDialog.style.display = 'none' })
+  function openAddDialog() {
+    el.addDialog.style.display = 'flex'
+    // 弹窗打开时把焦点送进对话框，关闭后还给「添加设备」按钮。
+    const first = el.addDialog.querySelector('input[name="addProto"]')
+    if (first !== null && first !== undefined) first.focus()
+  }
+  function closeAddDialog() {
+    if (el.addDialog.style.display === 'none') return
+    el.addDialog.style.display = 'none'
+    el.addDevice.focus()
+  }
+  el.addDevice.addEventListener('click', openAddDialog)
+  el.addCancel.addEventListener('click', closeAddDialog)
   el.addDialog.addEventListener('click', event => {
-    if (event.target === el.addDialog) el.addDialog.style.display = 'none'
+    if (event.target === el.addDialog) closeAddDialog()
+  })
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape') closeAddDialog()
   })
   el.addConfirm.addEventListener('click', async () => {
     const checked = document.querySelector('input[name="addProto"]:checked')
     const protocol = checked ? checked.value : 'coyote'
-    el.addDialog.style.display = 'none'
+    closeAddDialog()
     try {
       const result = await api('/api/devices', {
         method: 'POST',
@@ -398,23 +504,44 @@
   el.logsToggle.addEventListener('click', () => {
     logsOpen = !logsOpen
     el.logPanel.style.display = logsOpen ? '' : 'none'
-    el.logsToggle.textContent = logsOpen ? '收起日志' : '日志'
+    el.logsToggle.classList.toggle('active', logsOpen)
+    el.logsToggle.setAttribute('aria-pressed', logsOpen ? 'true' : 'false')
+    syncRailHome()
     if (logsOpen) renderLogs()
   })
 
   el.auditToggle.addEventListener('click', () => {
     auditOpen = !auditOpen
     el.auditPanel.style.display = auditOpen ? '' : 'none'
-    el.auditToggle.textContent = auditOpen ? '收起审计' : '审计'
+    el.auditToggle.classList.toggle('active', auditOpen)
+    el.auditToggle.setAttribute('aria-pressed', auditOpen ? 'true' : 'false')
+    syncRailHome()
     if (auditOpen) renderAudit()
   })
+
+  // 右栏入口卡只是顶栏开关的快捷方式，不改变任何面板语义。
+  el.railOpenLogs.addEventListener('click', () => el.logsToggle.click())
+  el.railOpenAudit.addEventListener('click', () => el.auditToggle.click())
+  el.railOpenDebug.addEventListener('click', () => el.debugToggle.click())
 
   async function renderLogs() {
     if (!logsOpen) return
     try {
       const body = await api('/api/logs')
       const lines = body.lines ?? []
-      el.logs.textContent = lines.length === 0 ? '（暂无日志）' : lines.join('\n')
+      if (lines.length === 0) {
+        const empty = document.createElement('div')
+        empty.className = 'hint'
+        empty.textContent = '（暂无日志）'
+        el.logs.replaceChildren(empty)
+      } else {
+        // 逐行一个 div，才能命中 style.css 里 .log > div 的等宽折行样式。
+        el.logs.replaceChildren(...lines.map(line => {
+          const row = document.createElement('div')
+          row.textContent = line
+          return row
+        }))
+      }
       el.logs.scrollTop = el.logs.scrollHeight
     } catch {
       // The log panel must never take the console down with it.
@@ -444,7 +571,7 @@
       renderDevices()
     } catch (error) {
       el.conn.textContent = '连接失败'
-      el.conn.classList.remove('on')
+      el.conn.className = 'pill bad'
       fail(error.message ?? String(error))
     }
   }
@@ -487,11 +614,10 @@
       return
     }
     el.sensors.replaceChildren(...sources.map(source => {
-      const row = document.createElement('span')
-      row.className = 'sensor'
+      const row = document.createElement('div')
+      row.className = 'sensor-row'
       const label = document.createElement('span')
-      // Source id/kind plus the quality word only: the default console never
-      // shows a numeric feature, probe delta or resolved command.
+      // 只显示源 id/kind 与质量词：默认控制台从不显示数值特征、probe 差值或解析命令。
       label.textContent = `${source.id} · ${source.kind}`
       const quality = document.createElement('span')
       quality.className = QUALITY_CLASS[source.quality] ?? 'q-warn'
@@ -525,9 +651,9 @@
 
   function applyDebugState(enabled) {
     debugEnabled = enabled === true
-    el.debugToggle.classList.toggle('on', debugEnabled)
+    el.debugToggle.classList.toggle('active', debugEnabled)
     el.debugToggle.setAttribute('aria-pressed', debugEnabled ? 'true' : 'false')
-    el.debugToggle.textContent = debugEnabled ? '调试中' : '调试'
+    syncRailHome()
   }
 
   async function renderDebugProbes() {
@@ -551,6 +677,11 @@
       }
       el.debugProbes.replaceChildren(...probes.slice().reverse().map(probeLine))
     } catch (error) {
+      // 另一个控制台把调试关掉时服务器返回 403：本页要跟着关，而不是每 2 秒刷一次错误。
+      if (error.status === 403) {
+        applyDebugState(false)
+        return
+      }
       fail(error.message ?? String(error))
     }
   }
@@ -586,19 +717,30 @@
   void (async () => {
     if (token.length < 16) {
       el.conn.textContent = '缺少 token'
-      el.conn.classList.remove('on')
+      el.conn.className = 'pill bad'
       fail('URL 缺少 token 参数；请从启动日志打开控制台地址')
       return
     }
     await refresh()
-    await renderErrors()
-    await refreshSensors()
-    await syncDebug()
+    // 轮询先装上：波形库的补拉不阻塞控制台运行（它有自己的超时）。
     setInterval(refresh, 500)
     setInterval(renderAudit, 3_000)
     setInterval(renderErrors, 3_000)
     setInterval(renderLogs, 2_000)
     setInterval(refreshSensors, 3_000)
     setInterval(renderDebugProbes, 2_000)
+    // 波形库是 UI 的一部分，但快照不包含它；补一次现有的 GET 让内建波形可见。
+    try {
+      const library = await api('/api/waveforms')
+      if (Array.isArray(library)) {
+        waveforms = library
+        renderWaveforms()
+      }
+    } catch {
+      // 波形库加载失败不应阻断控制台；导入/存库成功后仍会通过 call() 刷新。
+    }
+    await renderErrors()
+    await refreshSensors()
+    await syncDebug()
   })()
 })()

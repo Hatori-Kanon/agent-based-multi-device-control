@@ -5,101 +5,169 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'">
 <title>Embodied Roleplay — device runtime</title>
 <style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; padding: 20px 24px 40px;
-    font: 14px/1.5 -apple-system, "Segoe UI", system-ui, sans-serif;
-    background: #101014; color: #e6e6ea;
+  /*
+   * Electron 主窗口（设备运行时）。这个窗口不走 dashboard 的静态服务，所以
+   * 样式内联在这里；配色与 `src/ui/style.css` 的「墨金」主题保持一致（令牌值
+   * 相同，改动时两边一起改）。结构类名（.device/.ch/.meter/...）由
+   * renderer.js 生成，别改名。
+   */
+  :root {
+    color-scheme: dark;
+    --ink-0: #08090c;
+    --ink-1: #0c0e13;
+    --panel: #151920;
+    --panel-2: #1b2029;
+    --field: #0e1117;
+    --line: rgba(255, 255, 255, 0.08);
+    --line-2: rgba(255, 255, 255, 0.16);
+    --line-gold: rgba(247, 217, 122, 0.34);
+    --gold: #ffe59a;
+    --gold-2: #f7d97a;
+    --gold-glow: rgba(247, 217, 122, 0.3);
+    --text: #eef1f6;
+    --muted: #9aa4b4;
+    --faint: #616b7c;
+    --ok: #5ee0a0;
+    --info: #6fb4ef;
+    --warn: #ffc966;
+    --bad: #ff5470;
+    --sans: "Inter", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "Liberation Mono", monospace;
   }
-  h1 { font-size: 15px; font-weight: 600; margin: 0 0 2px; letter-spacing: .02em; }
-  .sub { color: #7d7d8a; font-size: 12px; margin-bottom: 20px; }
+  * { box-sizing: border-box; }
+  html, body { min-height: 100%; }
+  body {
+    margin: 0; padding: 22px 24px 36px;
+    font: 14px/1.55 var(--sans);
+    color: var(--text);
+    background:
+      radial-gradient(900px 480px at 12% -10%, rgba(247, 217, 122, 0.07), transparent 62%),
+      radial-gradient(760px 420px at 104% -6%, rgba(111, 180, 239, 0.05), transparent 58%),
+      var(--ink-0);
+    -webkit-font-smoothing: antialiased;
+  }
+  h1 { font-size: 15px; font-weight: 700; margin: 0 0 3px; letter-spacing: .05em; }
+  h1::before {
+    content: ""; display: inline-block; width: 13px; height: 13px; margin-right: 9px;
+    border-radius: 4px; background: linear-gradient(145deg, var(--gold), #c9a227);
+    box-shadow: 0 0 14px var(--gold-glow); vertical-align: -1px;
+  }
+  .sub { color: var(--faint); font-size: 12px; margin-bottom: 18px; }
 
   button {
-    font: inherit; color: inherit; cursor: pointer;
-    background: #23232c; border: 1px solid #34343f; border-radius: 8px;
-    padding: 7px 14px;
+    font: inherit; font-size: 12.5px; font-weight: 600; color: var(--text); cursor: pointer;
+    background: linear-gradient(180deg, var(--panel-2), #171b22);
+    border: 1px solid var(--line-2); border-radius: 9px; padding: 7px 14px;
+    transition: border-color .16s ease, transform .12s ease, background .16s ease;
   }
-  button:hover { background: #2c2c37; }
-  button:disabled { opacity: .4; cursor: default; }
+  button:hover { border-color: var(--line-gold); transform: translateY(-1px); }
+  button:active { transform: translateY(0) scale(.985); }
+  button:disabled { opacity: .4; cursor: default; transform: none; }
   #panic {
-    width: 100%; font-size: 17px; font-weight: 700; letter-spacing: .06em;
-    background: #86122a; border-color: #b3203c; padding: 16px; margin-bottom: 18px;
+    width: 100%; font-size: 16px; font-weight: 800; letter-spacing: .1em;
+    color: #fff; padding: 15px; margin-bottom: 16px;
+    background: linear-gradient(180deg, #e23a58, #ac1e39);
+    border-color: rgba(255, 84, 112, 0.55);
+    box-shadow: 0 8px 24px rgba(226, 58, 88, 0.26);
   }
-  #panic:hover { background: #a11732; }
+  #panic:hover { box-shadow: 0 12px 30px rgba(226, 58, 88, 0.36); }
 
   .banner {
-    display: none; margin-bottom: 18px; padding: 12px 14px; border-radius: 8px;
-    background: #3a1420; border: 1px solid #7d2138; align-items: center; gap: 12px;
+    display: none; margin-bottom: 16px; padding: 12px 15px; border-radius: 12px;
+    background: linear-gradient(180deg, rgba(92, 20, 38, .75), rgba(58, 12, 24, .75));
+    border: 1px solid rgba(255, 84, 112, .45); align-items: center; gap: 12px;
+    color: #ffd9e1; font-size: 13px;
   }
   .banner.on { display: flex; }
   .banner span { flex: 1; }
 
-  .device { border: 1px solid #26262f; border-radius: 10px; margin-bottom: 14px; overflow: hidden; }
+  .device {
+    border: 1px solid var(--line); border-radius: 16px; margin-bottom: 14px; overflow: hidden;
+    background: linear-gradient(180deg, rgba(24, 28, 36, .92), rgba(16, 19, 25, .92));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .035), 0 10px 30px rgba(0, 0, 0, .32);
+  }
   .device > header {
-    display: flex; align-items: baseline; gap: 10px;
-    padding: 10px 14px; background: #16161c; border-bottom: 1px solid #26262f;
+    display: flex; align-items: center; gap: 9px;
+    padding: 12px 16px; background: rgba(255, 255, 255, .03); border-bottom: 1px solid var(--line);
   }
-  .device h2 { font-size: 13px; font-weight: 600; margin: 0; }
-  .life { font-size: 11px; color: #7d7d8a; }
-  .life.ready { color: #58c07a; }
-  .life.failed { color: #e2617a; }
-  .life.connecting { color: #d8b45a; }
+  .device h2 { font-size: 13.5px; font-weight: 650; margin: 0; }
+  .life { font-size: 10.5px; color: var(--faint); border: 1px solid var(--line); border-radius: 99px; padding: 2px 9px; }
+  .life.ready { color: var(--ok); border-color: rgba(94, 224, 160, .36); background: rgba(94, 224, 160, .08); }
+  .life.failed { color: var(--bad); border-color: rgba(255, 84, 112, .36); background: rgba(255, 84, 112, .07); }
+  .life.connecting { color: var(--warn); border-color: rgba(255, 201, 102, .36); background: rgba(255, 201, 102, .08); }
 
-  .ch { display: grid; grid-template-columns: 130px 1fr auto; gap: 12px; align-items: center; padding: 11px 14px; }
-  .ch + .ch { border-top: 1px solid #1e1e26; }
-  .ch-name { font-size: 12px; }
-  .ch-kind { color: #62626e; font-size: 11px; }
+  .ch { display: grid; grid-template-columns: 140px 1fr auto; gap: 16px; align-items: center; padding: 13px 16px; }
+  .ch + .ch { border-top: 1px dashed var(--line); }
+  .ch-name { font-size: 13px; font-weight: 600; }
+  .ch-kind { color: var(--faint); font-size: 10.5px; font-weight: 400; }
 
-  .meter { height: 8px; border-radius: 4px; background: #22222b; overflow: hidden; margin-bottom: 7px; }
-  .meter i { display: block; height: 100%; background: linear-gradient(90deg, #3f7fd0, #6fb0f0); transition: width .12s linear; }
-  .caps { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; font-size: 11px; color: #8b8b98; }
+  .meter { height: 8px; border-radius: 99px; background: rgba(255, 255, 255, .07); overflow: hidden; margin-bottom: 8px; box-shadow: inset 0 1px 3px rgba(0, 0, 0, .45); }
+  .meter i { display: block; height: 100%; border-radius: 99px; background: linear-gradient(90deg, #3f7fd0, var(--info) 55%, var(--gold)); box-shadow: 0 0 12px rgba(111, 180, 239, .35); transition: width .12s linear; }
+  .caps { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; font-size: 11.5px; color: var(--muted); }
   .caps label { display: flex; gap: 6px; align-items: center; }
-  input[type=range] { width: 96px; accent-color: #3f7fd0; }
-  input[type=number], input[type=text], select, textarea {
-    font: inherit; font-size: 12px; padding: 3px 6px;
-    background: #1b1b22; color: inherit; border: 1px solid #33333d; border-radius: 5px;
-  }
-  input[type=number] { width: 62px; }
-  select { max-width: 150px; }
-  .val { color: #cfcfda; font-variant-numeric: tabular-nums; min-width: 34px; }
+  .val { color: var(--text); font-variant-numeric: tabular-nums; min-width: 34px; font-size: 11.5px; }
   .acts { display: flex; gap: 7px; }
-  .acts button { font-size: 12px; padding: 5px 11px; }
+  .acts button { font-size: 11.5px; padding: 5px 11px; }
 
-  details { border: 1px solid #26262f; border-radius: 10px; margin-top: 16px; }
-  summary { padding: 10px 14px; cursor: pointer; font-size: 13px; font-weight: 600; background: #16161c; }
-  .panel { padding: 12px 14px; }
-  table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid #1e1e26; }
-  th { color: #7d7d8a; font-weight: 500; font-size: 11px; }
-  .tag { background: #22222b; border-radius: 4px; padding: 1px 6px; margin-right: 4px; font-size: 10px; color: #9a9aa8; }
-  .scope-session { color: #d8b45a; }
-  .scope-library { color: #58c07a; }
-  textarea { width: 100%; min-height: 70px; font-family: ui-monospace, Consolas, monospace; }
-  .import-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
-  #auditLog {
-    max-height: 260px; overflow-y: auto; font-family: ui-monospace, Consolas, monospace;
-    font-size: 11px; background: #0c0c10; border-radius: 6px; padding: 8px;
+  input[type=range] {
+    -webkit-appearance: none; appearance: none; width: 96px; height: 8px; margin: 6px 2px;
+    border-radius: 99px; background: rgba(255, 255, 255, .09); outline: none; cursor: pointer;
   }
-  #auditLog div { white-space: pre-wrap; word-break: break-all; padding: 1px 0; }
-  .r-rejected { color: #d8b45a; }
-  .r-error { color: #e2617a; }
-  .a-human { color: #6fb0f0; }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 17px; height: 17px; border-radius: 6px;
+    background: linear-gradient(180deg, var(--gold), var(--gold-2));
+    border: 1px solid rgba(0, 0, 0, .45); box-shadow: 0 0 10px var(--gold-glow); cursor: pointer;
+  }
+  input[type=number], input[type=text], select, textarea {
+    font: inherit; font-size: 12px; padding: 6px 9px; color-scheme: dark;
+    background: var(--field); color: var(--text); border: 1px solid var(--line-2); border-radius: 8px;
+  }
+  input[type=number]:focus, input[type=text]:focus, select:focus, textarea:focus {
+    outline: none; border-color: var(--line-gold); box-shadow: 0 0 0 3px rgba(247, 217, 122, .1);
+  }
+  input[type=number] { width: 66px; }
+  select { max-width: 170px; }
 
-  footer { margin-top: 22px; padding-top: 14px; border-top: 1px solid #22222b; color: #62626e; font-size: 11px; }
-  code { background: #1b1b22; padding: 1px 5px; border-radius: 4px; color: #a9a9b8; }
-  #err { color: #e2617a; margin-top: 8px; min-height: 16px; font-size: 11px; }
+  details {
+    border: 1px solid var(--line); border-radius: 14px; margin-top: 14px; overflow: hidden;
+    background: linear-gradient(180deg, rgba(24, 28, 36, .9), rgba(16, 19, 25, .9));
+  }
+  summary { padding: 12px 16px; cursor: pointer; font-size: 12px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+  summary::marker { color: var(--gold); }
+  .panel { padding: 4px 16px 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--faint); font-weight: 500; font-size: 10.5px; letter-spacing: .06em; }
+  .tag { background: rgba(255, 255, 255, .05); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; margin-right: 4px; font-size: 10px; color: var(--muted); }
+  .scope-session { color: var(--gold); }
+  .scope-library { color: var(--ok); }
+  textarea { width: 100%; min-height: 70px; font-family: var(--mono); font-size: 12px; line-height: 1.6; }
+  .import-row { display: flex; gap: 8px; align-items: center; margin: 10px 0 8px; flex-wrap: wrap; }
+  #auditLog {
+    max-height: 260px; overflow-y: auto; font-family: var(--mono);
+    font-size: 11px; background: rgba(0, 0, 0, .28); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+  }
+  #auditLog div { white-space: pre-wrap; word-break: break-all; padding: 1px 0; color: var(--muted); }
+  .r-rejected { color: var(--warn); }
+  .r-error { color: var(--bad); }
+  .a-human { color: var(--info); }
+
+  footer { margin-top: 22px; padding-top: 14px; border-top: 1px solid var(--line); color: var(--faint); font-size: 11px; line-height: 1.8; }
+  footer div + div { margin-top: 4px; }
+  code { background: rgba(255, 255, 255, .055); border: 1px solid var(--line); padding: 1px 5px; border-radius: 5px; color: var(--muted); font-family: var(--mono); }
+  #err { color: var(--bad); margin-top: 8px; min-height: 16px; font-size: 11px; }
+  ::selection { background: rgba(247, 217, 122, .28); color: #fff; }
 </style>
 </head>
 <body>
-  <h1>设备运行时 · M1</h1>
+  <h1>设备运行时</h1>
   <div class="sub"><code>mock-pulse</code> 模拟流式硬件（停止刷新即归零），<code>mock-hold</code> 模拟有状态硬件（宿主崩溃后仍在输出），<code>coyote</code> 为真实郊狼 V3（需开机并允许蓝牙）。</div>
 
-  <button id="panic">紧急停止 · EMERGENCY STOP</button>
+  <button id="panic" type="button">紧急停止 · EMERGENCY STOP</button>
 
-  <div class="banner" id="lockBanner">
+  <div class="banner" id="lockBanner" role="alert">
     <span><strong>输出已被人类锁定。</strong>模型的所有写入工具都会被拒绝，直到你在此解锁。</span>
-    <button id="unlock">解锁</button>
+    <button id="unlock" type="button">解锁</button>
   </div>
 
   <div id="devices"></div>
@@ -108,11 +176,11 @@
     <summary>波形库</summary>
     <div class="panel">
       <div class="import-row">
-        <input type="text" id="wfName" placeholder="波形名称" style="width:160px">
-        <button id="wfImport">导入</button>
-        <span style="color:#62626e;font-size:11px">粘贴每帧 16 位十六进制，空白或逗号分隔</span>
+        <input type="text" id="wfName" placeholder="波形名称" aria-label="新波形名称" style="width:160px">
+        <button id="wfImport" type="button">导入</button>
+        <span style="color:#7f8a9b;font-size:11px">粘贴每帧 16 位十六进制，空白或逗号分隔</span>
       </div>
-      <textarea id="wfFrames" placeholder="0A0A0A0A00000000 0A0A0A0A64646464"></textarea>
+      <textarea id="wfFrames" placeholder="0A0A0A0A00000000 0A0A0A0A64646464" aria-label="波形帧序列（每帧 16 位十六进制）"></textarea>
       <table id="wfTable">
         <thead><tr><th>名称</th><th>id</th><th>作用域</th><th>时长</th><th>峰值</th><th>频率</th><th>标签</th><th></th></tr></thead>
         <tbody></tbody>
