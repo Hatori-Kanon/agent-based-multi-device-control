@@ -46,6 +46,19 @@ export interface Channel {
    * Omitted or 0 means the mapping is linear from zero.
    */
   readonly outputFloorPercent?: number
+
+  /**
+   * Narrative region id this channel drives, e.g. `chest` (`M2-实施计划.md`
+   * §4.6.3).
+   *
+   * Packs speak regions, never device ids, so this is the join between an
+   * intent and the hardware it reaches. A backend may declare a sensible
+   * default here (a dual-channel Coyote is usually not one region), but most
+   * hardware is unlabeled: a human assigns the label in the app and the
+   * registry's `RegionStore` override wins over this field. Absent means "no
+   * region", which makes the channel only reachable by `whole-body` intents.
+   */
+  readonly region?: string
 }
 
 /** Connection state of a backend as observed by the registry. */

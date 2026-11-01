@@ -20,7 +20,7 @@ import {
   type ModelTurnResult,
   type ToolCall,
 } from '@embodied/core'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createHostRuntime, type HostRuntime } from '../src/main/bootstrap.ts'
 import {
   DirectoryPackSource,
@@ -797,5 +797,46 @@ describe('play session archive and ledger (B2-T7/T8)', () => {
     const silentRun = await createArchivedHarness({ turns: [scriptedTurn('嗯。')], backing })
     await silentRun.host.start({ packId: 'demo', plannedMinutes: 45 })
     expect(silentRun.runner.requests[0]!.messages[0]!.content).not.toContain('开场指引')
+  })
+})
+
+describe('session ceiling and narrative regions (B2-T9/T10)', () => {
+  it('writes a narrowed ceiling through the human path, audits it and re-asserts bounds', async () => {
+    const h = await createHarness([
+      {
+        text: '（低笑）',
+        toolCalls: [planCall()],
+        finishReason: 'tool-calls',
+      },
+    ])
+    const bounds = vi.spyOn(h.registry, 'reapplyBounds')
+    await h.host.start({ packId: 'tentacle', plannedMinutes: 30 })
+
+    await h.host.setCeiling(15)
+
+    expect(h.policy.ceiling()).toBe(15)
+    // Hardware ceiling must follow the software one (Coyote BF).
+    expect(bounds).toHaveBeenCalledTimes(1)
+    const change = h.records().find(record => record.action === 'policy_change'
+      && (record.detail as { scope?: string } | undefined)?.scope === 'session')
+    expect(change?.detail).toMatchObject({ previous: 100, next: 15 })
+    // The ceiling is persisted through the human save hook.
+    expect(h.states.length).toBeGreaterThan(0)
+  })
+
+  it('edits a channel region label and clears it again, auditing both directions', async () => {
+    const h = await createHarness([{ text: '好。', toolCalls: [], finishReason: 'stop' }])
+
+    await h.host.setRegion('mock-pulse', 'a', 'chest')
+    expect(h.host.regions()['mock-pulse:a']).toBe('chest')
+    const channelA = h.registry.snapshot().devices
+      .find(device => device.id === 'mock-pulse')?.channels
+      .find(channel => channel.id === 'a')
+    expect(channelA?.region).toBe('chest')
+    expect(h.records().some(record => record.action === 'region_change'
+      && record.result === 'ok')).toBe(true)
+
+    await h.host.setRegion('mock-pulse', 'a', undefined)
+    expect(h.host.regions()['mock-pulse:a']).toBeUndefined()
   })
 })

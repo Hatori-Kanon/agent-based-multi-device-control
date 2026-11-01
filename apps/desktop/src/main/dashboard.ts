@@ -15,8 +15,15 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from 'node:net'
 import { dirname, join, normalize, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { ChannelPolicy } from '@embodied/core'
-import { isSensorError, probeDirectorJson } from '@embodied/core'
+import type { ChannelPolicy, PackRegistryEntry } from '@embodied/core'
+import {
+  ContentPackError,
+  isSensorError,
+  MAX_ZIP_BYTES,
+  PackRegistryError,
+  probeDirectorJson,
+  ZipError,
+} from '@embodied/core'
 import type { FeatureSample, ProbeRecord, SensorQuality, SensorStatus, Snapshot } from '@embodied/core'
 import type { DeviceManagerEntry, DeviceProtocol } from './bootstrap.ts'
 import { isSessionError } from './play.ts'
@@ -29,6 +36,14 @@ const MAX_BODY_BYTES = 256 * 1024
 /** Protocols the operator may add through the console. */
 const ADDABLE_PROTOCOLS: readonly string[] = ['coyote', 'xhtkj', 'mock']
 
+/** 一次导入的结果，只含 UI 需要的小字段（`LoadedPack` 不可序列化）。 */
+export interface PackImportSummary {
+  readonly id: string
+  readonly version: string
+  /** 本次导入是否立即成为 active 版本。 */
+  readonly active: boolean
+}
+
 /** Every capability the console needs; satisfied by HostRuntime plus audit. */
 export interface DashboardDeps {
   snapshot(): unknown
@@ -37,6 +52,12 @@ export interface DashboardDeps {
    * test double) keeps working; the session routes answer 404 without it.
    */
   readonly session?: DashboardSession
+  /** 已安装内容包与 active 版本（B2-T14）；`GET /api/packs`。 */
+  listPacks(): Promise<readonly PackRegistryEntry[]>
+  /** 校验并安装一个 zip；成功后返回被安装的版本（通常同时激活）。 */
+  importPack(bytes: Uint8Array): Promise<PackImportSummary>
+  /** 切换下一次会话使用的 active 版本；会话中途不生效。 */
+  activatePack(id: string, version: string): Promise<void>
   panic(source: string): Promise<void>
   unlock(note?: string): Promise<void>
   setCap(deviceId: string, channelId: string, patch: Partial<ChannelPolicy>): Promise<void>
@@ -80,6 +101,15 @@ export interface DashboardDeps {
   sensorFrame(sourceId?: string): Promise<Snapshot | undefined>
   /** Store one externally captured feature sample (unknown source → 400). */
   pushFeatures(sample: FeatureSample): void
+  /**
+   * Move the session ceiling as a human (B2-T9). Optional: the console-only
+   * host has no session, and the route answers 404 in that case.
+   */
+  readonly setSessionCeiling?: (percent: number) => Promise<unknown>
+  /** Move one channel's narrative region label (B2-T10). */
+  readonly setRegion?: (deviceId: string, channelId: string, region: string | undefined) => Promise<void>
+  /** Region labels in force, keyed `device:channel` (B2-T10). */
+  readonly regions?: () => Readonly<Record<string, string>>
 }
 
 /** The one-session API the play routes drive (implemented by `PlayHost`). */
@@ -147,6 +177,35 @@ function sendSessionFailure(response: ServerResponse, error: unknown): void {
   throw error
 }
 
+/**
+ * 内容包路由的错误映射。
+ *
+ * `not-found`/`not-installed` 是 404（包或版本不存在），`store-failure`/
+ * `invalid-registry` 是宿主侧故障（500），其余注册表错误与 zip/包校验失败
+ * 都是调用方可修复的 400。未知错误继续冒泡成 500，交给错误日志。
+ */
+function sendPackFailure(response: ServerResponse, error: unknown): void {
+  if (error instanceof PackRegistryError) {
+    const status = error.code === 'not-found' || error.code === 'not-installed'
+      ? 404
+      : error.code === 'store-failure' || error.code === 'invalid-registry'
+        ? 500
+        : 400
+    sendJson(response, status, { ok: false, error: error.message, code: error.code })
+    return
+  }
+  if (error instanceof ZipError) {
+    sendJson(response, 400, { ok: false, error: error.message, code: error.code })
+    return
+  }
+  if (error instanceof ContentPackError) {
+    // 包校验错误自带出错文件与 JSON 路径，原样展示给导入 UI。
+    sendJson(response, 400, { ok: false, error: error.message, code: 'PACK_INVALID', file: error.file })
+    return
+  }
+  throw error
+}
+
 async function readBody(request: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
@@ -162,6 +221,47 @@ async function readBody(request: IncomingMessage): Promise<string> {
     })
     request.on('end', () => { resolve(Buffer.concat(chunks).toString('utf8')) })
     request.on('error', reject)
+  })
+}
+
+/**
+ * 读取原始二进制请求体（`POST /api/packs/import` 的 zip）。
+ *
+ * 与 JSON 的 `readBody` 分开：zip 上限是 `MAX_ZIP_BYTES`（64 MB），远超
+ * 控制台普通 JSON 的 256 KiB。超限时用 `resume()` 把剩余数据排空再返回
+ * 可读错误，而不是像 JSON 路径那样直接 destroy 连接——导入失败必须能
+ * 在控制台看到 400 的原因。
+ */
+async function readBinaryBody(request: IncomingMessage, limit: number): Promise<Uint8Array> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let total = 0
+    let settled = false
+    const fail = (message: string): void => {
+      if (settled) return
+      settled = true
+      reject(new Error(message))
+      request.resume()
+    }
+    request.on('data', (chunk: Buffer) => {
+      if (settled) return
+      total += chunk.length
+      if (total > limit) {
+        fail(`zip upload exceeds the ${limit}-byte limit`)
+        return
+      }
+      chunks.push(chunk)
+    })
+    request.on('end', () => {
+      if (settled) return
+      settled = true
+      resolve(new Uint8Array(Buffer.concat(chunks)))
+    })
+    request.on('error', (error: Error) => {
+      if (settled) return
+      settled = true
+      reject(error)
+    })
   })
 }
 
@@ -488,6 +588,125 @@ export class DashboardServer {
         sendJson(response, 200, await session.end(reason))
       } catch (error) {
         sendSessionFailure(response, error)
+      }
+      return
+    }
+
+    // ── Session ceiling (B2-T9) ──────────────────────────────────────────
+    // Human-only by construction: the route calls PlayHost.setCeiling, which
+    // is the only place PolicyStore.setSessionCeilingByHuman is reached.
+    if (request.method === 'POST' && pathname === '/api/session/ceiling') {
+      const setSessionCeiling = this.options.deps.setSessionCeiling
+      if (setSessionCeiling === undefined) {
+        sendError(response, 404, 'the session service is not available')
+        return
+      }
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(request)
+      } catch (error) {
+        sendError(response, 400, `invalid JSON body: ${error instanceof Error ? error.message : 'unreadable'}`)
+        return
+      }
+      const percent = body.percent
+      if (typeof percent !== 'number' || !Number.isInteger(percent)) {
+        sendError(response, 400, 'percent must be a whole number from 0 to 100')
+        return
+      }
+      try {
+        sendJson(response, 200, await setSessionCeiling(percent))
+      } catch (error) {
+        sendSessionFailure(response, error)
+      }
+      return
+    }
+
+    // ── Narrative regions (B2-T10) ───────────────────────────────────────
+    // Region labels are device configuration, not session state: they apply
+    // immediately and persist even when no session is open.
+    if (request.method === 'GET' && pathname === '/api/region') {
+      sendJson(response, 200, { regions: this.options.deps.regions?.() ?? {} })
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/region') {
+      const setRegion = this.options.deps.setRegion
+      if (setRegion === undefined) {
+        sendError(response, 404, 'region editing is not available')
+        return
+      }
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(request)
+      } catch (error) {
+        sendError(response, 400, `invalid JSON body: ${error instanceof Error ? error.message : 'unreadable'}`)
+        return
+      }
+      const deviceId = asOptionalString(body.deviceId)
+      const channelId = asOptionalString(body.channelId)
+      if (deviceId === undefined || channelId === undefined) {
+        sendError(response, 400, 'deviceId and channelId are required')
+        return
+      }
+      const rawRegion = body.region
+      if (!(rawRegion === undefined || rawRegion === null || typeof rawRegion === 'string')) {
+        sendError(response, 400, 'region must be a string or null')
+        return
+      }
+      try {
+        await setRegion(deviceId, channelId, rawRegion === null ? undefined : rawRegion)
+        sendJson(response, 200, { regions: this.options.deps.regions?.() ?? {} })
+      } catch (error) {
+        sendError(response, 400, error instanceof Error ? error.message : 'region change rejected')
+      }
+      return
+    }
+
+    // ── Content packs (B2-T14) ───────────────────────────────────────────
+    // 安装/切换只改注册表，不碰用户存档（`内容包规范.md` §6.6）。导入是原始
+    // zip 字节而不是 JSON；鉴权仍走统一的 x-control-token。
+    if (request.method === 'GET' && pathname === '/api/packs') {
+      sendJson(response, 200, { packs: await this.options.deps.listPacks() })
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/packs/import') {
+      let bytes: Uint8Array
+      try {
+        bytes = await readBinaryBody(request, MAX_ZIP_BYTES)
+      } catch (error) {
+        sendError(response, 400, `could not read the zip upload: ${error instanceof Error ? error.message : 'unreadable'}`)
+        return
+      }
+      try {
+        // 导入即激活：新装/升级后立即可玩；要保留旧版就用 activate 切回去。
+        const pack = await this.options.deps.importPack(bytes)
+        sendJson(response, 200, { pack, packs: await this.options.deps.listPacks() })
+      } catch (error) {
+        sendPackFailure(response, error)
+      }
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/packs/activate') {
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(request)
+      } catch (error) {
+        sendError(response, 400, `invalid JSON body: ${error instanceof Error ? error.message : 'unreadable'}`)
+        return
+      }
+      const id = asOptionalString(body.id)
+      const version = asOptionalString(body.version)
+      if (id === undefined || version === undefined) {
+        sendError(response, 400, 'id and version are required')
+        return
+      }
+      try {
+        await this.options.deps.activatePack(id, version)
+        sendJson(response, 200, { ok: true, packs: await this.options.deps.listPacks() })
+      } catch (error) {
+        sendPackFailure(response, error)
       }
       return
     }

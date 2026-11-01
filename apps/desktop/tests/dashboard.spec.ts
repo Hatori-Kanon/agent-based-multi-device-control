@@ -1,5 +1,6 @@
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
+import { deflateRawSync } from 'node:zlib'
 import {
   FakeClock,
   M2_MODEL_TOOLS,
@@ -319,6 +320,9 @@ function debugDeps(records: readonly ProbeRecord[]): DashboardDeps {
       end: async () => unused(),
       snapshot: () => ({ phase: 'scene', lastLine: '……', choices: [] }),
     },
+    listPacks: async () => unused(),
+    importPack: async () => unused(),
+    activatePack: async () => unused(),
     panic: async () => unused(),
     unlock: async () => unused(),
     setCap: async () => unused(),
@@ -645,5 +649,211 @@ describe('phone stop page', () => {
     })
     const snapshot = await fetch(`${base(host)}/api/snapshot`, { headers: headers(host.dashboardToken) })
     expect(((await snapshot.json()) as { locked: boolean }).locked).toBe(true)
+  })
+})
+
+// ── B2-T14: content-pack routes ────────────────────────────────────────────
+// `core` 的 ZIP 读取器零依赖，fixture 也手写一个最小 store-only ZIP；
+// 这里只生成 ASCII 文件名，避免把 CP437/UTF-8 的编码细节带进路由测试。
+
+const PACK_CRC32_TABLE: Uint32Array = (() => {
+  const table = new Uint32Array(256)
+  for (let index = 0; index < 256; index += 1) {
+    let value = index
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value & 1) !== 0 ? (0xedb88320 ^ (value >>> 1)) : value >>> 1
+    }
+    table[index] = value >>> 0
+  }
+  return table
+})()
+
+function packCrc32(bytes: Uint8Array): number {
+  let crc = 0xffffffff
+  for (const byte of bytes) crc = ((crc >>> 8) ^ PACK_CRC32_TABLE[(crc ^ byte) & 0xff]!) >>> 0
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function packUtf8(text: string): Uint8Array {
+  return new TextEncoder().encode(text)
+}
+
+function packConcat(parts: readonly Uint8Array[]): Uint8Array {
+  const total = parts.reduce((sum, part) => sum + part.byteLength, 0)
+  const result = new Uint8Array(total)
+  let offset = 0
+  for (const part of parts) {
+    result.set(part, offset)
+    offset += part.byteLength
+  }
+  return result
+}
+
+/** 最小 ZIP fixture；`deflate: true` 时走 method 8，验证宿主的 `inflateRaw` 注入。 */
+function packZip(files: Readonly<Record<string, string>>, options: { readonly deflate?: boolean } = {}): Uint8Array {
+  const localParts: Uint8Array[] = []
+  const centralParts: Uint8Array[] = []
+  let localOffset = 0
+  for (const [name, value] of Object.entries(files)) {
+    const nameBytes = packUtf8(name)
+    const data = packUtf8(value)
+    const crc = packCrc32(data)
+    const method = options.deflate === true ? 8 : 0
+    const compressed = method === 8 ? new Uint8Array(deflateRawSync(data)) : data
+
+    const local = new Uint8Array(30 + nameBytes.byteLength + compressed.byteLength)
+    const localView = new DataView(local.buffer)
+    localView.setUint32(0, 0x04034b50, true)
+    localView.setUint16(4, 20, true)
+    localView.setUint16(6, 0, true)
+    localView.setUint16(8, method, true)
+    localView.setUint32(14, crc, true)
+    localView.setUint32(18, compressed.byteLength, true)
+    localView.setUint32(22, data.byteLength, true)
+    localView.setUint16(26, nameBytes.byteLength, true)
+    local.set(nameBytes, 30)
+    local.set(compressed, 30 + nameBytes.byteLength)
+    localParts.push(local)
+
+    const central = new Uint8Array(46 + nameBytes.byteLength)
+    const centralView = new DataView(central.buffer)
+    centralView.setUint32(0, 0x02014b50, true)
+    centralView.setUint16(4, 20, true)
+    centralView.setUint16(6, 20, true)
+    centralView.setUint16(8, 0, true)
+    centralView.setUint16(10, method, true)
+    centralView.setUint32(16, crc, true)
+    centralView.setUint32(20, compressed.byteLength, true)
+    centralView.setUint32(24, data.byteLength, true)
+    centralView.setUint16(28, nameBytes.byteLength, true)
+    centralView.setUint32(42, localOffset, true)
+    central.set(nameBytes, 46)
+    centralParts.push(central)
+
+    localOffset += local.byteLength
+  }
+  const centralSize = centralParts.reduce((sum, part) => sum + part.byteLength, 0)
+  const eocd = new Uint8Array(22)
+  const eocdView = new DataView(eocd.buffer)
+  eocdView.setUint32(0, 0x06054b50, true)
+  eocdView.setUint16(8, Object.keys(files).length, true)
+  eocdView.setUint16(10, Object.keys(files).length, true)
+  eocdView.setUint32(12, centralSize, true)
+  eocdView.setUint32(16, localOffset, true)
+  return packConcat([...localParts, ...centralParts, eocd])
+}
+
+function packZipOf(
+  id: string,
+  version: string,
+  name: string,
+  options: { readonly deflate?: boolean } = {},
+): Uint8Array {
+  return packZip({
+    'pack.json': JSON.stringify({
+      id,
+      name,
+      version,
+      engine: '>=0.2 <1.0',
+      mode: 'freeform',
+      rating: 'all',
+      boundaries: ['不做真实伤害'],
+    }),
+    'persona.md': `# ${name}\n\n## 导演摘要\n\n测试用角色，先观察再靠近。\n`,
+  }, options)
+}
+
+/** `fetch()` 在运行时接受任意 ArrayBufferView；TS 6 的 DOM 类型只收 ArrayBuffer 视图。 */
+function packUpload(bytes: Uint8Array): BodyInit {
+  return bytes as unknown as BodyInit
+}
+
+interface PacksResponse {
+  readonly packs: readonly {
+    readonly id: string
+    readonly activeVersion?: string
+    readonly versions: readonly { readonly version: string; readonly active: boolean }[]
+  }[]
+}
+
+interface ImportResponse extends PacksResponse {
+  readonly pack: { readonly id: string; readonly version: string; readonly active: boolean }
+}
+
+describe('content pack API (B2-T14)', () => {
+  it('imports a zip, lists both versions, and switches the active version', async () => {
+    const host = await start()
+    const token = host.dashboardToken
+    const url = base(host)
+
+    let response = await fetch(`${url}/api/packs`, { headers: headers(token) })
+    expect(response.status).toBe(200)
+    expect(((await response.json()) as PacksResponse).packs).toEqual([])
+
+    response = await fetch(`${url}/api/packs/import`, {
+      method: 'POST',
+      headers: headers(token),
+      body: packUpload(packZipOf('demo-pack', '1.0.0', '旧版')),
+    })
+    expect(response.status).toBe(200)
+    let imported = await response.json() as ImportResponse
+    expect(imported.pack).toEqual({ id: 'demo-pack', version: '1.0.0', active: true })
+    expect(imported.packs[0]?.activeVersion).toBe('1.0.0')
+
+    // 新版本安装后默认切到新版本；旧版仍保留，可随时切回（回滚）。
+    response = await fetch(`${url}/api/packs/import`, {
+      method: 'POST',
+      headers: headers(token),
+      body: packUpload(packZipOf('demo-pack', '1.1.0', '新版', { deflate: true })),
+    })
+    expect(response.status).toBe(200)
+    imported = await response.json() as ImportResponse
+    expect(imported.pack).toEqual({ id: 'demo-pack', version: '1.1.0', active: true })
+    expect(imported.packs[0]?.versions.map(version => version.version)).toEqual(['1.0.0', '1.1.0'])
+    expect(imported.packs[0]?.activeVersion).toBe('1.1.0')
+
+    response = await fetch(`${url}/api/packs/activate`, {
+      method: 'POST',
+      headers: headers(token, true),
+      body: JSON.stringify({ id: 'demo-pack', version: '1.0.0' }),
+    })
+    expect(response.status).toBe(200)
+    const switched = await response.json() as PacksResponse
+    expect(switched.packs[0]?.activeVersion).toBe('1.0.0')
+    expect(switched.packs[0]?.versions.find(version => version.active)?.version).toBe('1.0.0')
+  })
+
+  it('answers 400 for a corrupt zip and 404 for an unknown pack or version', async () => {
+    const host = await start()
+    const token = host.dashboardToken
+    const url = base(host)
+
+    let response = await fetch(`${url}/api/packs/import`, {
+      method: 'POST',
+      headers: headers(token),
+      body: packUpload(packUtf8('definitely not a zip archive')),
+    })
+    expect(response.status).toBe(400)
+    const corrupt = await response.json() as { error: string; code?: string }
+    expect(corrupt.error).toMatch(/zip/iu)
+    expect(corrupt.code).toBe('not-a-zip')
+    // 校验失败不改变已安装列表（导入是全有或全无）。
+    expect(((await (await fetch(`${url}/api/packs`, { headers: headers(token) })).json()) as PacksResponse).packs)
+      .toEqual([])
+
+    response = await fetch(`${url}/api/packs/activate`, {
+      method: 'POST',
+      headers: headers(token, true),
+      body: JSON.stringify({ id: 'ghost', version: '1.0.0' }),
+    })
+    expect(response.status).toBe(404)
+    expect(((await response.json()) as { error: string }).error).toContain('ghost')
+
+    response = await fetch(`${url}/api/packs/activate`, {
+      method: 'POST',
+      headers: headers(token, true),
+      body: JSON.stringify({ id: 'ghost' }),
+    })
+    expect(response.status).toBe(400)
   })
 })

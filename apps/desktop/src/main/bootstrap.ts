@@ -10,16 +10,20 @@
 import { randomBytes } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { inflateRawSync } from 'node:zlib'
 import {
   AuditLog,
   AnkniBackend,
   ButtplugBackend,
   CoyoteBackend,
   DeviceRegistry,
+  ENGINE_VERSION,
   MockBackend,
   MonsterPartyBackend,
+  PackRegistry,
   parsePolicySnapshot,
   PolicyStore,
+  RegionStore,
   DEFAULT_SESSION_CEILING,
   SensorRegistry,
   serializePolicySnapshot,
@@ -35,6 +39,7 @@ import {
   type LlmConfig,
   type ModelRunner,
   type PolicySnapshot,
+  type RawInflate,
   type RegistrySnapshot,
   type SensorStatus,
   type SerializedWaveform,
@@ -45,8 +50,10 @@ import { DashboardServer, type DashboardDeps } from './dashboard.ts'
 import { log, recentLogs } from './log.ts'
 import { NodeTextSocketTransport } from './node-socket.ts'
 import { FileAppendOnlyStore, FileDocumentStore, readAuditTail } from './node-storage.ts'
+import { FsPackStore } from './pack-store.ts'
+import { RegistryPackSource } from './pack-source.ts'
 import { PanicServer } from './panic-server.ts'
-import { DirectoryPackSource, PlayHost } from './play.ts'
+import { PlayHost } from './play.ts'
 import { cameraSensorSource, DEFAULT_CAMERA_FPS, type CameraHost } from './sensors/camera-host.ts'
 import { createModelRunner, llmSummaryOf, loadLlmSettings, settingsFromConfig, singleCallModel } from './llm.ts'
 import type { LlmSummary, SettingsEnv } from './settings.ts'
@@ -157,6 +164,14 @@ export interface HostRuntime {
    * latch move together.
    */
   readonly play: PlayHost
+  /**
+   * 已安装内容包注册表（B2-T14）。
+   *
+   * 只读暴露给嵌入式宿主/测试；控制台通过 `/api/packs/*` 使用它，会话服务
+   * 通过 `RegistryPackSource` 读取当前 active 版本。注册表没有需要关闭的
+   * 句柄，`shutdown` 只等待排队中的导入/切换落盘。
+   */
+  readonly packs: PackRegistry
   readonly panicToken: string
   readonly panicAddress: { host: string; port: number } | undefined
   /** The control console's token and bind address. */
@@ -358,7 +373,19 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
   })
   const llmSummary = (): LlmSummary => llmSummaryOf(llmSettings)
 
-  const registry = new DeviceRegistry({ clock, audit, policy, waveforms, onError: recordError })
+  // Region labels: manifest defaults live in the registry snapshot; the
+  // override layer persists separately so a cleared label stays cleared.
+  const regionStore = new RegionStore()
+  const savedRegions = await documents.read('regions')
+  if (savedRegions !== undefined) {
+    try {
+      const parsed: unknown = JSON.parse(savedRegions)
+      if (typeof parsed === 'object' && parsed !== null) regionStore.restore(parsed as Record<string, string>)
+    } catch (error) {
+      recordError(error)
+    }
+  }
+  const registry = new DeviceRegistry({ clock, audit, policy, waveforms, regions: regionStore, onError: recordError })
   const controller = new AbortController()
 
   // ── Perception sources (A1-T6) ──────────────────────────────────────────
@@ -410,10 +437,35 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
   }
   const pushFeatures = (sample: FeatureSample): void => { sensors.push(sample) }
 
+  // ── Content-pack registry (B2-T14) ──────────────────────────────────────
+  // The registry owns `<dataDir>/content/registry.json` and
+  // `content/packs/<id>/<version>/`; `core` stays platform-free, so the host
+  // supplies the filesystem port and Node's zip decompressor. This is the only
+  // writer of installed packs (the session reads through `RegistryPackSource`).
+  const packStore = new FsPackStore(options.dataDir)
+  const inflateRaw: RawInflate = (data, inflateOptions) =>
+    new Uint8Array(inflateRawSync(data, inflateOptions))
+  const packRegistry = new PackRegistry({
+    store: packStore,
+    clock,
+    engineVersion: ENGINE_VERSION,
+    inflateRaw,
+  })
+  // 导入/切换都是 read-modify-write 同一份 registry.json；并发 HTTP 请求若
+  // 交错会互相覆盖，所以全部串行化。shutdown 会等这个队列排空再退出，
+  // 避免进程在“文件写完、注册表未写”的中间态退出。
+  let packOps: Promise<unknown> = Promise.resolve()
+  const runPackOp = <T>(operation: () => Promise<T>): Promise<T> => {
+    const next = packOps.then(operation, operation)
+    packOps = next.catch(() => {})
+    return next
+  }
+
   // ── Host session service (B1-T16) ───────────────────────────────────────
-  // One session per process. Packs are read from the documented interim layout
-  // (`content/packs/<id>/<version>/`) until B2-T14's registry owns that lookup;
-  // swapping the source does not change the session API.
+  // One session per process. Packs resolve through the installed-pack registry
+  // (B2-T14): the active version chosen in `content/registry.json` wins, so
+  // switching a pack at a session boundary changes what the next start loads
+  // without touching this service's interface.
   const play = new PlayHost({
     clock,
     audit,
@@ -423,7 +475,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     sensors,
     runner: modelRunner,
     savePolicy,
-    packs: new DirectoryPackSource(options.dataDir),
+    packs: new RegistryPackSource({ registry: packRegistry, store: packStore, engineVersion: ENGINE_VERSION }),
     // B2-T7/T8: every settled turn writes a snapshot, every session one ledger
     // line. The ledger is append-only and lives outside `state/` on purpose.
     archive: {
@@ -692,6 +744,16 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       end: async reason => await play.end(reason),
       snapshot: () => play.snapshot(),
     },
+    // 内容包管理（B2-T14）：导入即激活，版本切换走 activatePack。每次调用都
+    // 经过 `runPackOp`，避免并发的 read-modify-write 覆盖 registry.json。
+    listPacks: async () => await runPackOp(async () => await packRegistry.list()),
+    importPack: async bytes => {
+      const installed = await runPackOp(async () => await packRegistry.install(bytes, { activate: true }))
+      return { id: installed.id, version: installed.version, active: installed.active }
+    },
+    activatePack: async (id, version) => {
+      await runPackOp(async () => { await packRegistry.activate(id, version) })
+    },
     panic,
     unlock: async note => {
       await registry.unlock('human', note)
@@ -752,6 +814,14 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     sensorFrame,
     pushFeatures,
     probes: () => play.probes(),
+    setSessionCeiling: async percent => await play.setCeiling(percent),
+    setRegion: async (deviceId, channelId, region) => {
+      await play.setRegion(deviceId, channelId, region)
+      // Durable override layer: a cleared label must stay cleared after a
+      // restart instead of reviving the manifest default.
+      await documents.write('regions', JSON.stringify(regionStore.snapshot(), null, 2))
+    },
+    regions: () => play.regions(),
     recentLogs,
   }
 
@@ -785,6 +855,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     modelRunner,
     llm,
     play,
+    packs: packRegistry,
     panicToken,
     panicAddress,
     dashboardToken,
@@ -813,6 +884,9 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       play.dispose()
       await panicServer?.stop()
       await dashboardServer?.stop()
+      // 注册表没有需要释放的句柄；等排队中的导入/切换写完（或回滚完），
+      // 避免进程在“包文件已写、registry.json 未写”的中间态退出。
+      await packOps.catch(() => {})
       await registry.shutdown()
       // Only stops an engine this process started.
       await intifaceProcess.stop()

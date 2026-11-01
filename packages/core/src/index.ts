@@ -69,6 +69,9 @@ export type { ChannelPolicy, PolicyChange, PolicySnapshot } from './devices/poli
 
 export { SerialQueue } from './devices/queue.ts'
 
+export { RegionStore } from './devices/regions.ts'
+export type { RegionChange, RegionStoreOptions } from './devices/regions.ts'
+
 export { DeviceRegistry } from './devices/registry.ts'
 export type {
   ChannelSnapshot,

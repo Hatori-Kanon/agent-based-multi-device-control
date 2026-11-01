@@ -499,6 +499,49 @@ export class PlaySession {
     return this.requireSnapshot()
   }
 
+  /**
+   * Move the session ceiling as a human (B2-T9 / D4).
+   *
+   * The store write is human-only; the hardware ceiling has to follow it, so
+   * every connected device re-asserts its bounds (`Coyote BF`). No engine or
+   * content-pack path reaches this method.
+   */
+  async setSessionCeiling(percent: number): Promise<PlaySnapshot> {
+    if (this.env.registry.isLocked) {
+      throw new SessionError('LOCKED', 'the device registry is locked; unlock it before changing the ceiling')
+    }
+    assertCeiling(percent)
+    const change = this.env.policy.setSessionCeilingByHuman(percent)
+    await this.env.audit.record({
+      actor: 'human',
+      action: 'policy_change',
+      result: 'ok',
+      detail: { scope: 'session', previous: change.previous, next: change.next },
+    })
+    await this.env.savePolicy()
+    // Rule 4 of the D4 decision: the hardware ceiling must not outlive a
+    // narrowed session ceiling.
+    await this.env.registry.reapplyBounds()
+    return this.requireSnapshot()
+  }
+
+  /** Move one channel's narrative region; the next plan sees it (B2-T10). */
+  async setRegion(deviceId: string, channelId: string, region: string | undefined): Promise<PlaySnapshot> {
+    await this.env.registry.setRegionByHuman(deviceId, channelId, region)
+    return this.requireSnapshot()
+  }
+
+  /** Region labels in force, keyed `device:channel`. */
+  regions(): Readonly<Record<string, string>> {
+    const labels: Record<string, string> = {}
+    for (const device of this.env.registry.snapshot().devices) {
+      for (const channel of device.channels) {
+        if (channel.region !== undefined) labels[`${device.id}:${channel.id}`] = channel.region
+      }
+    }
+    return labels
+  }
+
   /** Recent settled probes for the debug panel; empty without a session. */
   probes(): readonly ProbeRecord[] {
     return this.probeRecorder?.recent(20) ?? []
@@ -832,6 +875,27 @@ export class PlayHost {
     await session.panic(source)
   }
 
+  /** Human session-ceiling change; requires an open session (B2-T9). */
+  async setCeiling(percent: number): Promise<PlaySnapshot> {
+    const session = this.session
+    if (session === undefined) throw new SessionError('NO_SESSION', 'no session is open')
+    return await session.setSessionCeiling(percent)
+  }
+
+  /** Region label edit; works without a session (it is device config, B2-T10). */
+  async setRegion(deviceId: string, channelId: string, region: string | undefined): Promise<void> {
+    if (this.session !== undefined) {
+      await this.session.setRegion(deviceId, channelId, region)
+      return
+    }
+    await this.options.registry.setRegionByHuman(deviceId, channelId, region)
+  }
+
+  /** Region labels in force, keyed `device:channel`. */
+  regions(): Readonly<Record<string, string>> {
+    return this.session?.regions() ?? regionsOf(this.options.registry.snapshot())
+  }
+
   /** Recent probes from the open session (debug panel only). */
   probes(): readonly ProbeRecord[] {
     return this.session?.probes() ?? []
@@ -982,6 +1046,17 @@ function scenarioFor(pack: LoadedPack, plannedMinutes: number): ScenarioDefiniti
     ],
     feedbackIntents: DEFAULT_INTENTS,
   }
+}
+
+/** Region labels from a registry snapshot, keyed `device:channel`. */
+function regionsOf(snapshot: RegistrySnapshot): Readonly<Record<string, string>> {
+  const labels: Record<string, string> = {}
+  for (const device of snapshot.devices) {
+    for (const channel of device.channels) {
+      if (channel.region !== undefined) labels[`${device.id}:${channel.id}`] = channel.region
+    }
+  }
+  return labels
 }
 
 /** What the model may read about the world this turn: registry facts only. */

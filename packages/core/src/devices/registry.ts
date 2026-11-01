@@ -21,6 +21,7 @@ import { SafetyError } from './errors.ts'
 import type { DispatchEvent } from './events.ts'
 import { assertLevelWithinPolicy, clampPercentToPolicy, type ChannelPolicy, type PolicyStore } from './policy.ts'
 import { SerialQueue } from './queue.ts'
+import { RegionStore, type RegionChange } from './regions.ts'
 import type { Channel, ChannelKind, DeviceBackend, DeviceLifecycle } from './types.ts'
 import type { Clock } from '../ports/clock.ts'
 import type { WaveformLibrary } from '../waveform/library.ts'
@@ -63,6 +64,15 @@ export interface ChannelSnapshot {
    * across backends; this is how much of that is visible.
    */
   readonly outputFloorPercent: number
+  /**
+   * Narrative region this channel is currently labelled with.
+   *
+   * Resolution order is **human/machine manifest override → the backend's
+   * {@link Channel.region} → `undefined`**. It never falls back to
+   * `whole-body`: that wildcard is the resolver's rule for "call every level
+   * channel", not a label the registry invents (`M2-实施计划.md` §4.6.3).
+   */
+  readonly region?: string
   /** Level most recently written to the transport. */
   readonly percent: number
   readonly maxPercent: number
@@ -93,6 +103,14 @@ export interface DeviceRegistryOptions {
   readonly policy: PolicyStore
   /** Resolves waveform ids for pulse-capable channels. */
   readonly waveforms?: WaveformLibrary
+  /**
+   * Human-owned region labels, keyed `device:channel`.
+   *
+   * Optional: without it the registry still reports whatever a backend put on
+   * {@link Channel.region}, and human edits land in a private in-memory store.
+   * The host injects the store it also persists, so labels survive a restart.
+   */
+  readonly regions?: RegionStore
   /** Receives transport and shutdown failures for operator display. */
   readonly onError: (error: unknown) => void
   readonly tickMs?: number
@@ -128,11 +146,14 @@ function describe(error: unknown): string {
 export class DeviceRegistry {
   private readonly devices = new Map<string, DeviceState>()
   private readonly listeners = new Set<(event: DispatchEvent) => void>()
+  private readonly regions: RegionStore
   private locked = false
   private lockedReason: string | undefined
   private shuttingDown = false
 
-  constructor(private readonly options: DeviceRegistryOptions) {}
+  constructor(private readonly options: DeviceRegistryOptions) {
+    this.regions = options.regions ?? new RegionStore()
+  }
 
   get isLocked(): boolean {
     return this.locked
@@ -610,6 +631,43 @@ export class DeviceRegistry {
   }
 
   /**
+   * Label a channel with a narrative region, or clear the label.
+   *
+   * Human-only. The model's tool face lists regions but never assigns one: a
+   * relabelable channel would let a pack redirect output somewhere it was not
+   * meant to reach. Works on a registered-but-unconnected device, because a
+   * human setting up hardware labels the ports before plugging anything in.
+   *
+   * Takes effect on the next `resolvePlan` call — the resolver reads labels from
+   * {@link snapshot}, so no reconnect or restart is involved.
+   */
+  async setRegionByHuman(deviceId: string, channelId: string, region: string | undefined): Promise<void> {
+    // null rather than an absent key: a cleared label stays visible in the
+    // persisted audit line, where an omitted field would read as "no change".
+    const detail: Record<string, unknown> = { deviceId, channelId, next: region ?? null }
+    let change: RegionChange
+    try {
+      this.requireDevice(deviceId)
+      this.channelState(deviceId, channelId)
+      change = this.regions.setByHuman(deviceId, channelId, region)
+    } catch (error) {
+      await this.recordFailure('human', 'region_change', detail, error)
+      throw error
+    }
+    await this.options.audit.record({
+      actor: 'human',
+      action: 'region_change',
+      result: 'ok',
+      detail: {
+        deviceId,
+        channelId,
+        previous: change.previous ?? null,
+        next: change.next ?? null,
+      },
+    })
+  }
+
+  /**
    * Make a cap change take effect immediately rather than at the next value
    * change.
    *
@@ -640,6 +698,36 @@ export class DeviceRegistry {
     }
   }
 
+  /**
+   * Re-assert hardware-enforced bounds on every ready channel.
+   *
+   * The session ceiling narrows every channel at once, and a Coyote keeps its
+   * `BF` soft cap in hardware across power cycles. A narrowed cap that never
+   * reaches the device would leave the old ceiling silently in force, so a
+   * session-wide change re-sends it everywhere instead of only on the channels
+   * a policy edit happened to name.
+   *
+   * Failures are reported through `onError` and never abort the sweep: one
+   * unreachable toy must not stop the others from being narrowed. Nothing is
+   * audited — this is not a new action, it re-asserts bounds a human already
+   * set and audited as `policy_change`.
+   */
+  async reapplyBounds(): Promise<void> {
+    if (this.shuttingDown) return
+    for (const device of this.devices.values()) {
+      if (device.lifecycle !== 'ready') continue
+      if (device.backend.applyBounds === undefined) continue
+      for (const state of device.channels.values()) {
+        const channelId = state.channel.id
+        try {
+          await device.queue.enqueue(() => device.backend.applyBounds!(channelId), true)
+        } catch (error) {
+          this.options.onError(error)
+        }
+      }
+    }
+  }
+
   snapshot(): RegistrySnapshot {
     return {
       locked: this.locked,
@@ -651,12 +739,19 @@ export class DeviceRegistry {
         canScan: device.backend.scan !== undefined,
         channels: [...device.channels.values()].map(state => {
           const policy = this.options.policy.effective(device.backend.id, state.channel.id)
+          // Human/machine label first, then whatever the backend declared.
+          // Never `whole-body`: the wildcard belongs to the resolver. `has`
+          // keeps an explicit clear from resurrecting the backend label.
+          const region = this.regions.has(device.backend.id, state.channel.id)
+            ? this.regions.get(device.backend.id, state.channel.id)
+            : state.channel.region
           return {
             id: state.channel.id,
             kind: state.channel.kind,
             label: state.channel.label,
             supportsWaveform: state.channel.supportsWaveform === true,
             outputFloorPercent: state.channel.outputFloorPercent ?? 0,
+            ...(region === undefined ? {} : { region }),
             percent: state.percent,
             maxPercent: policy.maxPercent,
             maxWaveIntensity: policy.maxWaveIntensity,
