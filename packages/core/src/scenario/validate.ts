@@ -104,8 +104,14 @@ function warn(ctx: Context, file: string, path: string, rule: string, message: s
   ctx.issues.push({ file, path, rule, severity: 'warning', message })
 }
 
-/** Structural path problem, or `undefined` when the path is safe. */
-function pathProblem(path: string): string | undefined {
+/**
+ * Structural path problem, or `undefined` when the path is safe.
+ *
+ * Exported so `loadPack` can reject unsafe paths *before* it asks the
+ * {@link import('../ports/content-source.ts').ContentSource} for any bytes: a
+ * `..` segment must never reach a host that maps paths onto a real directory.
+ */
+export function pathProblem(path: string): string | undefined {
   if (path.length === 0) return 'empty path'
   if (path.startsWith('/')) return 'absolute paths are not allowed'
   if (DRIVE_PREFIX.test(path)) return 'absolute paths are not allowed'

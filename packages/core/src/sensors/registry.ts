@@ -104,9 +104,13 @@ export class SensorRegistry {
       const freshnessMs = entry.ring.freshnessMs(now)
       const quality = newest === undefined
         ? 'unavailable'
-        : freshnessMs !== undefined && freshnessMs >= this.staleAfterMs
-          ? 'stale'
-          : newest.quality
+        : newest.quality === 'unavailable'
+          // An explicit unplug sample outranks staleness: "the camera is gone"
+          // must not decay into "no recent samples" three seconds later.
+          ? 'unavailable'
+          : freshnessMs !== undefined && freshnessMs >= this.staleAfterMs
+            ? 'stale'
+            : newest.quality
       statuses.push({
         id: entry.source.id,
         kind: entry.source.kind,

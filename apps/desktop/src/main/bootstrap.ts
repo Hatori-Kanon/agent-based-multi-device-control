@@ -19,6 +19,7 @@ import {
   MonsterPartyBackend,
   parsePolicySnapshot,
   PolicyStore,
+  DEFAULT_SESSION_CEILING,
   SensorRegistry,
   serializePolicySnapshot,
   WaveformLibrary,
@@ -29,6 +30,7 @@ import {
   type DeviceBackend,
   type DeviceLifecycle,
   type FeatureSample,
+  type PolicySnapshot,
   type RegistrySnapshot,
   type SensorStatus,
   type SerializedWaveform,
@@ -267,10 +269,28 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
   // fails closed and we keep the conservative defaults.
   const savedPolicy = await documents.read('policy')
   if (savedPolicy !== undefined) {
+    let restored: PolicySnapshot | undefined
     try {
-      policy.restore(parsePolicySnapshot(JSON.parse(savedPolicy)))
+      restored = parsePolicySnapshot(JSON.parse(savedPolicy))
+      policy.restore(restored)
     } catch (error) {
+      restored = undefined
       recordError(error)
+    }
+    if (restored !== undefined
+      && (Object.keys(restored.channels).length > 0 || restored.sessionCeiling !== DEFAULT_SESSION_CEILING)) {
+      // Restoring human-set state is not a cap change, but a hand-edited file
+      // must leave a trace: the audit records what came back from disk.
+      await audit.record({
+        actor: 'system',
+        action: 'policy_change',
+        result: 'ok',
+        detail: {
+          scope: 'restore',
+          channels: Object.keys(restored.channels).length,
+          sessionCeiling: restored.sessionCeiling,
+        },
+      })
     }
   }
 

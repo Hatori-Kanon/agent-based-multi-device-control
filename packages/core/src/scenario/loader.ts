@@ -29,7 +29,7 @@ import { parseHexFrames } from '../waveform/hex.ts'
 import { createBuiltinWaveforms } from '../waveform/builtin.ts'
 import { ENGINE_VERSION } from '../version.ts'
 import type { FeedbackIntent } from './intents.ts'
-import { validatePack, type ValidationIssue } from './validate.ts'
+import { pathProblem, validatePack, type ValidationIssue } from './validate.ts'
 
 /** Manifest file name at the pack root. */
 export const PACK_MANIFEST_FILE = 'pack.json'
@@ -367,6 +367,9 @@ function checkWaveformReferences(
   if (scenario === undefined) return
   const intents = Array.isArray(scenario.feedbackIntents) ? scenario.feedbackIntents : []
   for (const intent of intents) {
+    // Structurally broken entries are reported by `validatePack`; this pass
+    // must not throw a raw TypeError on them (review blocker B1).
+    if (typeof intent !== 'object' || intent === null) continue
     const reference = intent.suggest?.waveform
     if (reference === undefined) continue
     const builtinId = reference.startsWith('builtin:') ? reference.slice('builtin:'.length) : reference
@@ -382,10 +385,9 @@ function checkWaveformReferences(
 /** Fill the documented default for omitted intent regions (S15 ladder step 0). */
 function normalizeScenario(scenario: ScenarioDefinition): ScenarioDefinition {
   const intents = Array.isArray(scenario.feedbackIntents) ? scenario.feedbackIntents : []
-  const feedbackIntents = intents.map(intent => ({
-    ...intent,
-    regions: intent.regions ?? ['whole-body'],
-  }))
+  const feedbackIntents = intents.map(intent => (typeof intent === 'object' && intent !== null
+    ? { ...intent, regions: intent.regions ?? ['whole-body'] }
+    : intent))
   return { ...scenario, feedbackIntents }
 }
 
@@ -420,6 +422,15 @@ export async function loadPack(source: ContentSource, options: LoadPackOptions =
   const engineVersion = options.engineVersion ?? ENGINE_VERSION
   const listed = await source.list()
   const files = [...listed].sort()
+  // Reject unsafe paths before the first stat/read (review blocker B2): the
+  // ContentSource maps these strings onto a real directory on the host, so a
+  // ".." segment must never reach it, and the error must name the file.
+  for (const file of files) {
+    const problem = pathProblem(file)
+    if (problem !== undefined) {
+      throw new ContentPackError({ file, path: '.', message: `unsafe path: ${problem}` })
+    }
+  }
   const sizes = new Map<string, number>()
   for (const file of files) {
     try {
@@ -465,6 +476,25 @@ export async function loadPack(source: ContentSource, options: LoadPackOptions =
   }
 
   const persona = sizes.has(PACK_PERSONA_FILE) ? await readTextOrThrow(source, PACK_PERSONA_FILE) : ''
+
+  // Structurally broken entries must be reported, never dereferenced: a raw
+  // TypeError here would escape the ContentPackError contract (review B1).
+  if (scenario !== undefined) {
+    const rawIntents: unknown = (scenario as { feedbackIntents?: unknown }).feedbackIntents
+    if (Array.isArray(rawIntents)) {
+      rawIntents.forEach((intent, index) => {
+        if (typeof intent !== 'object' || intent === null) {
+          issues.push(toIssue(
+            PACK_SCENARIO_FILE,
+            `feedbackIntents[${index}]`,
+            'intent.shape',
+            'error',
+            'feedbackIntents entries must be objects',
+          ))
+        }
+      })
+    }
+  }
 
   issues.push(...validatePack({ manifest, files, sizes, ...(scenario === undefined ? {} : { scenario }), engineVersion }))
   issues.push(...personaIssues(persona))

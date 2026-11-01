@@ -704,3 +704,55 @@ describe('dispatch events follow accepted commands, never envelope ticks', () =>
     expect(events).toHaveLength(1)
   })
 })
+
+describe('session ceiling bounds the effective cap', () => {
+  it('surfaces the ceiling in the snapshot and rejects anything above it', async () => {
+    // Review item R5: only the Coyote BF sync used `effective()`, so the
+    // snapshot and the write path still advertised the raw channel cap.
+    const h = createHarness()
+    await h.registry.connect('toy', signal())
+    h.policy.setByHuman('toy', 'a', { maxPercent: 40 })
+    h.policy.setSessionCeilingByHuman(15)
+
+    const channelA = h.registry.snapshot().devices
+      .find(device => device.id === 'toy')?.channels
+      .find(channel => channel.id === 'a')
+    expect(channelA?.maxPercent).toBe(15)
+
+    const before = h.toy.writes.length
+    const error = await safetyErrorFrom(
+      h.registry.setLevel('human', { deviceId: 'toy', channelId: 'a', percent: 40, durationSec: 5 }),
+    )
+    expect(error.code).toBe('POLICY_PERCENT')
+    expect(error.message).toContain('15')
+    await h.registry.settled()
+    expect(h.toy.writes.length).toBe(before)
+
+    // Releasing the ceiling brings the channel cap back into force.
+    h.policy.setSessionCeilingByHuman(100)
+    const restored = h.registry.snapshot().devices
+      .find(device => device.id === 'toy')?.channels
+      .find(channel => channel.id === 'a')
+    expect(restored?.maxPercent).toBe(40)
+  })
+})
+
+describe('dispatch listeners cannot break the control path', () => {
+  it('reports an async listener rejection instead of leaking an unhandled rejection', async () => {
+    const h = createHarness()
+    await h.registry.connect('toy', signal())
+    const before = h.errors.length
+    h.registry.subscribe(async () => {
+      throw new Error('async listener boom')
+    })
+
+    await h.registry.setLevel('model', { deviceId: 'toy', channelId: 'a', percent: 10, durationSec: 5 })
+    await h.registry.settled()
+    // Two microtask turns let the promise catch run.
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(h.errors.length).toBeGreaterThan(before)
+    expect((h.errors.at(-1) as Error).message).toContain('async listener boom')
+  })
+})

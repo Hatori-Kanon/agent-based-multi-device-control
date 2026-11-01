@@ -147,6 +147,7 @@ function key(deviceId: string, channelId: string): string {
 export class PolicyStore {
   private readonly overrides = new Map<string, ChannelPolicy>()
   private sessionCeiling = DEFAULT_SESSION_CEILING
+  private restored = false
 
   /** @param defaults - Applied to any channel without an explicit override. */
   constructor(private readonly defaults: ChannelPolicy = DEFAULT_CHANNEL_POLICY) {
@@ -164,6 +165,8 @@ export class PolicyStore {
    * @throws SafetyError with code `INVALID_POLICY` when the result is unsafe.
    */
   setByHuman(deviceId: string, channelId: string, patch: Partial<ChannelPolicy>): PolicyChange {
+    assertDeviceKey(deviceId)
+    assertChannelKey(channelId)
     const previous = this.get(deviceId, channelId)
     const next: ChannelPolicy = {
       maxPercent: patch.maxPercent ?? previous.maxPercent,
@@ -215,7 +218,13 @@ export class PolicyStore {
   }
 
   /**
-   * Restore a previously persisted snapshot.
+   * Restore a previously persisted snapshot — **once, at startup**.
+   *
+   * This is the load half of persistence, not a third mutation path: it refuses
+   * a second call and refuses to overwrite a store that already has explicit
+   * overrides, so no engine or content-pack code path can use it to widen a cap
+   * after the process is running (review blocker A-2). Callers audit the
+   * restored values when they differ from the defaults.
    *
    * Validates everything first and commits atomically: a file with one unsafe
    * entry restores nothing, so a hand-edited cap cannot half-apply.
@@ -223,6 +232,9 @@ export class PolicyStore {
    * @throws SafetyError with code `INVALID_POLICY`.
    */
   restore(snapshot: PolicySnapshot): void {
+    if (this.restored) {
+      throw new SafetyError('INVALID_POLICY', 'PolicyStore.restore() may only be called once, at startup')
+    }
     const next = new Map<string, ChannelPolicy>()
     for (const [encoded, policy] of Object.entries(snapshot.channels)) {
       const decoded = decodeSnapshotKey(encoded)
@@ -233,15 +245,40 @@ export class PolicyStore {
       next.set(key(decoded.deviceId, decoded.channelId), { ...policy })
     }
     assertCeiling(snapshot.sessionCeiling)
+    if (this.overrides.size > 0) {
+      throw new SafetyError('INVALID_POLICY', 'PolicyStore.restore() cannot overwrite caps that were already set in this process')
+    }
     this.overrides.clear()
     for (const [internal, policy] of next) this.overrides.set(internal, policy)
     this.sessionCeiling = snapshot.sessionCeiling
+    this.restored = true
   }
 }
 
 function assertCeiling(percent: number): void {
   if (!isWholeNumber(percent) || percent < 0 || percent > ABSOLUTE_MAX_PERCENT) {
     throw new SafetyError('INVALID_POLICY', `sessionCeiling must be a whole number from 0 to ${ABSOLUTE_MAX_PERCENT}`)
+  }
+}
+
+/**
+ * `state/policy.json` keys are `device:channel`.
+ *
+ * A colon inside the device id would make the mapping non-injective (device
+ * `a:b` + channel `c` collides with device `a` + channel `b:c`), and restoring
+ * such a file could move a tightened cap onto the wrong device — a silent
+ * fail-open. Channel ids may contain colons on hub backends (`0:1:vibrate`),
+ * but never the internal NUL separator.
+ */
+function assertDeviceKey(deviceId: string): void {
+  if (deviceId.length === 0 || deviceId.includes(':') || deviceId.includes('\u0000')) {
+    throw new SafetyError('INVALID_POLICY', "deviceId must be non-empty and must not contain ':' or NUL")
+  }
+}
+
+function assertChannelKey(channelId: string): void {
+  if (channelId.length === 0 || channelId.includes('\u0000')) {
+    throw new SafetyError('INVALID_POLICY', 'channelId must be non-empty and must not contain NUL')
   }
 }
 

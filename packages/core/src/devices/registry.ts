@@ -650,7 +650,7 @@ export class DeviceRegistry {
         lifecycle: device.lifecycle,
         canScan: device.backend.scan !== undefined,
         channels: [...device.channels.values()].map(state => {
-          const policy = this.options.policy.get(device.backend.id, state.channel.id)
+          const policy = this.options.policy.effective(device.backend.id, state.channel.id)
           return {
             id: state.channel.id,
             kind: state.channel.kind,
@@ -738,15 +738,21 @@ export class DeviceRegistry {
    */
   private emit(event: DispatchEvent): void {
     for (const listener of [...this.listeners]) {
-      try {
-        listener(event)
-      } catch (error) {
+      const report = (error: unknown): void => {
         try {
           this.options.onError(error)
         } catch {
           // The diagnostic sink itself failed; losing the warning must not
           // escalate into a device-control fault.
         }
+      }
+      try {
+        const result: unknown = listener(event)
+        // An async listener must not escape as an unhandled rejection: that
+        // can take the whole main process down (review item A-3).
+        if (result instanceof Promise) result.catch(report)
+      } catch (error) {
+        report(error)
       }
     }
   }
@@ -758,7 +764,7 @@ export class DeviceRegistry {
       if (this.locked && percent > 0) return
       const state = device.channels.get(channelId)
       if (state === undefined) return
-      const policy = this.options.policy.get(device.backend.id, channelId)
+      const policy = this.options.policy.effective(device.backend.id, channelId)
       const clamped = clampPercentToPolicy(policy, percent)
       await device.backend.applyLevel(channelId, clamped)
       state.percent = clamped
@@ -782,7 +788,7 @@ export class DeviceRegistry {
     if (device.lifecycle !== 'ready') {
       throw new SafetyError('NOT_CONNECTED', `device ${deviceId} is ${device.lifecycle}; connect it first`)
     }
-    return this.options.policy.get(deviceId, channelId)
+    return this.options.policy.effective(deviceId, channelId)
   }
 
   private assertDuration(durationSec: number, policy: ChannelPolicy): void {

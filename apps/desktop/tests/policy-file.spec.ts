@@ -81,3 +81,24 @@ describe('policy persistence', () => {
     expect(runtime.policy.ceiling()).toBe(100)
   })
 })
+
+describe('policy restore is auditable', () => {
+  it('records a policy_change with scope "restore" when the persisted file is not default', async () => {
+    runtime = await start()
+    runtime.policy.setByHuman('coyote', 'a', { maxPercent: 25 })
+    await runtime.savePolicy()
+    await runtime.shutdown()
+    runtime = undefined
+
+    runtime = await start()
+    const raw = await readFile(join(root, 'audit', 'device.jsonl'), 'utf8')
+    const records = raw
+      .trimEnd()
+      .split('\n')
+      .map(line => JSON.parse(line) as { action: string; actor: string; detail?: { scope?: string } })
+    const restored = records.find(record => record.action === 'policy_change' && record.detail?.scope === 'restore')
+    // A hand-edited file must leave a trace even though restoring it is not a
+    // cap change: this is the only record that says what came back from disk.
+    expect(restored?.actor).toBe('system')
+  })
+})

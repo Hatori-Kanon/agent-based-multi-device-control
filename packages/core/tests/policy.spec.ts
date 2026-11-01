@@ -222,4 +222,27 @@ describe('policy persistence', () => {
     expect(store.get('coyote', 'a').maxPercent).toBe(30)
     expect(store.ceiling()).toBe(100)
   })
+
+  it('allows restore once, at startup, and never over in-process caps', () => {
+    // Review blocker A-2: `restore` must not become a third raise path.
+    const store = new PolicyStore()
+    store.restore({ channels: {}, sessionCeiling: 100 })
+    expect(() => store.restore({ channels: {}, sessionCeiling: 100 })).toThrow(/only be called once/)
+
+    const other = new PolicyStore()
+    other.setByHuman('coyote', 'a', { maxPercent: 10 })
+    expect(() =>
+      other.restore({ channels: { 'coyote:a': { maxPercent: 90, maxWaveIntensity: 80, maxDurationSec: 60 } }, sessionCeiling: 100 }),
+    ).toThrow(/cannot overwrite/)
+    expect(other.get('coyote', 'a').maxPercent).toBe(10)
+  })
+
+  it('refuses a device id that would make the persisted key non-injective', () => {
+    const store = new PolicyStore()
+    // `a:b` + `c` and `a` + `b:c` would both serialize to "a:b:c".
+    expect(() => store.setByHuman('a:b', 'c', { maxPercent: 10 })).toThrow(SafetyError)
+    expect(() => store.setByHuman('a', 'b\u0000c', { maxPercent: 10 })).toThrow(SafetyError)
+    // Hub channel ids legitimately contain colons.
+    expect(() => store.setByHuman('buttplug', '0:1:vibrate', { maxPercent: 10 })).not.toThrow()
+  })
 })
