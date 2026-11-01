@@ -1,0 +1,16 @@
+=== HW9 离线分析摘要 ===
+输入: E:\Harness\DSH\Agent-based-multi-device-control\analysis\hw9-capture\_tools\analysis\selftest\rr-good
+HRS 通知: 360 条 | 时长: 5m59.0s | 60.2 条/分钟 | 解码失败: 0 条
+flags: bit4=100.0% | bit2=100.0% | bit1=100.0%
+RR: 总数 720 | 中位 834.0ms | P5/P95 788.1/882.8ms | ∈[400,1500] 100.0% | 伪影率 0.00%
+Gate A 可连接        : pass   收到 0x2A37 / HRS 通知=HRS 通知 360 条（含解码失败 0 条）→pass | 通知覆盖时长=5m59.0s→pass | GATT 180D/2A37 notify=gatt.json: 180D=有, 2A37=有, notify=有→pass
+Gate B RR 可用      : pass   bit4=1 通知比例=bit4=1 300 / 300 = 100.0%→pass | 每包 ≥2 个 RR 的比例=≥2 RR 300 / 300 = 100.0%→pass | RR ∈ [400,1500]ms 比例=600 / 600 = 100.0%→pass | 粗伪影率（相邻 RR 变化 >20%）=0 / 599 对 = 0.0%→pass
+Gate B- 仅 bpm     : fail   Gate A 通过=Gate A pass→pass | Gate B 不通过（RR 不可用）=Gate B pass，RR 可用，无需降级→fail
+Gate C 私有通道       : fail   前提：标准 HRS 无可用 RR（Gate B 不通过）=Gate B pass（RR 可用，不需要私有通道）→fail | 非标准 notify 特征（gatt.json）=非标准 notify 特征 0 个→fail | 非 HRS 通知流（notifications.jsonl）=非 HRS 通知流 0 组，其中周期/数值可疑候选 0 组→fail
+Gate D 不可用        : fail   无任何通知=通知总数 360→fail | 连接失败=无连接事件日志，未验证→未验证 | Windows 方案不稳定=需 T8/人工观察，未验证→未验证
+决策: 首选（RR 源）：支持动作后 Δbpm + 离线 60s RMSSD
+
+已写入: analysis.json, analysis.md
+
+JSON: E:\Harness\DSH\Agent-based-multi-device-control\analysis\hw9-capture\_tools\analysis\selftest\rr-good\analysis.json
+Markdown: E:\Harness\DSH\Agent-based-multi-device-control\analysis\hw9-capture\_tools\analysis\selftest\rr-good\analysis.md
