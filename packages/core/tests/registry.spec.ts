@@ -43,7 +43,7 @@ async function safetyErrorFrom(promise: Promise<unknown>): Promise<SafetyError> 
  * Explicit policy so these tests describe behaviour rather than tracking the
  * shipped default, which is deliberately lower than anything asserted here.
  */
-const TEST_POLICY: ChannelPolicy = { maxPercent: 40, maxWaveIntensity: 80, maxDurationSec: 60 }
+const TEST_POLICY: ChannelPolicy = { minPercent: 0, maxPercent: 40, maxWaveIntensity: 80, minFreq: 10, maxFreq: 240, maxDurationSec: 60 }
 
 function createHarness(options?: { keepAliveMs?: number; policy?: ChannelPolicy }) {
   const clock = new FakeClock()
@@ -78,23 +78,20 @@ function createHarness(options?: { keepAliveMs?: number; policy?: ChannelPolicy 
 }
 
 describe('policy is enforced before the transport is touched', () => {
-  it('refuses a level above the human cap and writes nothing', async () => {
+  it('clamps an absolute level into the human interval and writes the clamped value', async () => {
     const h = createHarness()
     await h.registry.connect('toy', signal())
-    const before = h.toy.writes.length
 
-    const error = await safetyErrorFrom(
-      h.registry.setLevel('model', { deviceId: 'toy', channelId: 'a', percent: 80, durationSec: 5 }),
-    )
-    expect(error.code).toBe('POLICY_PERCENT')
-    expect(error.message).toContain('40')
-
+    // Direct control is absolute. 80 is above the 0-40 interval, so the
+    // registry's final gate lowers it instead of refusing the command.
+    await h.registry.setLevel('model', { deviceId: 'toy', channelId: 'a', percent: 80, durationSec: 5 })
+    h.clock.advance(50)
     await h.registry.settled()
-    expect(h.toy.writes.length).toBe(before)
-    expect(h.toy.deviceLevel('a')).toBe(0)
+    expect(h.toy.deviceLevel('a')).toBe(40)
 
-    const rejected = h.records().find(record => record.action === 'set_level' && record.result === 'rejected')
-    expect(rejected?.reason).toContain('POLICY_PERCENT')
+    const accepted = h.records().find(record => record.action === 'set_level' && record.result === 'ok')
+    // The audit records what was actually sent, not the raw request.
+    expect(accepted?.detail?.percent).toBe(40)
   })
 
   it('refuses indefinite output', async () => {
@@ -171,6 +168,57 @@ describe('policy is enforced before the transport is touched', () => {
     expect((await safetyErrorFrom(
       h.registry.setLevel('model', { deviceId: 'toy', channelId: 'a', percent: 10, durationSec: 5 }),
     )).code).toBe('NOT_CONNECTED')
+  })
+})
+
+describe('absolute levels are clamped into the channel interval', () => {
+  const INTERVAL: ChannelPolicy = {
+    minPercent: 10,
+    maxPercent: 60,
+    maxWaveIntensity: 80,
+    minFreq: 10,
+    maxFreq: 240,
+    maxDurationSec: 60,
+  }
+
+  it('sends 100% requests as the interval ceiling and 1% requests as the floor', async () => {
+    const h = createHarness({ policy: INTERVAL })
+    await h.registry.connect('toy', signal())
+
+    await h.registry.setLevel('human', { deviceId: 'toy', channelId: 'a', percent: 100, durationSec: 5 })
+    h.clock.advance(50)
+    await h.registry.settled()
+    expect(h.toy.deviceLevel('a')).toBe(60)
+
+    await h.registry.setLevel('human', { deviceId: 'toy', channelId: 'a', percent: 1, durationSec: 5 })
+    h.clock.advance(50)
+    await h.registry.settled()
+    expect(h.toy.deviceLevel('a')).toBe(10)
+
+    const channelA = h.registry.snapshot().devices.find(device => device.id === 'toy')?.channels[0]
+    expect(channelA?.percent).toBe(10)
+    expect(channelA).toMatchObject({ minPercent: 10, maxPercent: 60, minFreq: 10, maxFreq: 240 })
+    // The internal pulse-width cap is deliberately absent from the snapshot:
+    // neither the UI nor the model may configure it.
+    expect(channelA).not.toHaveProperty('maxWaveIntensity')
+  })
+
+  it('lifts an authored envelope to the interval floor and caps its peak', async () => {
+    const h = createHarness({ policy: INTERVAL })
+    await h.registry.connect('toy', signal())
+
+    await h.registry.runPattern('model', { deviceId: 'toy', channelId: 'a', envelope: steady(1), durationSec: 5 })
+    h.clock.advance(50)
+    await h.registry.settled()
+    expect(h.toy.deviceLevel('a')).toBe(10)
+
+    await h.registry.runPattern('model', { deviceId: 'toy', channelId: 'a', envelope: steady(100), durationSec: 5 })
+    h.clock.advance(50)
+    await h.registry.settled()
+    expect(h.toy.deviceLevel('a')).toBe(60)
+
+    const run = h.records().filter(record => record.action === 'run_pattern' && record.result === 'ok').at(-1)
+    expect(run?.detail?.envelope).toMatchObject({ minPercent: 60, maxPercent: 60 })
   })
 })
 
@@ -521,7 +569,7 @@ describe('dispatch events follow accepted commands, never envelope ticks', () =>
 
     // A refused command never reaches the dispatch point.
     await safetyErrorFrom(
-      h.registry.setLevel('model', { deviceId: 'toy', channelId: 'a', percent: 80, durationSec: 5 }),
+      h.registry.setLevel('model', { deviceId: 'toy', channelId: 'a', percent: 20, durationSec: 0 }),
     )
     expect(events).toHaveLength(1)
 
@@ -689,6 +737,22 @@ describe('dispatch events follow accepted commands, never envelope ticks', () =>
     expect(events[0]).toMatchObject({ kind: 'stop', deviceId: 'toy', channelId: 'a' })
   })
 
+  it('treats a negative setLevel as a stop, not a zero level', async () => {
+    // Review S-4: clamping -5 to 0 used to record a `set_level percent 0`
+    // event, which reads in the audit trail as a deliberate level command.
+    const h = createHarness()
+    const events: PublishedDispatch[] = []
+    h.registry.subscribe(event => { events.push(event) })
+    await h.registry.connect('toy', signal())
+
+    await h.registry.setLevel('model', { deviceId: 'toy', channelId: 'a', percent: -5 })
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({ kind: 'stop', deviceId: 'toy', channelId: 'a' })
+    const stop = h.records().find(record => record.action === 'stop' && record.result === 'ok')
+    expect(stop).toBeDefined()
+    expect(h.records().some(record => record.action === 'set_level')).toBe(false)
+  })
+
   it('does not report a human cap change as a dispatch', async () => {
     const h = createHarness()
     const events: PublishedDispatch[] = []
@@ -706,7 +770,7 @@ describe('dispatch events follow accepted commands, never envelope ticks', () =>
 })
 
 describe('session ceiling bounds the effective cap', () => {
-  it('surfaces the ceiling in the snapshot and rejects anything above it', async () => {
+  it('surfaces the ceiling in the snapshot and clamps anything above it', async () => {
     // Review item R5: only the Coyote BF sync used `effective()`, so the
     // snapshot and the write path still advertised the raw channel cap.
     const h = createHarness()
@@ -719,14 +783,10 @@ describe('session ceiling bounds the effective cap', () => {
       .find(channel => channel.id === 'a')
     expect(channelA?.maxPercent).toBe(15)
 
-    const before = h.toy.writes.length
-    const error = await safetyErrorFrom(
-      h.registry.setLevel('human', { deviceId: 'toy', channelId: 'a', percent: 40, durationSec: 5 }),
-    )
-    expect(error.code).toBe('POLICY_PERCENT')
-    expect(error.message).toContain('15')
+    await h.registry.setLevel('human', { deviceId: 'toy', channelId: 'a', percent: 40, durationSec: 5 })
+    h.clock.advance(50)
     await h.registry.settled()
-    expect(h.toy.writes.length).toBe(before)
+    expect(h.toy.deviceLevel('a')).toBe(15)
 
     // Releasing the ceiling brings the channel cap back into force.
     h.policy.setSessionCeilingByHuman(100)
@@ -734,6 +794,25 @@ describe('session ceiling bounds the effective cap', () => {
       .find(device => device.id === 'toy')?.channels
       .find(channel => channel.id === 'a')
     expect(restored?.maxPercent).toBe(40)
+  })
+
+  it('keeps the interval legal when a legacy ceiling sits below the channel floor', async () => {
+    // Review S-1: raw [40, 60] plus a restored ceiling of 20 used to produce
+    // the invalid snapshot interval [40, 20], rejecting every positive output.
+    const h = createHarness({ policy: { ...TEST_POLICY, minPercent: 40, maxPercent: 60 } })
+    await h.registry.connect('toy', signal())
+    h.policy.setSessionCeilingByHuman(20)
+
+    const channel = h.registry.snapshot().devices
+      .find(device => device.id === 'toy')?.channels
+      .find(entry => entry.id === 'a')
+    expect(channel?.minPercent).toBe(19)
+    expect(channel?.maxPercent).toBe(20)
+
+    await h.registry.setLevel('human', { deviceId: 'toy', channelId: 'a', percent: 20, durationSec: 5 })
+    h.clock.advance(50)
+    await h.registry.settled()
+    expect(h.toy.deviceLevel('a')).toBe(20)
   })
 })
 

@@ -1,8 +1,8 @@
 /*
  * Embodied 前端设计系统（v2「墨金」）。
  *
- * 三处界面共用本文件：控制台（index.html）、游玩页（play.html）、手机急停页
- * （phone.html）。只做样式，不含任何业务逻辑；页面里的 <script> 仍然只通过
+ * 单窗口应用页（index.html：游玩视图 + 设备视图）与手机急停页（phone.html）
+ * 共用本文件。只做样式，不含任何业务逻辑；页面里的 <script> 仍然只通过
  * dashboard 的 JSON API 说话。
  *
  * 设计语言参考 ai-for-coyote：近黑底色 + 金色强调 + 细描边卡片 + 圆角药丸，
@@ -1925,4 +1925,458 @@ input[type="range"]:disabled {
     z-index: 20;
     background: var(--ink-1);
   }
+}
+
+
+/* ── 15. v3 单窗口与通道条 ── */
+
+/* 15.1 单窗口两视图：.app 仍是纵向 flex，两个 section 轮流吃掉剩余高度。 */
+#view-play,
+#view-device {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+#view-play[hidden],
+#view-device[hidden] {
+  display: none;
+}
+
+/* 顶栏「游玩 / 设备」：不参与 topbar-spacer 的伸缩，切换时宽度稳定。 */
+.topbar > .nav {
+  flex: none;
+}
+
+/* 设备视图自己的遥测开关条（顶栏只留视图切换与安全件）。 */
+.viewbar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 20px 0;
+}
+
+.viewbar .nav {
+  margin-left: auto;
+}
+
+.viewbar-hint {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 15.2 大厅右列：准备工作 + 软上限上下叠放，不跟开局卡抢左列。 */
+.lobby-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.soft-caps-card .card-title {
+  margin-bottom: 12px;
+}
+
+/* 15.3 软上限：大厅与舞台右轨共用同一套紧凑行。 */
+.soft-cap {
+  padding: 10px 0;
+  border-top: 1px dashed var(--line);
+}
+
+.soft-cap:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.soft-cap-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.soft-cap-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  font-weight: 650;
+}
+
+.soft-cap-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 3px 0;
+}
+
+.soft-cap-label {
+  flex: none;
+  width: 28px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.soft-cap-row input[type="range"] {
+  flex: 1 1 0;
+  width: auto;
+  min-width: 0;
+  max-width: 132px;
+}
+
+.soft-cap-row .val {
+  flex: none;
+  min-width: 68px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.soft-cap-row .hint {
+  font-size: 10.5px;
+}
+
+/* 15.4 设备视图：继承原 index.html 内联的布局微调（现在只剩这一页）。 */
+#devDevices {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+#devDevices .device {
+  margin-bottom: 0;
+}
+
+#view-device .ch-mid {
+  min-width: 0;
+}
+
+#view-device .device > header .device-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-left: auto;
+}
+
+#view-device .device > header .device-actions .mini {
+  margin-left: 0;
+}
+
+#devWfFrames {
+  min-height: 56px;
+}
+
+#view-device .wf-grid .empty {
+  grid-column: 1 / -1;
+}
+
+#view-device .rail-right .card-title small {
+  white-space: nowrap;
+}
+
+#view-device .rail-right .rail-home {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+}
+
+#view-device .rail-home-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+#view-device .rail-home-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+#view-device .rail-home-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: rgba(255, 255, 255, 0.025);
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.16s var(--ease), background 0.16s var(--ease), transform 0.16s var(--ease);
+}
+
+#view-device .rail-home-item:hover {
+  border-color: var(--line-gold);
+  background: rgba(247, 217, 122, 0.06);
+  transform: translateY(-1px);
+}
+
+#view-device .rail-home-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--line);
+}
+
+/* 打开一个（或几个）遥测面板时，让面板吃满右栏高度，避免面板下方留空。 */
+#view-device .rail-right > .card:not(.rail-home) {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+#view-device .rail-right > .card:not(.rail-home) .audit,
+#view-device .rail-right > .card:not(.rail-home) .log,
+#view-device .rail-right > .card:not(.rail-home) .debug-list {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+}
+
+/* 15.5 游玩视图：从 v2 的 play.html 内联样式搬过来的舞台/大厅微调。 */
+.lobby-card .field-row {
+  align-items: center;
+  gap: 12px;
+}
+
+.lobby-card .field-label {
+  flex: 0 0 64px;
+}
+
+.lobby-card select {
+  flex: 1;
+  width: 100%;
+  max-width: none;
+}
+
+.lobby-card input[type="range"] {
+  flex: 1;
+  width: auto;
+}
+
+.lobby-card #start {
+  margin-top: 4px;
+}
+
+.lobby-card #startHint {
+  margin-top: 12px;
+}
+
+.lobby-card .steps + .hint {
+  margin-top: 14px;
+}
+
+#lines > .hint:only-child {
+  margin: auto 0;
+}
+
+/* 顶部留一点淡出，滚动时被裁掉的第一条看起来是「还可以往上翻」。 */
+#lines {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 16px);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 16px);
+}
+
+#debugToggle.on {
+  color: var(--gold);
+  border-color: var(--line-gold);
+  background: var(--gold-dim);
+}
+
+/* 15.6 设备视图通道条：强度条本身是直控滑杆，滑轨透明、滑块可见。 */
+#view-device .ch {
+  align-items: start;
+}
+
+.level-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.level-rail {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  min-width: 0;
+  height: 26px;
+}
+
+.level-rail .meter {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 12px;
+  transform: translateY(-50%);
+  border-radius: 99px;
+  pointer-events: none;
+}
+
+.level-rail .meter i {
+  transition: width 0.08s linear;
+}
+
+/* 有效区间的起点：低于它的非零值会被客户端吸附到 minPercent。 */
+.level-rail .level-floor {
+  position: absolute;
+  top: 50%;
+  left: var(--floor, 0%);
+  width: 1px;
+  height: 16px;
+  transform: translateY(-50%);
+  background: var(--line-2);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+
+.level-rail input[type="range"].level-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 26px;
+  margin: 0;
+  background: transparent;
+  border-radius: 99px;
+}
+
+.level-rail input[type="range"].level-input::-webkit-slider-runnable-track {
+  background: transparent;
+}
+
+.level-readout {
+  flex: none;
+  min-width: 44px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.cap-range {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.cap-range .cap-label {
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.cap-range input[type="range"] {
+  width: 84px;
+}
+
+.cap-range .val {
+  min-width: 58px;
+}
+
+.cap-duration {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 15.7 窄屏回退：通道条改成单列；顶栏视图切换在换行后仍靠左。 */
+@media (max-width: 1240px) {
+  /* 三栏收窄后 172px 的名称列会把通道条挤出卡片：名称/停止占第一行，
+     直控与边界控件整行铺开。 */
+  #view-device .ch {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  #view-device .ch-name {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  #view-device .acts {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  #view-device .ch-mid {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+}
+
+@media (max-width: 980px) {
+  .viewbar {
+    flex-wrap: wrap;
+    padding: 10px 14px 0;
+  }
+
+  .viewbar-hint {
+    display: none;
+  }
+
+  .viewbar .nav {
+    margin-left: 0;
+  }
+}
+
+@media (max-width: 760px) {
+  #view-device .ch {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  #view-device .ch-name,
+  #view-device .ch-mid,
+  #view-device .acts {
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  #view-device .acts {
+    justify-content: flex-start;
+  }
+
+  .soft-cap-row input[type="range"] {
+    max-width: none;
+  }
+}
+
+@media (max-width: 620px) {
+  .lobby-card .field-label {
+    flex-basis: 56px;
+  }
+}
+
+/* ── 15.5 软上限卡：一台设备一张卡，通道分段 ─────────────────────────────── */
+
+.soft-cap-channel {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+}
+
+.soft-cap-head + .soft-cap-channel {
+  border-top: 0;
+  margin-top: 4px;
+  padding-top: 0;
+}
+
+.soft-cap-channel > .tag {
+  align-self: flex-start;
+  margin-bottom: 4px;
 }

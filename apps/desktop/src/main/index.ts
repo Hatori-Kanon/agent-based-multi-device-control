@@ -41,7 +41,6 @@ let runtime: HostRuntime | undefined
 let bleWorker: BleWorker | undefined
 let cameraWorker: CameraWorker | undefined
 let window: BrowserWindow | undefined
-let playWindow: BrowserWindow | undefined
 let quitting = false
 
 function dataDir(): string {
@@ -169,32 +168,25 @@ async function createWindow(): Promise<void> {
 }
 
 /**
- * Open the play page (B2-T12) in its own window.
+ * Bring the single window to the front and switch it to the play view (v3).
  *
- * Same origin, same token-in-query rule as the console: the page does its own
- * fetch() calls with `x-control-token`. No preload is attached — the play page
- * talks HTTP only, so its window needs no IPC surface.
+ * The play view lives in the same page as the device view now, so the shortcut
+ * must never open a second window: it focuses the existing one and clicks the
+ * nav tab the page already owns.
  */
-async function openPlayWindow(): Promise<void> {
-  const url = dashboardPageUrl('/play')
-  if (url === undefined) return
-  if (playWindow !== undefined) {
-    playWindow.focus()
-    return
+async function focusPlayView(): Promise<void> {
+  if (window === undefined) return
+  if (window.isMinimized()) window.restore()
+  window.show()
+  window.focus()
+  try {
+    await window.webContents.executeJavaScript(
+      "document.querySelector('[data-view-target=\"play\"]')?.click(); true",
+      true,
+    )
+  } catch {
+    // The page may still be loading; the nav is available as soon as it is.
   }
-  playWindow = new BrowserWindow({
-    width: 1120,
-    height: 880,
-    title: 'Embodied 游玩',
-    backgroundColor: '#0d0d12',
-    webPreferences: {
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-    },
-  })
-  playWindow.on('closed', () => { playWindow = undefined })
-  await playWindow.loadURL(url)
 }
 
 /** Cut output before the process goes away, whatever the exit path. */
@@ -313,10 +305,9 @@ void app.whenReady().then(async () => {
     console.error(`[embodied] could not register ${PANIC_ACCELERATOR}; use the on-screen stop button`)
   }
 
-  // Play page entry (B2-T12). The console stays the device console; the play
-  // page opens beside it and can be reopened at any time.
+  // Play view entry (B2-T12 / v3). Same window, different view — never a popup.
   const playRegistered = globalShortcut.register(PLAY_ACCELERATOR, () => {
-    void openPlayWindow().catch(reportError)
+    void focusPlayView().catch(reportError)
   })
   if (!playRegistered) {
     console.error(`[embodied] could not register ${PLAY_ACCELERATOR}; open the play URL printed below instead`)
@@ -330,7 +321,7 @@ void app.whenReady().then(async () => {
   }
   const playUrl = dashboardPageUrl('/play')
   if (playUrl !== undefined) {
-    console.log(`[embodied] play: ${playUrl} (${PLAY_ACCELERATOR} opens it in its own window)`)
+    console.log(`[embodied] play: ${playUrl} (${PLAY_ACCELERATOR} switches the window to the play view)`)
   }
   if (runtime.panicAddress !== undefined) {
     console.log(`[embodied] out-of-band stop: POST http://${runtime.panicAddress.host}:${runtime.panicAddress.port}/panic`)

@@ -229,6 +229,104 @@ describe('DashboardServer', () => {
     expect(records.some(record => record.action === 'policy_change' && record.actor === 'human')).toBe(true)
   })
 
+  it('exposes per-channel ranges and drives direct level control', async () => {
+    const host = await start()
+    const token = host.dashboardToken
+    const post = async (path: string, body: unknown): Promise<Response> => fetch(`${base(host)}${path}`, {
+      method: 'POST',
+      headers: headers(token, true),
+      body: JSON.stringify(body),
+    })
+    await post('/api/connect', { deviceId: 'mock-pulse' })
+
+    // The human narrows both axes: an interval and a frequency band.
+    const cap = await post('/api/cap', {
+      deviceId: 'mock-pulse',
+      channelId: 'a',
+      patch: { minPercent: 10, maxPercent: 55, minFreq: 40, maxFreq: 120 },
+    })
+    expect(cap.status).toBe(200)
+    type Snapshot = {
+      devices: Array<{
+        id: string
+        channels: Array<{
+          id: string
+          percent: number
+          minPercent: number
+          maxPercent: number
+          minFreq: number
+          maxFreq: number
+          maxDurationSec: number
+        }>
+      }>
+    }
+    const afterCap = await cap.json() as Snapshot
+    const channel = (snapshot: Snapshot): Snapshot['devices'][number]['channels'][number] | undefined =>
+      snapshot.devices.find(device => device.id === 'mock-pulse')?.channels.find(entry => entry.id === 'a')
+    expect(channel(afterCap)).toMatchObject({ minPercent: 10, maxPercent: 55, minFreq: 40, maxFreq: 120 })
+
+    // Direct control is absolute and clamped into the human's interval: asking
+    // for 5% (below the floor) lands on 10%.
+    const low = await post('/api/level', { deviceId: 'mock-pulse', channelId: 'a', percent: 5, durationSec: 5 })
+    expect(low.status).toBe(200)
+    expect(channel(await low.json() as Snapshot)?.percent).toBe(10)
+
+    // Above the ceiling is clamped down rather than refused.
+    const high = await post('/api/level', { deviceId: 'mock-pulse', channelId: 'a', percent: 90, durationSec: 5 })
+    expect(high.status).toBe(200)
+    expect(channel(await high.json() as Snapshot)?.percent).toBe(55)
+
+    // percent 0 is a stop.
+    const stop = await post('/api/level', { deviceId: 'mock-pulse', channelId: 'a', percent: 0 })
+    expect(stop.status).toBe(200)
+    expect(channel(await stop.json() as Snapshot)?.percent).toBe(0)
+
+    // Malformed payloads are refused, not coerced.
+    expect((await post('/api/level', { deviceId: 'mock-pulse', channelId: 'a', percent: 'x' })).status).toBe(400)
+    expect((await post('/api/cap', { deviceId: 'mock-pulse', channelId: 'a', patch: { minPercent: 80, maxPercent: 20 } })).status).toBe(400)
+
+    const records = await auditRecords()
+    expect(records.some(record => record.action === 'set_level' && record.actor === 'human')).toBe(true)
+  })
+
+  it('rejects malformed level and cap payloads instead of coercing them', async () => {
+    const host = await start()
+    const token = host.dashboardToken
+    const post = async (path: string, body: unknown): Promise<Response> => fetch(`${base(host)}${path}`, {
+      method: 'POST',
+      headers: headers(token, true),
+      body: JSON.stringify(body),
+    })
+    await post('/api/connect', { deviceId: 'mock-pulse' })
+
+    // Direct control is an absolute 0–100 whole number; negative and fractional
+    // values must not be silently clamped into a level (or a fake stop).
+    expect((await post('/api/level', { deviceId: 'mock-pulse', channelId: 'a', percent: -5 })).status).toBe(400)
+    expect((await post('/api/level', { deviceId: 'mock-pulse', channelId: 'a', percent: 12.5 })).status).toBe(400)
+    expect((await post('/api/level', { deviceId: 'mock-pulse', channelId: 'a', percent: 101 })).status).toBe(400)
+
+    // A cap patch is all-or-nothing: one bad field must not apply the rest.
+    expect((await post('/api/cap', {
+      deviceId: 'mock-pulse',
+      channelId: 'a',
+      patch: { maxPercent: 30, minFreq: 'nope' },
+    })).status).toBe(400)
+    // The removed pulse-width cap is a clean 400, not a silently ignored field.
+    expect((await post('/api/cap', {
+      deviceId: 'mock-pulse',
+      channelId: 'a',
+      patch: { maxWaveIntensity: 50 },
+    })).status).toBe(400)
+
+    // Nothing above may have changed the human's bounds.
+    const snapshot = await (await fetch(`${base(host)}/api/snapshot`, { headers: headers(token) })).json() as {
+      devices: Array<{ id: string; channels: Array<{ id: string; maxPercent: number; minFreq: number }> }>
+    }
+    const channel = snapshot.devices.find(device => device.id === 'mock-pulse')?.channels.find(entry => entry.id === 'a')
+    expect(channel?.maxPercent).toBe(20)
+    expect(channel?.minFreq).toBe(10)
+  })
+
   it('panics, locks, and unlocks', async () => {
     const host = await start()
     const token = host.dashboardToken
@@ -338,6 +436,7 @@ function debugDeps(records: readonly ProbeRecord[]): DashboardDeps {
     panic: async () => unused(),
     unlock: async () => unused(),
     setCap: async () => unused(),
+    level: async () => unused(),
     demo: async () => unused(),
     pattern: async () => unused(),
     stop: async () => unused(),
@@ -893,6 +992,7 @@ describe('session controls (B2-T11)', () => {
       panic: async () => unused(),
       unlock: async () => unused(),
       setCap: async () => unused(),
+      level: async () => unused(),
       demo: async () => unused(),
       pattern: async () => unused(),
       stop: async () => unused(),
@@ -1023,6 +1123,7 @@ describe('play page (B2-T12)', () => {
       panic: async () => unused(),
       unlock: async () => unused(),
       setCap: async () => unused(),
+      level: async () => unused(),
       demo: async () => unused(),
       pattern: async () => unused(),
       stop: async () => unused(),
@@ -1045,16 +1146,27 @@ describe('play page (B2-T12)', () => {
     }
   }
 
-  it('serves the play page and its script through the static whitelist', async () => {
+  it('serves the single-window app and its scripts through the static whitelist', async () => {
     const host = await start()
-    // A page navigation cannot carry headers: `/play` (and `/play.js`) must be
-    // readable without the token, exactly like the console and the phone page.
+    // v3: `/` and `/play` are the same single-window page; a page navigation
+    // cannot carry headers, so scripts and styles must be readable without the
+    // token, exactly like the phone page.
     const page = await fetch(`${base(host)}/play`)
     expect(page.status).toBe(200)
     expect(page.headers.get('content-type')).toContain('text/html')
     const html = await page.text()
-    expect(html).toContain('Embodied 游玩')
+    // Both views live in the page; the play view is the default landing view.
+    expect(html).toContain('id="view-play"')
+    expect(html).toContain('id="view-device"')
+    expect(html).toContain('data-view-target="play"')
+    expect(html).toContain('data-view-target="device"')
+    // The play view is what the page opens on: the device section ships hidden
+    // and the body starts in the play mode.
+    expect(html).toContain('data-view="play"')
+    expect(html).toMatch(/id="view-device"[^>]*hidden/u)
     expect(html).toContain('/play.js')
+    expect(html).toContain('/app.js')
+    expect(html).toContain('/shell.js')
     expect(html).toContain('href="/style.css"')
     expect(html).toMatch(/connect-src 'self'/)
     // Safety chrome is in the markup: a persistent stop button and the LOCKED
@@ -1063,8 +1175,11 @@ describe('play page (B2-T12)', () => {
     expect(html).toContain('紧急停止')
     expect(html).toContain('id="lockBanner"')
     expect(html).toContain('id="choices"')
-    expect(html).toContain('会话上限')
     expect(html).toContain('id="debugPanel" style="display:none"')
+    // v3 dropped the global session ceiling X from the UI: the human bounds the
+    // output per device/channel instead (软上限).
+    expect(html).not.toContain('id="ceiling"')
+    expect(html).toContain('软上限')
     // No probe/tool field name and no probe number may appear in the default
     // page — the player only sees narrative, options and time.
     expect(html).not.toMatch(/motionEnergy|motionPeak|staticRatio|centerMotionRatio|lumaMean|lumaStd|overexposedRatio|underexposedRatio|audioLevelPct|bpm/u)
@@ -1074,18 +1189,45 @@ describe('play page (B2-T12)', () => {
     expect(script.status).toBe(200)
     expect(script.headers.get('content-type')).toContain('javascript')
     const js = await script.text()
-    // The three surfaces the page drives besides the session snapshot.
+    // The surfaces the play view drives besides the session snapshot.
     expect(js).toContain('/api/session/transcript')
-    expect(js).toContain('/api/session/ceiling')
     expect(js).toContain('/api/panic')
+    expect(js).toContain('/api/cap')
+    // The global ceiling route is gone from this view.
+    expect(js).not.toContain('/api/session/ceiling')
     // Token convention: query once, then the header — never persisted, and no
     // bare console.error when a poll fails.
     expect(js).not.toContain('localStorage')
     expect(js).not.toMatch(/\bconsole\./u)
 
-    // The allowlist is still a whitelist: only the two named files are served.
+    // The device view's script is the console logic; it owns direct control.
+    const consoleScript = await fetch(`${base(host)}/app.js`)
+    expect(consoleScript.status).toBe(200)
+    const consoleJs = await consoleScript.text()
+    expect(consoleJs).toContain('/api/level')
+    expect(consoleJs).toContain('/api/cap')
+
+    // The view switch is a tiny separate script so the page needs no inline JS.
+    const shell = await fetch(`${base(host)}/shell.js`)
+    expect(shell.status).toBe(200)
+    expect(shell.headers.get('content-type')).toContain('javascript')
+    const shellJs = await shell.text()
+    // The switch must remember the view AND keep the URL in sync, otherwise a
+    // refresh on `/play` would always fall back to the play view.
+    expect(shellJs).toContain('sessionStorage')
+    expect(shellJs).toContain('replaceState')
+    expect(shellJs).toContain('viewchange')
+
+    // `/device` is a deep link to the same page, and the deleted play.html is
+    // not reachable any more.
+    const devicePage = await fetch(`${base(host)}/device`)
+    expect(devicePage.status).toBe(200)
+    expect(await devicePage.text()).toContain('id="view-device"')
+    expect((await fetch(`${base(host)}/play.html`)).status).toBe(404)
+
+    // The allowlist is still a whitelist: unknown names are clean 404s.
     expect((await fetch(`${base(host)}/play.json`)).status).toBe(404)
-    expect((await fetch(`${base(host)}/src/ui/play.html`)).status).toBe(404)
+    expect((await fetch(`${base(host)}/src/ui/index.html`)).status).toBe(404)
   })
 
   it('renders choices from the session snapshot and posts the picked id', async () => {
@@ -1132,23 +1274,24 @@ describe('play page (B2-T12)', () => {
     }
   })
 
-  it('serves the play page from the in-memory bundle the dev server ships', async () => {
+  it('serves the single-window app from the in-memory bundle the dev server ships', async () => {
     // `start-dev.bat` runs `dev-server.ts`, which inlines the UI files into the
     // bundle and hands them over as `staticFiles`; this is that exact path.
     const { readFile } = await import('node:fs/promises')
-    const [playHtmlText, playJsText] = await Promise.all([
-      readFile(join(process.cwd(), 'src', 'ui', 'play.html'), 'utf8'),
-      readFile(join(process.cwd(), 'src', 'ui', 'play.js'), 'utf8'),
-    ])
+    const names = ['index.html', 'play.js', 'app.js', 'shell.js'] as const
+    const files = Object.fromEntries(await Promise.all(names.map(async name =>
+      [name, await readFile(join(process.cwd(), 'src', 'ui', name), 'utf8')] as const,
+    )))
     const calls: string[] = []
     const server = new DashboardServer({
       deps: playDeps(calls),
       token: PLAY_TOKEN,
-      staticFiles: { 'play.html': playHtmlText, 'play.js': playJsText },
+      staticFiles: files,
     })
     const address = await server.start()
     const url = `http://${address.host}:${address.port}`
     try {
+      // `/play` is a deep link into the same page, not a second document.
       const page = await fetch(`${url}/play`)
       expect(page.status).toBe(200)
       expect(await page.text()).toContain('/play.js')
@@ -1157,6 +1300,10 @@ describe('play page (B2-T12)', () => {
       expect(script.status).toBe(200)
       expect(script.headers.get('content-type')).toContain('javascript')
       expect(await script.text()).toContain('/api/session/transcript')
+
+      const shell = await fetch(`${url}/shell.js`)
+      expect(shell.status).toBe(200)
+      expect(shell.headers.get('content-type')).toContain('javascript')
     } finally {
       await server.stop()
     }

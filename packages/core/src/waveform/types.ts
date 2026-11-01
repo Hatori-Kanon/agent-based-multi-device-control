@@ -26,8 +26,11 @@ export const MAX_FREQ = 240
  * Protocol-legal waveform intensity range.
  *
  * 100 corresponds to a ~100 µs pulse width, which the vendor's own V2 notes
- * flag as the point where pulses start to sting. Deployment policy caps this
- * lower; see `maxWaveIntensity`.
+ * flag as the point where pulses start to sting. The emit path therefore caps
+ * every slot at the channel's internal `maxWaveIntensity` (default 80, not a
+ * UI/API option). Amplitude is bounded by the channel's strength interval, and
+ * the waveform frequency band is bounded by `minFreq`/`maxFreq` in the channel
+ * policy.
  */
 export const MIN_INTENSITY = 0
 export const MAX_INTENSITY = 100

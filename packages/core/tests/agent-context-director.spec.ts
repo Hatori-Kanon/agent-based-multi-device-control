@@ -16,6 +16,7 @@ import {
 import type { ChannelSnapshot, DeviceSnapshot, RegistrySnapshot } from '../src/devices/registry.ts'
 import { DEFAULT_INTENTS } from '../src/scenario/default-intents.ts'
 import type { FeedbackIntent } from '../src/scenario/intents.ts'
+import { MAX_FREQ, MIN_FREQ } from '../src/waveform/types.ts'
 import { PhaseMachine } from '../src/scenario/phases.ts'
 
 const BOUNDARIES = ['不得越过玩家明确说出的底线。', '不替玩家做决定。', '不做无法撤回的伤害。']
@@ -37,8 +38,10 @@ function channel(overrides: Partial<ChannelFact> = {}): ChannelFact {
     supportsWaveform: true,
     outputFloorPercent: 0,
     percent: 0,
+    minPercent: 0,
     maxPercent: 100,
-    maxWaveIntensity: 100,
+    minFreq: MIN_FREQ,
+    maxFreq: MAX_FREQ,
     maxDurationSec: 60,
     effect: undefined,
     waveform: undefined,

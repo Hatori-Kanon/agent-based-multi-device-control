@@ -177,7 +177,7 @@ describe('reaction probe audit', () => {
     // No device-level vocabulary anywhere, at any depth.
     expect(matchingKeys(detail, key => /percent|cap|intensity|duration|strength/i.test(key))).toEqual([])
     expect(JSON.stringify(detail)).not.toMatch(
-      /"percent"\s*:|targetPercent|deltaPercent|maxPercent|maxDurationSec|maxWaveIntensity/i,
+      /"percent"\s*:|targetPercent|deltaPercent|maxPercent|maxDurationSec|maxFreq/i,
     )
   })
 

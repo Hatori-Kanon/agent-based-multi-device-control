@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { WaveformLibrary, type DeviceLifecycle } from '../src/index.ts'
+import { MAX_FREQ, MIN_FREQ, WaveformLibrary, type DeviceLifecycle } from '../src/index.ts'
 import type {
   Beat,
   BeatChange,
@@ -46,6 +46,7 @@ function channel(
   region?: string,
   overrides: {
     percent?: number
+    minPercent?: number
     maxPercent?: number
     maxDurationSec?: number
     supportsWaveform?: boolean
@@ -59,8 +60,10 @@ function channel(
     outputFloorPercent: 0,
     ...(region === undefined ? {} : { region }),
     percent: overrides.percent ?? 0,
+    minPercent: overrides.minPercent ?? 0,
     maxPercent: overrides.maxPercent ?? 20,
-    maxWaveIntensity: 80,
+    minFreq: MIN_FREQ,
+    maxFreq: MAX_FREQ,
     maxDurationSec: overrides.maxDurationSec ?? 60,
     effect: undefined,
     waveform: undefined,
@@ -173,7 +176,7 @@ describe('resolvePlan is a pure, byte-stable function', () => {
 })
 
 describe('clamping and the strength conversion', () => {
-  it('clamps a high-strength beat to the channel cap and marks it clamped', () => {
+  it('maps a 100% request to the channel ceiling', () => {
     const registry = snapshot(device('toy', [channel('a', 'chest')]))
     const fixture = plan([
       levelBeat('b1', {
@@ -185,8 +188,9 @@ describe('clamping and the strength conversion', () => {
     ])
 
     const command = firstCommand(resolvePlan(fixture, context(registry, PLAIN_INTENT_MAP)).commands)
+    // 100% is relative: it means the human's ceiling, not a clamp.
     expect(command.body).toEqual({ kind: 'level', percent: 20, durationSec: 2 })
-    expect(command.clamped).toBe(true)
+    expect(command.clamped).toBe(false)
   })
 
   it('applies the targetPercent > deltaPercent > strength priority', () => {
@@ -204,7 +208,8 @@ describe('clamping and the strength conversion', () => {
       ]),
       ctx,
     )
-    expect(firstCommand(absolute.commands).body).toEqual({ kind: 'level', percent: 10, durationSec: 2 })
+    // targetPercent is relative too: 10% of the 0-20 band is 2.
+    expect(firstCommand(absolute.commands).body).toEqual({ kind: 'level', percent: 2, durationSec: 2 })
 
     const relative = resolvePlan(
       plan([
@@ -217,8 +222,9 @@ describe('clamping and the strength conversion', () => {
       ]),
       ctx,
     )
-    expect(firstCommand(relative.commands).body).toEqual({ kind: 'level', percent: 20, durationSec: 2 })
-    expect(firstCommand(relative.commands).clamped).toBe(true)
+    // Current 18 in 0-20 is a 90% position; +5 lands at 95%, i.e. 19.
+    expect(firstCommand(relative.commands).body).toEqual({ kind: 'level', percent: 19, durationSec: 2 })
+    expect(firstCommand(relative.commands).clamped).toBe(false)
 
     const strengthOnly = resolvePlan(
       plan([levelBeat('b1', { intentId: 'plain', regions: ['chest'], strength: 'med', change: { kind: 'level' } })]),
@@ -329,8 +335,9 @@ describe('region routing and distribution', () => {
     // Target `a` inherits the level change and overrides only the strength.
     expect(commands.get('a')?.body).toEqual({ kind: 'level', percent: 20, durationSec: 2 })
     // Target `b` overrides the change too: deltaPercent is relative to its own
-    // current snapshot percent (30), so 40 is the target, not clamped.
-    expect(commands.get('b')?.body).toEqual({ kind: 'level', percent: 40, durationSec: 2 })
+    // current position. Current 30 in 0-40 is a 75% position; +10 lands at
+    // 85%, i.e. 34, and that is a normal mapping rather than a clamp.
+    expect(commands.get('b')?.body).toEqual({ kind: 'level', percent: 34, durationSec: 2 })
     expect(commands.get('b')?.clamped).toBe(false)
   })
 

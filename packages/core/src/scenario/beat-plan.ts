@@ -50,16 +50,20 @@ export interface WaveformModulation {
  * A change to apply on top of the intent's suggestion.
  *
  * For `kind: 'level'` the target is resolved with a three-step priority
- * (D8): absolute `targetPercent` first, then `deltaPercent` relative to the
- * channel's current level, then the beat's `strength` conversion. Both
+ * (D8): explicit `targetPercent` first, then `deltaPercent` relative to the
+ * channel's current position, then the beat's `strength` conversion. Both
  * numeric fields may be omitted, which leaves the strength conversion in
  * charge — a strength-only level change is legal.
+ *
+ * Every percentage here is the model's **relative** 0-100 scale: 100 means the
+ * human's channel ceiling, 0 means stop, and values in between are mapped
+ * through the human's interval by the resolver.
  */
 export interface BeatChange {
   readonly kind: 'level' | 'waveform'
-  /** `kind='level'`: absolute target percentage, 0-100, clamped to the channel cap. */
+  /** `kind='level'`: relative target percentage, 0-100, 100 = the human ceiling. */
   readonly targetPercent?: number
-  /** `kind='level'`: offset from the channel's current level, -20..+20. */
+  /** `kind='level'`: offset from the channel's current relative position, -20..+20. */
   readonly deltaPercent?: number
   /** `kind='waveform'`. */
   readonly waveformId?: string

@@ -13,13 +13,14 @@
 
 import { join } from 'node:path'
 import { createHostRuntime } from './main/bootstrap.ts'
+// v3: one single-window app. `index.html` hosts both the play view and the
+// device view; `shell.js` switches between them client-side, so `/` and `/play`
+// serve the same page and there is no separate play.html any more.
 import indexHtml from './ui/index.html?text'
 import appJs from './ui/app.js?text'
-import styleCss from './ui/style.css?text'
-// B2-T12: the play page is part of the same in-memory bundle, so start-dev.bat
-// reaches /play without Electron and without a disk lookup.
-import playHtml from './ui/play.html?text'
 import playJs from './ui/play.js?text'
+import shellJs from './ui/shell.js?text'
+import styleCss from './ui/style.css?text'
 // The phone stop page is the third static file; keeping it in the map means the
 // bundle really is self-contained (no disk lookup for a page that must work
 // when the operator's phone is the only client).
@@ -48,9 +49,9 @@ const runtime = await createHostRuntime({
         dashboardStaticFiles: {
           'index.html': indexHtml,
           'app.js': appJs,
-          'style.css': styleCss,
-          'play.html': playHtml,
           'play.js': playJs,
+          'shell.js': shellJs,
+          'style.css': styleCss,
           'phone.html': phoneHtml,
         },
       }),

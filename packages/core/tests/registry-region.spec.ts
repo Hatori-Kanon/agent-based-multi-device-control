@@ -28,7 +28,7 @@ import { resolvePlan, type FeedbackIntent, type ResolveContext } from '../src/sc
  * and `devices_list` read at runtime — not a fixture shaped to pass.
  */
 
-const TEST_POLICY: ChannelPolicy = { maxPercent: 40, maxWaveIntensity: 80, maxDurationSec: 60 }
+const TEST_POLICY: ChannelPolicy = { minPercent: 0, maxPercent: 40, maxWaveIntensity: 80, minFreq: 10, maxFreq: 240, maxDurationSec: 60 }
 
 /** Three independent ports, which is enough to see a wrong fan-out. */
 const CHANNELS: readonly Channel[] = [

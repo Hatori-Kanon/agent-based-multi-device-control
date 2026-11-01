@@ -1,10 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
-  clampFrameIntensity,
-  clampWaveformIntensity,
+  clampFrameFrequency,
+  clampWaveformFrequency,
   compileWaveformScript,
   createBuiltinWaveforms,
-  DEFAULT_MAX_WAVE_INTENSITY,
   deserializeWaveform,
   formatHexFrame,
   frameAt,
@@ -197,33 +196,35 @@ describe('frame access and summaries', () => {
   })
 })
 
-describe('emit-path clamping', () => {
+describe('emit-path frequency mapping', () => {
   const frame: PulseFrame = { freq: [10, 20, 30, 40], intensity: [10, 50, 90, 100] }
 
-  it('lowers intensity and leaves frequency alone', () => {
-    const clamped = clampFrameIntensity(frame, 60)
-    expect(clamped.intensity).toEqual([10, 50, 60, 60])
-    expect(clamped.freq).toEqual([10, 20, 30, 40])
+  it('maps frequencies into the band and leaves intensity bytes alone', () => {
+    // Protocol band 10-240 mapped into 10-120: 10/20/30/40 -> 10/15/20/24.
+    const mapped = clampFrameFrequency(frame, 10, 120)
+    expect(mapped.freq).toEqual([10, 15, 20, 24])
+    expect(mapped.intensity).toEqual([10, 50, 90, 100])
   })
 
-  it('returns the same object when nothing needs clamping', () => {
-    expect(clampFrameIntensity(frame, 100)).toBe(frame)
+  it('returns the same object for the identity band', () => {
+    expect(clampFrameFrequency(frame, MIN_FREQ, MAX_FREQ)).toBe(frame)
+    expect(clampFrameFrequency(frame, MAX_FREQ, MIN_FREQ)).toBe(frame)
   })
 
-  it('brings a whole waveform under the cap', () => {
-    const clamped = clampWaveformIntensity(waveform([frame]), DEFAULT_MAX_WAVE_INTENSITY)
-    expect(peakIntensity(clamped)).toBe(DEFAULT_MAX_WAVE_INTENSITY)
+  it('maps a whole waveform and preserves peak intensity', () => {
+    const mapped = clampWaveformFrequency(waveform([frame]), 10, 120)
+    expect(mapped.frames[0]?.freq).toEqual([10, 15, 20, 24])
+    expect(peakIntensity(mapped)).toBe(peakIntensity(waveform([frame])))
   })
 
-  it('keeps the vendor square waves intact under a generous cap', () => {
+  it('keeps the vendor square waves intact under the identity band', () => {
     // 挤压 and 气泡 are 0-to-100 square waves. No slew limit may exist here or
-    // most shared waveforms would be rejected.
+    // most shared waveforms would be rejected; the default band is identity.
     const square = waveform([
       { freq: [10, 10, 10, 10], intensity: [0, 0, 0, 0] },
       { freq: [10, 10, 10, 10], intensity: [100, 100, 100, 100] },
     ])
-    const clamped = clampWaveformIntensity(square, 100)
-    expect(clamped).toBe(square)
+    expect(clampWaveformFrequency(square, MIN_FREQ, MAX_FREQ)).toBe(square)
   })
 })
 

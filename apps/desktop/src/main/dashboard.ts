@@ -61,6 +61,13 @@ export interface DashboardDeps {
   panic(source: string): Promise<void>
   unlock(note?: string): Promise<void>
   setCap(deviceId: string, channelId: string, patch: Partial<ChannelPolicy>): Promise<void>
+  /**
+   * Human direct control from the strength bar.
+   *
+   * `percent` is an *absolute* level (not the model's relative scale); the
+   * registry clamps it into the channel interval and the session ceiling.
+   */
+  level(deviceId: string, channelId: string, percent: number, durationSec?: number): Promise<void>
   demo(deviceId: string, channelId: string): Promise<void>
   /** Run a full envelope on a channel — the console's primary gesture. */
   pattern(
@@ -310,11 +317,19 @@ function asNumberArray(value: unknown): number[] | undefined {
 function asPolicyPatch(value: unknown): Partial<ChannelPolicy> | undefined {
   if (typeof value !== 'object' || value === null) return undefined
   const raw = value as Record<string, unknown>
-  const patch: { maxPercent?: number; maxWaveIntensity?: number; maxDurationSec?: number } = {}
-  if (typeof raw.maxPercent === 'number') patch.maxPercent = raw.maxPercent
-  if (typeof raw.maxWaveIntensity === 'number') patch.maxWaveIntensity = raw.maxWaveIntensity
-  if (typeof raw.maxDurationSec === 'number') patch.maxDurationSec = raw.maxDurationSec
-  return Object.keys(patch).length === 0 ? undefined : patch
+  const keys = ['minPercent', 'maxPercent', 'minFreq', 'maxFreq', 'maxDurationSec'] as const
+  const patch: Record<string, number> = {}
+  for (const key of keys) {
+    if (!(key in raw)) continue
+    const field = raw[key]
+    // 任一已知字段非法就整条 patch 拒绝：静默丢弃会变成「只改了一半的边界」，
+    // 而边界是安全状态，不能部分生效。
+    if (typeof field !== 'number' || !Number.isFinite(field) || !Number.isInteger(field)) return undefined
+    patch[key] = field
+  }
+  // A client still sending the removed pulse-width cap gets a clean 400.
+  if ('maxWaveIntensity' in raw) return undefined
+  return Object.keys(patch).length === 0 ? undefined : patch as Partial<ChannelPolicy>
 }
 
 /** Perceived qualities an external capture end may report. */
@@ -379,20 +394,27 @@ const STATIC_TYPES: Readonly<Record<string, string>> = {
   '.css': 'text/css; charset=utf-8',
 }
 
-/** Static console files. `/phone` and `/play` are page aliases (A1-T9, B2-T12). */
-const STATIC_FILES = new Set(['index.html', 'app.js', 'style.css', 'phone.html', 'play.html', 'play.js'])
+/**
+ * Static console files (v3: one single-window app).
+ *
+ * `play.html` no longer exists: the play view and the device view live in the
+ * same page, so `/` and `/play` both serve `index.html` and `shell.js` switches
+ * views client-side.
+ */
+const STATIC_FILES = new Set(['index.html', 'app.js', 'play.js', 'shell.js', 'style.css', 'phone.html'])
 
 /**
  * Page aliases → static file name.
  *
- * The play page is a static page plus its script, not a new business route:
- * `/play` only renames `/play.html`, and the allowlist still decides what can
- * be served (a request for `/play.json` is a clean 404).
+ * `/play` and `/device` are deep links into the single-window app; the
+ * allowlist still decides what can be served (a request for `/play.json` is a
+ * clean 404).
  */
 const STATIC_ALIASES: Readonly<Record<string, string>> = {
   '/': '/index.html',
   '/phone': '/phone.html',
-  '/play': '/play.html',
+  '/play': '/index.html',
+  '/device': '/index.html',
 }
 
 export class DashboardServer {
@@ -1019,10 +1041,51 @@ export class DashboardServer {
       const body = await readJsonBody(request)
       const patch = asPolicyPatch(body.patch)
       if (patch === undefined) {
-        sendError(response, 400, 'patch must set maxPercent, maxWaveIntensity, or maxDurationSec')
+        sendError(response, 400, 'patch must set minPercent, maxPercent, minFreq, maxFreq, or maxDurationSec')
         return
       }
-      await this.options.deps.setCap(asString(body.deviceId, ''), asString(body.channelId, ''), patch)
+      try {
+        await this.options.deps.setCap(asString(body.deviceId, ''), asString(body.channelId, ''), patch)
+      } catch (error) {
+        // A malformed interval (min >= max, out of range) is a client error:
+        // say which bound is wrong instead of turning it into a 500.
+        sendError(response, 400, error instanceof Error ? error.message : 'policy patch refused')
+        return
+      }
+      sendJson(response, 200, this.options.deps.snapshot())
+      return
+    }
+
+    // Direct human control from the strength bar (v3). Absolute percentage,
+    // optional duration; both ends are clamped by the safety runtime.
+    if (request.method === 'POST' && pathname === '/api/level') {
+      const body = await readJsonBody(request)
+      const percent = body.percent
+      if (typeof percent !== 'number' || !Number.isFinite(percent) || !Number.isInteger(percent)) {
+        sendError(response, 400, 'percent must be a whole number from 0 to 100')
+        return
+      }
+      if (percent < 0 || percent > 100) {
+        sendError(response, 400, 'percent must be a whole number from 0 to 100')
+        return
+      }
+      const rawDuration = body.durationSec
+      if (rawDuration !== undefined && rawDuration !== null
+        && (typeof rawDuration !== 'number' || !Number.isFinite(rawDuration))) {
+        sendError(response, 400, 'durationSec must be a number of seconds')
+        return
+      }
+      try {
+        await this.options.deps.level(
+          asString(body.deviceId, ''),
+          asString(body.channelId, ''),
+          percent,
+          typeof rawDuration === 'number' ? rawDuration : undefined,
+        )
+      } catch (error) {
+        sendError(response, 400, error instanceof Error ? error.message : 'level command refused')
+        return
+      }
       sendJson(response, 200, this.options.deps.snapshot())
       return
     }

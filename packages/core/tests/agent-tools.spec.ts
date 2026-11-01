@@ -187,9 +187,10 @@ describe('M2 model tool surface', () => {
     const percentKeys = refs.filter(ref => /percent/i.test(ref.key))
 
     // Explicit allow-list (Lead ruling, 2026-11-01): these two are BeatPlan
-    // *request* values. The resolver clamps them to the effective cap and the
-    // model can never read the cap or the resulting level back, so they are not
-    // a cap-raise path. Every other percent-shaped field is forbidden.
+    // *request* values on the model's 0-100 relative scale. The resolver maps
+    // them through the human interval and the model can never read the bounds
+    // or the resulting level back, so they are not a raise path. Every other
+    // percent-shaped field is forbidden.
     expect([...new Set(percentKeys.map(ref => ref.key))].sort()).toEqual(['deltaPercent', 'targetPercent'])
     for (const ref of percentKeys) {
       expect(ref.path.startsWith('apply_plan.')).toBe(true)
@@ -204,7 +205,6 @@ describe('M2 model tool surface', () => {
       'currentPercent',
       'outputFloorPercent',
       'effectivePercent',
-      'maxWaveIntensity',
       'maxDurationSec',
       'maxIntensity',
       'currentOutput',

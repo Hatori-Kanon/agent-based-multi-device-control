@@ -656,9 +656,12 @@ describe('M2 end-to-end acceptance (B2-T13)', () => {
     const afterStart = await readAudit(root)
     const firstActions = lastPlanActions(afterStart)
     expect(firstActions).toHaveLength(1)
+    // v3: the model writes a *relative* percentage. 100% maps onto the channel
+    // interval [0, 40], and the session ceiling then binds it at 20. The clamp
+    // is not a resolver "clamped" flag any more — it is visible in the applied
+    // percent (audit + dispatch status), which is what the human guards.
     expect(firstActions[0]!.percent).toBe(20)
     expect(firstActions[0]!.percent).toBeLessThanOrEqual(20)
-    expect(firstActions.some(action => action.status === 'clamped')).toBe(true)
 
     const policyAfterStart = JSON.parse(await readFile(join(root, 'state', 'policy.json'), 'utf8')) as {
       sessionCeiling: number
@@ -679,7 +682,6 @@ describe('M2 end-to-end acceptance (B2-T13)', () => {
     expect(secondActions).toHaveLength(1)
     expect(secondActions[0]!.percent).toBe(10)
     expect(secondActions[0]!.percent).toBeLessThanOrEqual(10)
-    expect(secondActions[0]!.status).toBe('clamped')
     expect(runtime.policy.effective('mock-pulse', 'a').maxPercent).toBe(10)
 
     const dispatchedPercents = afterMessage

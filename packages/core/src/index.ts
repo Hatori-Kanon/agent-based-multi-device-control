@@ -33,6 +33,7 @@ export type { AuditActor, AuditFailureHandler, AuditRecord, AuditResult } from '
 export {
   assertValidEnvelope,
   clampEnvelopeToCap,
+  clampEnvelopeToRange,
   createEnvelopeSampler,
   DEFAULT_TICK_MS,
   EffectRunner,
@@ -57,15 +58,16 @@ export {
   ABSOLUTE_MAX_WAVE_INTENSITY,
   assertLevelWithinPolicy,
   assertValidPolicy,
-  clampPercentToPolicy,
+  clampPercentToRange,
   DEFAULT_CHANNEL_POLICY,
   DEFAULT_SESSION_CEILING,
+  mapPercentThroughRange,
   parsePolicySnapshot,
   POLICY_SNAPSHOT_VERSION,
   PolicyStore,
   serializePolicySnapshot,
 } from './devices/policy.ts'
-export type { ChannelPolicy, PolicyChange, PolicySnapshot } from './devices/policy.ts'
+export type { ChannelPolicy, PercentRange, PolicyChange, PolicySnapshot } from './devices/policy.ts'
 
 export { SerialQueue } from './devices/queue.ts'
 
@@ -86,9 +88,10 @@ export type { Channel, ChannelKind, DeviceBackend, DeviceLifecycle } from './dev
 
 export { createBuiltinWaveforms } from './waveform/builtin.ts'
 export {
+  clampFrameFrequency,
   clampFrameIntensity,
+  clampWaveformFrequency,
   clampWaveformIntensity,
-  DEFAULT_MAX_WAVE_INTENSITY,
   peakIntensity,
 } from './waveform/clamp.ts'
 export { compileWaveformScript } from './waveform/dsl.ts'
@@ -169,7 +172,7 @@ export {
   DEFAULT_FREQUENCY_BALANCE,
   DEFAULT_INTENSITY_BALANCE,
 } from './backends/coyote/backend.ts'
-export type { CoyoteBackendOptions, CoyoteChannelId } from './backends/coyote/backend.ts'
+export type { CoyoteBackendOptions, CoyoteChannelId, CoyoteFrequencyRange } from './backends/coyote/backend.ts'
 export {
   MONSTERPARTY_API_URL,
   MONSTERPARTY_ORIGIN,

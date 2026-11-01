@@ -10,13 +10,16 @@ import {
   CoyoteBackend,
   DeviceRegistry,
   FakeClock,
+  MAX_FREQ,
   MemoryAppendOnlyStore,
+  MIN_FREQ,
   MockBleTransport,
   PolicyStore,
   SafetyError,
   SILENT_INTENSITY,
   WaveformLibrary,
   compileWaveformScript,
+  createBuiltinWaveforms,
   percentToStrength,
   type AuditRecord,
   type CoyoteBackendOptions,
@@ -70,6 +73,7 @@ function harness(overrides: Partial<CoyoteBackendOptions> = {}) {
     transport,
     maxPercent: () => 40,
     maxWaveIntensity: () => 80,
+    frequencyRange: () => ({ min: MIN_FREQ, max: MAX_FREQ }),
     onError: error => { errors.push(error) },
     ...overrides,
   })
@@ -127,6 +131,7 @@ describe('Coyote connect handshake', () => {
       transport,
       maxPercent: () => 40,
       maxWaveIntensity: () => 80,
+      frequencyRange: () => ({ min: MIN_FREQ, max: MAX_FREQ }),
     })
 
     let caught: unknown
@@ -228,8 +233,8 @@ describe('Coyote frame stream', () => {
 })
 
 describe('Coyote waveform stage', () => {
-  it('streams waveform frames in order and clamps intensity without touching frequency', async () => {
-    const h = harness({ maxWaveIntensity: () => 70 })
+  it('maps waveform frequencies into the channel band and clamps pulse width', async () => {
+    const h = harness({ frequencyRange: () => ({ min: 10, max: 120 }) })
     await h.backend.connect(signal())
     await h.backend.applyWaveform('a', twoFrameWaveform())
     await h.backend.applyLevel('a', 30)
@@ -241,15 +246,53 @@ describe('Coyote waveform stage', () => {
       seen.push(b0Writes(h.transport.peripheral!.writes).at(-1)!)
     }
 
-    // Frame 0 of the waveform is intensity 100, clamped to the 70 cap.
-    expect(seen[0]?.intensityA).toEqual([70, 70, 70, 70])
-    expect(seen[0]?.freqA).toEqual([30, 30, 30, 30])
-    // Frame 1 is intensity 40, already under the cap.
+    // Protocol band 10-240 mapped into 10-120: 30 -> 20, 60 -> 34. The 100%
+    // slot is clipped to the channel's internal 80% pulse-width cap; the 40%
+    // slot is already below it and passes unchanged.
+    expect(seen[0]?.freqA).toEqual([20, 20, 20, 20])
+    expect(seen[0]?.intensityA).toEqual([80, 80, 80, 80])
+    expect(seen[1]?.freqA).toEqual([34, 34, 34, 34])
     expect(seen[1]?.intensityA).toEqual([40, 40, 40, 40])
-    expect(seen[1]?.freqA).toEqual([60, 60, 60, 60])
     // And it loops.
-    expect(seen[2]?.intensityA).toEqual([70, 70, 70, 70])
-    expect(seen[3]?.intensityA).toEqual([40, 40, 40, 40])
+    expect(seen[2]?.freqA).toEqual([20, 20, 20, 20])
+    expect(seen[3]?.freqA).toEqual([34, 34, 34, 34])
+  })
+
+  it('leaves frequency bytes untouched on the identity band but still caps intensity', async () => {
+    const h = harness()
+    await h.backend.connect(signal())
+    await h.backend.applyWaveform('a', twoFrameWaveform())
+    await h.backend.applyLevel('a', 30)
+    h.clock.advance(100)
+    await h.backend.settled()
+
+    // Default band is [MIN_FREQ, MAX_FREQ]: the authored 30 Hz frame passes
+    // through byte for byte. Pulse width is still a safety concern.
+    const frame = b0Writes(h.transport.peripheral!.writes).at(-1)!
+    expect(frame.freqA).toEqual([30, 30, 30, 30])
+    expect(frame.intensityA).toEqual([80, 80, 80, 80])
+  })
+
+  it('caps a built-in 95% waveform at the default 80% internal safety cap', async () => {
+    const h = harness()
+    const climb = createBuiltinWaveforms().find(waveform => waveform.id === 'climb')
+    expect(climb).toBeDefined()
+    await h.backend.connect(signal())
+    await h.backend.applyWaveform('a', climb!)
+    await h.backend.applyLevel('a', 30)
+
+    let peak = 0
+    for (let tick = 0; tick < 14; tick += 1) {
+      h.clock.advance(100)
+      await h.backend.settled()
+      const frame = b0Writes(h.transport.peripheral!.writes).at(-1)!
+      for (const value of frame.intensityA) {
+        expect(value).toBeLessThanOrEqual(80)
+        peak = Math.max(peak, value)
+      }
+    }
+    // The authored peak is 95; the emitted peak is the default cap, not 95.
+    expect(peak).toBe(80)
   })
 
   it('uses a plain texture when a level is set with no waveform chosen', async () => {
@@ -278,13 +321,13 @@ describe('Coyote waveform stage', () => {
   })
 
   it('restarts a waveform from its beginning when output resumes', async () => {
-    const h = harness({ maxWaveIntensity: () => 100 })
+    const h = harness()
     await h.backend.connect(signal())
     await h.backend.applyWaveform('a', twoFrameWaveform())
     await h.backend.applyLevel('a', 30)
     h.clock.advance(100)
     await h.backend.settled()
-    expect(b0Writes(h.transport.peripheral!.writes).at(-1)?.intensityA).toEqual([100, 100, 100, 100])
+    expect(b0Writes(h.transport.peripheral!.writes).at(-1)?.intensityA).toEqual([80, 80, 80, 80])
 
     // Idle for a while, then resume: the cursor must not have drifted.
     await h.backend.applyLevel('a', 0)
@@ -391,6 +434,7 @@ describe('Coyote bounds and link loss', () => {
       transport,
       maxPercent: () => 40,
       maxWaveIntensity: () => 80,
+      frequencyRange: () => ({ min: MIN_FREQ, max: MAX_FREQ }),
       onError: error => { errors.push(error) },
     })
     const lost: string[] = []
@@ -431,7 +475,7 @@ describe('Coyote through the registry', () => {
     const store = new MemoryAppendOnlyStore()
     const errors: unknown[] = []
     const audit = new AuditLog(store, clock, error => { errors.push(error) })
-    const policy = new PolicyStore({ maxPercent: 40, maxWaveIntensity: 80, maxDurationSec: 60 })
+    const policy = new PolicyStore({ minPercent: 0, maxPercent: 40, maxWaveIntensity: 80, minFreq: 10, maxFreq: 240, maxDurationSec: 60 })
     const waveforms = new WaveformLibrary()
     const transport = new MockBleTransport({ clock, name: COYOTE_BLE_NAME })
     const registry = new DeviceRegistry({
@@ -447,7 +491,13 @@ describe('Coyote through the registry', () => {
       clock,
       transport,
       maxPercent: channel => policy.get('coyote', channel).maxPercent,
+      // Read fresh from the store: a human lowering the internal pulse-width
+      // cap must reach the next emitted frame.
       maxWaveIntensity: channel => policy.get('coyote', channel).maxWaveIntensity,
+      frequencyRange: (channel: 'a' | 'b') => {
+        const entry = policy.get('coyote', channel)
+        return { min: entry.minFreq, max: entry.maxFreq }
+      },
       onError: error => { errors.push(error) },
     })
     registry.register(backend)
@@ -508,10 +558,10 @@ describe('Coyote through the registry', () => {
     expect(channels[1]?.percent).toBeGreaterThan(0)
   })
 
-  it('clamps an agent-authored waveform to the channel cap', async () => {
+  it('maps an agent-authored waveform into the channel frequency band', async () => {
     const h = registryHarness()
     await h.registry.connect('coyote', signal())
-    await h.policy.setByHuman('coyote', 'a', { maxWaveIntensity: 45 })
+    await h.policy.setByHuman('coyote', 'a', { minFreq: 10, maxFreq: 120 })
 
     const authored = h.waveforms.author({
       name: 'hot',
@@ -530,7 +580,40 @@ describe('Coyote through the registry', () => {
     await h.backend.settled()
 
     const frame = b0Writes(h.transport.peripheral!.writes).at(-1)!
-    expect(frame.intensityA).toEqual([45, 45, 45, 45])
+    // 20 in the protocol band maps to round(10 + 10/230 * 110) = 15.
+    expect(frame.freqA).toEqual([15, 15, 15, 15])
+    // The authored 100% slot is clipped to the default internal cap of 80.
+    expect(frame.intensityA).toEqual([80, 80, 80, 80])
+  })
+
+  it('honours a human-lowered internal pulse-width cap of 45', async () => {
+    const h = registryHarness()
+    await h.registry.connect('coyote', signal())
+    await h.policy.setByHuman('coyote', 'a', { maxWaveIntensity: 45 })
+
+    await h.registry.runPattern('model', {
+      deviceId: 'coyote',
+      channelId: 'a',
+      envelope: { preset: 'steady', minPercent: 30, maxPercent: 30, periodMs: 1_000, jitter: 0 },
+      durationSec: 30,
+      waveformId: 'climb',
+    })
+
+    let peak = 0
+    for (let tick = 0; tick < 14; tick += 1) {
+      h.clock.advance(100)
+      await h.registry.settled()
+      await h.backend.settled()
+      const frame = b0Writes(h.transport.peripheral!.writes).at(-1)!
+      for (const value of frame.intensityA) {
+        expect(value).toBeLessThanOrEqual(45)
+        peak = Math.max(peak, value)
+      }
+    }
+    expect(peak).toBe(45)
+    // The audit records the cap that was actually enforced.
+    const run = h.records().filter(record => record.action === 'run_pattern' && record.result === 'ok').at(-1)
+    expect(run?.detail?.waveformIntensityCap).toBe(45)
   })
 
   it('re-asserts the hardware ceiling when a human moves the cap', async () => {

@@ -30,7 +30,7 @@ import { SafetyError } from '../../devices/errors.ts'
 import type { Channel, DeviceBackend } from '../../devices/types.ts'
 import type { BleCharacteristicRef, BlePeripheral, BleTransport } from '../../ports/ble.ts'
 import type { Clock, Timer } from '../../ports/clock.ts'
-import { clampFrameIntensity } from '../../waveform/clamp.ts'
+import { clampFrameFrequency, clampFrameIntensity } from '../../waveform/clamp.ts'
 import { frameAt, type FrameSlots, type PulseFrame, type Waveform } from '../../waveform/types.ts'
 import {
   COYOTE_BATTERY_SERVICE,
@@ -85,6 +85,14 @@ export const DEFAULT_INTENSITY_BALANCE = 128
 /** Consecutive failed frame writes before the link is declared lost. */
 const WRITE_FAILURE_LIMIT = 5
 
+/** Protocol-unit waveform frequency band a channel may output in. */
+export interface CoyoteFrequencyRange {
+  /** Lowest emitted frequency, protocol units (`MIN_FREQ`-`MAX_FREQ`). */
+  readonly min: number
+  /** Highest emitted frequency, protocol units (`MIN_FREQ`-`MAX_FREQ`). */
+  readonly max: number
+}
+
 export interface CoyoteBackendOptions {
   readonly id?: string
   readonly name?: string
@@ -98,8 +106,25 @@ export interface CoyoteBackendOptions {
   readonly bleName?: string
   /** Percentage ceiling per channel; becomes the `BF` hardware soft cap. */
   readonly maxPercent: (channelId: CoyoteChannelId) => number
-  /** Waveform intensity ceiling per channel, applied to every emitted frame. */
+  /**
+   * Internal pulse-width safety cap per channel, 0-100.
+   *
+   * Every emitted frame's `intensity` slots are clamped to this value after the
+   * frequency mapping. It is deliberately **not** exposed as a UI/API option:
+   * the host reads the human-owned (but internal) policy value and passes it
+   * here, and the model has no path to change it. The default policy value is
+   * 80, below the ~100 µs stinging threshold.
+   */
   readonly maxWaveIntensity: (channelId: CoyoteChannelId) => number
+  /**
+   * Waveform frequency band per channel, in protocol units.
+   *
+   * Every emitted frame's `freq` slots are linearly remapped from the protocol
+   * band `[MIN_FREQ, MAX_FREQ]` into `[min, max]`; `[10, 240]` is the identity
+   * mapping. This is the human-configurable waveform control; intensity bytes
+   * are capped separately by {@link CoyoteBackendOptions.maxWaveIntensity}.
+   */
+  readonly frequencyRange: (channelId: CoyoteChannelId) => CoyoteFrequencyRange
   /** 0-255, persisted in the device. Higher makes low frequencies hit harder. */
   readonly frequencyBalance?: number
   /** 0-255, persisted in the device. Higher makes low frequencies sting more. */
@@ -326,8 +351,12 @@ export class CoyoteBackend implements DeviceBackend {
       ? (this.options.plainFrame ?? COYOTE_PLAIN_FRAME)
       : frameAt(state.waveform, state.cursor)
     if (source === undefined) return { freq: SILENT_FREQ, intensity: SILENT_INTENSITY }
-    const clamped = clampFrameIntensity(source, this.options.maxWaveIntensity(id))
-    return { freq: clamped.freq, intensity: clamped.intensity }
+    const band = this.options.frequencyRange(id)
+    const mapped = clampFrameFrequency(source, band.min, band.max)
+    // Frequency first, then the internal pulse-width safety cap: a narrow band
+    // must never accidentally carry an un-capped high-intensity frame.
+    const capped = clampFrameIntensity(mapped, this.options.maxWaveIntensity(id))
+    return { freq: capped.freq, intensity: capped.intensity }
   }
 
   private nextSeq(): number {

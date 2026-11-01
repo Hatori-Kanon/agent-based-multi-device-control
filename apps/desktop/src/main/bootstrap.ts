@@ -324,11 +324,15 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
   // corrupt or hand-edited file must never widen them: parsePolicySnapshot
   // fails closed and we keep the conservative defaults.
   const savedPolicy = await documents.read('policy')
+  let policyMigrated = false
+  let restoredSnapshot: PolicySnapshot | undefined
   if (savedPolicy !== undefined) {
     let restored: PolicySnapshot | undefined
     try {
       restored = parsePolicySnapshot(JSON.parse(savedPolicy))
       policy.restore(restored)
+      policyMigrated = restored.migrated === true
+      restoredSnapshot = restored
     } catch (error) {
       restored = undefined
       recordError(error)
@@ -352,6 +356,40 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
 
   const savePolicy = async (): Promise<void> => {
     await documents.write('policy', serializePolicySnapshot(policy.snapshot()))
+  }
+
+  // A v1 file (pulse-width era) is valid but old-shaped: write it back once so
+  // the on-disk state is v2 and the next start does not migrate again.
+  if (policyMigrated) await savePolicy()
+
+  // v3 removes the global session ceiling from the UI: the human bounds output
+  // per device/channel instead. A ceiling persisted by an older build is
+  // translated once into each explicit channel's `maxPercent` and then released,
+  // so it can never silently squeeze the new per-channel ranges (or create an
+  // inverted interval). The translation is audited; it only ever narrows.
+  const legacyCeiling = restoredSnapshot?.sessionCeiling
+  if (legacyCeiling !== undefined && legacyCeiling !== DEFAULT_SESSION_CEILING) {
+    for (const key of Object.keys(restoredSnapshot?.channels ?? {})) {
+      // Persisted keys are `device:channel` (the snapshot shape), not the
+      // internal NUL-joined key.
+      const separator = key.indexOf(':')
+      if (separator <= 0) continue
+      const deviceId = key.slice(0, separator)
+      const channelId = key.slice(separator + 1)
+      const current = policy.get(deviceId, channelId)
+      const narrowed = Math.max(current.minPercent + 1, Math.min(current.maxPercent, legacyCeiling))
+      if (narrowed !== current.maxPercent) {
+        policy.setByHuman(deviceId, channelId, { maxPercent: narrowed })
+      }
+    }
+    policy.setSessionCeilingByHuman(DEFAULT_SESSION_CEILING)
+    await savePolicy()
+    await audit.record({
+      actor: 'system',
+      action: 'policy_change',
+      result: 'ok',
+      detail: { scope: 'ceiling-migration', previous: legacyCeiling, next: DEFAULT_SESSION_CEILING },
+    })
   }
 
   // ── Model gateway (B1-T15) ──────────────────────────────────────────────
@@ -560,6 +598,16 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
           // `effective` is the session ceiling applied on top of the channel
           // cap, so `BF <= X` holds by construction (D4, rule 4).
           maxPercent: channel => policy.effective(entry.key, channel).maxPercent,
+          // The human's frequency band, read on every frame: a band change
+          // re-shapes the waveform texture live without touching the amplitude.
+          frequencyRange: channel => {
+            const effective = policy.effective(entry.key, channel)
+            return { min: effective.minFreq, max: effective.maxFreq }
+          },
+          // Internal pulse-width ceiling (default 80, v1 value preserved). It is
+          // deliberately NOT exposed through /api/cap: the human configures the
+          // frequency band, while this stays a fixed safety bound against the
+          // vendor's "stinging" pulse width.
           maxWaveIntensity: channel => policy.effective(entry.key, channel).maxWaveIntensity,
           onError: recordError,
         })
@@ -797,6 +845,19 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       })
     },
     stop: async (deviceId, channelId) => { await registry.stop('human', deviceId, channelId) },
+    level: async (deviceId, channelId, percent, durationSec) => {
+      // Direct human control from the strength bar: an *absolute* percentage,
+      // clamped by the registry into the channel's [min,max] interval and the
+      // session ceiling. The default duration keeps the "no indefinite output"
+      // rule; the UI renews while the slider is non-zero.
+      const capacity = policy.effective(deviceId, channelId).maxDurationSec
+      await registry.setLevel('human', {
+        deviceId,
+        channelId,
+        percent: Math.round(percent),
+        durationSec: durationSec === undefined ? capacity : Math.min(Math.round(durationSec), capacity),
+      })
+    },
     connect: async deviceId => { await registry.connect(deviceId, controller.signal) },
     scan: async (deviceId, durationMs) => { await registry.scan('human', deviceId, durationMs, controller.signal) },
     listWaveforms: () => waveforms.list(),

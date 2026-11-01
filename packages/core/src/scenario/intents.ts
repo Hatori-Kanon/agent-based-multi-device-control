@@ -23,7 +23,7 @@
  */
 
 import type { Envelope, EnvelopePreset } from '../devices/effect.ts'
-import { clampPercentToPolicy, type ChannelPolicy } from '../devices/policy.ts'
+import { mapPercentThroughRange, type PercentRange } from '../devices/policy.ts'
 import type { ChannelSnapshot, DeviceSnapshot, RegistrySnapshot } from '../devices/registry.ts'
 import type { Waveform } from '../waveform/types.ts'
 import type { WaveformLibrary } from '../waveform/library.ts'
@@ -391,7 +391,9 @@ function buildBody(
 
   if (change?.kind === 'level') {
     const requested = requestPercent(change, channel, policy, strength)
-    const percent = clampPercentToPolicy(policy, requested)
+    // The model's percent is relative: map it through the human interval here,
+    // the only place narrative intensity becomes an absolute level.
+    const percent = mapPercentThroughRange(policy, requested)
     // R4/§4.3: a level change's `durationSec` is an authorised hold time. It
     // wins over the intent's suggestion (e.g. ambient-field's 30s), else the
     // documented 2s default applies; either way it is clamped to the
@@ -400,7 +402,7 @@ function buildBody(
     const timing = clampDuration(change.durationSec ?? suggested, channel, beat.id, warnings)
     return {
       body: { kind: 'level', percent, durationSec: timing.durationSec },
-      clamped: requested > channel.maxPercent || timing.clamped,
+      clamped: requested < 0 || requested > 100 || timing.clamped,
       degraded: undefined,
     }
   }
@@ -447,27 +449,45 @@ function buildBody(
 }
 
 /**
- * D8's three-step priority: absolute `targetPercent`, then `deltaPercent`
- * against the channel's current level, then the strength ratio.
+ * D8's three-step priority in **relative** percent: explicit `targetPercent`,
+ * then `deltaPercent` against the channel's current position in its interval,
+ * then the strength ratio.
+ *
+ * `deltaPercent` stays a relative quantity: the snapshot's current absolute
+ * level is converted back to a relative position before the delta is applied,
+ * so a +5 request always moves by 5% of the human's band regardless of where
+ * that band starts or ends.
  */
 function requestPercent(
   change: BeatChange,
   channel: ResolveChannelSnapshot,
-  policy: ChannelPolicy,
+  policy: PercentRange,
   strength: BeatStrength,
 ): number {
   if (change.targetPercent !== undefined) return change.targetPercent
   if (change.deltaPercent !== undefined) {
     const current = Number.isFinite(channel.percent) ? channel.percent : 0
-    return current + change.deltaPercent
+    return relativePercentOf(policy, current) + change.deltaPercent
   }
-  return strengthTargetPercent(policy, strength)
+  return strengthRelativePercent(strength)
 }
 
-/** `round(maxPercent × STRENGTH_RATIO[strength])`, the D8 conversion. */
-function strengthTargetPercent(policy: ChannelPolicy, strength: BeatStrength): number {
-  const ratio = strengthRatio(strength)
-  return clampPercentToPolicy(policy, Math.round(policy.maxPercent * ratio))
+/** Current absolute level expressed as a 0-100 position inside the interval. */
+function relativePercentOf(policy: PercentRange, absolute: number): number {
+  const span = policy.maxPercent - policy.minPercent
+  if (span <= 0) return 0
+  const relative = ((absolute - policy.minPercent) / span) * 100
+  return Math.min(100, Math.max(0, relative))
+}
+
+/** D8 strength ratios expressed as the model's 0-100 relative scale. */
+function strengthRelativePercent(strength: BeatStrength): number {
+  return Math.round(100 * strengthRatio(strength))
+}
+
+/** Map a strength ratio through the channel interval. */
+function strengthTargetPercent(policy: PercentRange, strength: BeatStrength): number {
+  return mapPercentThroughRange(policy, strengthRelativePercent(strength))
 }
 
 function strengthRatio(strength: BeatStrength): number {
@@ -475,11 +495,15 @@ function strengthRatio(strength: BeatStrength): number {
   return table[strength] ?? 0
 }
 
-function policyOf(channel: ResolveChannelSnapshot): ChannelPolicy {
+/**
+ * Only the strength interval is needed for mapping. The snapshot deliberately
+ * does not carry the internal pulse-width cap: that safety value belongs to
+ * the emit path, never to the resolver.
+ */
+function policyOf(channel: ResolveChannelSnapshot): PercentRange {
   return {
+    minPercent: channel.minPercent,
     maxPercent: channel.maxPercent,
-    maxWaveIntensity: channel.maxWaveIntensity,
-    maxDurationSec: channel.maxDurationSec,
   }
 }
 

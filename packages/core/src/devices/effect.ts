@@ -108,6 +108,25 @@ export function clampEnvelopeToCap(envelope: Envelope, maxPercent: number): Enve
   return { ...envelope, maxPercent: capped, minPercent: Math.min(envelope.minPercent, capped) }
 }
 
+/**
+ * Fit an envelope inside the channel's output interval.
+ *
+ * Both ends are clamped: a floor below `minPercent` is lifted to it, and a
+ * peak above `maxPercent` is lowered to it, so an authored pattern plays
+ * across the human's band instead of being refused. A zero envelope (silence)
+ * is left alone rather than lifted to the floor, because 0 means "stop".
+ */
+export function clampEnvelopeToRange(envelope: Envelope, minPercent: number, maxPercent: number): Envelope {
+  if (envelope.maxPercent <= 0) return envelope
+  // A legacy session ceiling can leave the floor above the ceiling; safety
+  // wins, so the effective floor is the lower of the two.
+  const floor = Math.min(minPercent, maxPercent)
+  const upper = Math.max(floor, Math.min(envelope.maxPercent, maxPercent))
+  const lower = Math.min(Math.max(envelope.minPercent, floor), upper)
+  if (lower === envelope.minPercent && upper === envelope.maxPercent) return envelope
+  return { ...envelope, minPercent: lower, maxPercent: upper }
+}
+
 /** Stateful sampler for one envelope. */
 export interface EnvelopeSampler {
   valueAt(elapsedMs: number): number

@@ -38,11 +38,15 @@ describe('policy persistence', () => {
     const file = JSON.parse(raw) as {
       version: number
       sessionCeiling: number
-      channels: Record<string, { maxPercent: number }>
+      channels: Record<string, { maxPercent: number; minPercent: number; minFreq: number; maxFreq: number }>
     }
-    expect(file.version).toBe(1)
+    // v3 (the min/max + frequency-band model) writes snapshot version 2.
+    expect(file.version).toBe(2)
     expect(file.sessionCeiling).toBe(30)
     expect(file.channels['coyote:a']?.maxPercent).toBe(25)
+    expect(file.channels['coyote:a']?.minPercent).toBe(0)
+    expect(file.channels['coyote:a']?.minFreq).toBe(10)
+    expect(file.channels['coyote:a']?.maxFreq).toBe(240)
 
     // Persisting a cap is not a device action: no audit record may appear.
     await expect(access(join(root, 'audit', 'device.jsonl'))).rejects.toThrow()
@@ -58,9 +62,42 @@ describe('policy persistence', () => {
 
     runtime = await start()
     expect(runtime.policy.get('coyote', 'a').maxPercent).toBe(25)
-    expect(runtime.policy.ceiling()).toBe(30)
-    // The effective cap is the lower of the channel cap and the ceiling.
+    // v3 folds a legacy ceiling into the per-channel cap and releases it: the
+    // global X is no longer a UI concept, so it must not keep squeezing later
+    // per-channel edits.
+    expect(runtime.policy.ceiling()).toBe(100)
     expect(runtime.policy.effective('coyote', 'a').maxPercent).toBe(25)
+  })
+
+  it('folds a legacy session ceiling into per-channel caps on boot', async () => {
+    // v3 removes the global ceiling from the UI; a ceiling persisted by an older
+    // build must not silently squeeze the new per-channel ranges forever.
+    await mkdir(join(root, 'state'), { recursive: true })
+    await writeFile(
+      join(root, 'state', 'policy.json'),
+      JSON.stringify({
+        version: 2,
+        sessionCeiling: 20,
+        channels: {
+          'coyote:a': { minPercent: 0, maxPercent: 60, maxWaveIntensity: 80, minFreq: 10, maxFreq: 240, maxDurationSec: 60 },
+        },
+      }),
+      'utf8',
+    )
+
+    runtime = await start()
+    expect(runtime.policy.get('coyote', 'a').maxPercent).toBe(20)
+    expect(runtime.policy.ceiling()).toBe(100)
+    // The migration is persisted, so the next start sees a released ceiling.
+    const raw = JSON.parse(await readFile(join(root, 'state', 'policy.json'), 'utf8')) as {
+      sessionCeiling: number
+      channels: Record<string, { maxPercent: number }>
+    }
+    expect(raw.channels['coyote:a']?.maxPercent).toBe(20)
+    expect(raw.sessionCeiling).toBe(100)
+    // It is audited as a system policy change, not as a device action.
+    const audit = await readFile(join(root, 'audit', 'device.jsonl'), 'utf8')
+    expect(audit).toContain('ceiling-migration')
   })
 
   it('keeps the conservative default when the persisted file is corrupt', async () => {

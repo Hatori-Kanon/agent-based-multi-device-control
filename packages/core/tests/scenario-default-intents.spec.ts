@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { assertValidEnvelope, MIN_PERIOD_MS, WaveformLibrary, type EnvelopePreset } from '../src/index.ts'
+import { assertValidEnvelope, MAX_FREQ, MIN_FREQ, MIN_PERIOD_MS, WaveformLibrary, type EnvelopePreset } from '../src/index.ts'
 import { parseBeatPlan, type Beat, type BeatPlan, type BeatStrength } from '../src/scenario/beat-plan.ts'
 import { DEFAULT_INTENTS, ENVELOPE_DEFAULTS, STRENGTH_RATIO } from '../src/scenario/default-intents.ts'
 import {
@@ -20,8 +20,10 @@ function channel(maxPercent: number): ResolveChannelSnapshot {
     supportsWaveform: false,
     outputFloorPercent: 0,
     percent: 0,
+    minPercent: 0,
     maxPercent,
-    maxWaveIntensity: 80,
+    minFreq: MIN_FREQ,
+    maxFreq: MAX_FREQ,
     maxDurationSec: 60,
     effect: undefined,
     waveform: undefined,

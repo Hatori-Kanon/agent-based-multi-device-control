@@ -16,10 +16,10 @@
  */
 
 import type { AuditActor, AuditLog } from './audit.ts'
-import { EffectRunner, assertValidEnvelope, clampEnvelopeToCap, type EffectSnapshot, type Envelope } from './effect.ts'
+import { EffectRunner, assertValidEnvelope, clampEnvelopeToRange, type EffectSnapshot, type Envelope } from './effect.ts'
 import { SafetyError } from './errors.ts'
 import type { DispatchEvent } from './events.ts'
-import { assertLevelWithinPolicy, clampPercentToPolicy, type ChannelPolicy, type PolicyStore } from './policy.ts'
+import { assertLevelWithinPolicy, clampPercentToRange, type ChannelPolicy, type PolicyStore } from './policy.ts'
 import { SerialQueue } from './queue.ts'
 import { RegionStore, type RegionChange } from './regions.ts'
 import type { Channel, ChannelKind, DeviceBackend, DeviceLifecycle } from './types.ts'
@@ -75,8 +75,12 @@ export interface ChannelSnapshot {
   readonly region?: string
   /** Level most recently written to the transport. */
   readonly percent: number
+  /** Human-owned strength interval for this channel. */
+  readonly minPercent: number
   readonly maxPercent: number
-  readonly maxWaveIntensity: number
+  /** Human-owned waveform frequency band, in protocol units. */
+  readonly minFreq: number
+  readonly maxFreq: number
   readonly maxDurationSec: number
   readonly effect: EffectSnapshot | undefined
   readonly waveform: { readonly id: string; readonly name: string } | undefined
@@ -400,25 +404,31 @@ export class DeviceRegistry {
     }
   }
 
-  /** Hold one level for a bounded time. `percent: 0` stops the channel. */
+  /** Hold one level for a bounded time. `percent <= 0` stops the channel. */
   async setLevel(actor: AuditActor, command: LevelCommand): Promise<void> {
-    const detail = { ...command }
-    if (command.percent === 0) {
-      // Zero is a stop, so it follows the stop path and emits one stop event
-      // rather than a level event.
+    const detail: Record<string, unknown> = { ...command }
+    if (command.percent <= 0) {
+      // Zero is a stop, and a negative value is an invalid request that must
+      // not be clamped to 0 and audited as a `set_level` at 0. Both follow the
+      // stop path and emit one stop event rather than a level event.
       await this.stop(actor, command.deviceId, command.channelId)
       return
     }
+    let percent: number
     try {
       const policy = this.prepare(command.deviceId, command.channelId)
       const durationSec = command.durationSec ?? 0
-      // Validate as a level first so the refusal names percent or duration
-      // rather than an envelope field the caller never wrote.
-      assertLevelWithinPolicy(policy, command.percent, durationSec)
+      // Direct control is absolute: the registry's final gate clamps it into
+      // the human's interval (and the session ceiling) before validating.
+      percent = clampPercentToRange(policy, command.percent)
+      detail.percent = percent
+      // Validate as a level first so the refusal names duration rather than an
+      // envelope field the caller never wrote.
+      assertLevelWithinPolicy(policy, percent, durationSec)
       const envelope: Envelope = {
         preset: 'steady',
-        minPercent: command.percent,
-        maxPercent: command.percent,
+        minPercent: percent,
+        maxPercent: percent,
         periodMs: 1_000,
         jitter: 0,
       }
@@ -433,7 +443,7 @@ export class DeviceRegistry {
       deviceId: command.deviceId,
       channelId: command.channelId,
       at: this.options.clock.now(),
-      percent: command.percent,
+      percent,
       ...(command.durationSec === undefined ? {} : { durationSec: command.durationSec }),
     })
     await this.options.audit.record({ actor, action: 'set_level', result: 'ok', detail })
@@ -441,8 +451,9 @@ export class DeviceRegistry {
 
   /** Run a background envelope on one channel, replacing any effect there. */
   async runPattern(actor: AuditActor, command: PatternCommand): Promise<void> {
-    // Author content plays inside the cap: an envelope that asks for more runs
-    // at the cap (the human's boundary), while malformed shapes still refuse.
+    // Author content plays inside the channel's interval: an envelope that asks
+    // for more runs at the ceiling, and one that dips below the floor is lifted
+    // to it, while malformed shapes still refuse.
     let envelope = command.envelope
     const detail: Record<string, unknown> = {
       deviceId: command.deviceId,
@@ -454,11 +465,14 @@ export class DeviceRegistry {
     try {
       const policy = this.prepare(command.deviceId, command.channelId)
       this.assertDuration(command.durationSec, policy)
-      envelope = clampEnvelopeToCap(envelope, policy.maxPercent)
+      envelope = clampEnvelopeToRange(envelope, policy.minPercent, policy.maxPercent)
       detail.envelope = { ...envelope }
       assertValidEnvelope(envelope, policy.maxPercent)
       if (command.waveformId !== undefined) {
         await this.selectWaveform(command.deviceId, command.channelId, command.waveformId)
+        detail.waveformFreqRange = { min: policy.minFreq, max: policy.maxFreq }
+        // Internal safety cap applied on the emit path; recorded for audit even
+        // though the host does not expose it as a configurable field.
         detail.waveformIntensityCap = policy.maxWaveIntensity
       }
       this.channelState(command.deviceId, command.channelId).runner.start(envelope, command.durationSec * 1_000)
@@ -753,8 +767,10 @@ export class DeviceRegistry {
             outputFloorPercent: state.channel.outputFloorPercent ?? 0,
             ...(region === undefined ? {} : { region }),
             percent: state.percent,
+            minPercent: policy.minPercent,
             maxPercent: policy.maxPercent,
-            maxWaveIntensity: policy.maxWaveIntensity,
+            minFreq: policy.minFreq,
+            maxFreq: policy.maxFreq,
             maxDurationSec: policy.maxDurationSec,
             effect: state.runner.snapshot(),
             waveform: state.waveform === undefined
@@ -860,7 +876,7 @@ export class DeviceRegistry {
       const state = device.channels.get(channelId)
       if (state === undefined) return
       const policy = this.options.policy.effective(device.backend.id, channelId)
-      const clamped = clampPercentToPolicy(policy, percent)
+      const clamped = clampPercentToRange(policy, percent)
       await device.backend.applyLevel(channelId, clamped)
       state.percent = clamped
     }, priority)

@@ -26,7 +26,7 @@ const CHANNELS: readonly Channel[] = [
 ]
 
 /** Explicit policy so the assertions describe behaviour, not the shipped default. */
-const TEST_POLICY: ChannelPolicy = { maxPercent: 40, maxWaveIntensity: 80, maxDurationSec: 60 }
+const TEST_POLICY: ChannelPolicy = { minPercent: 0, maxPercent: 40, maxWaveIntensity: 80, minFreq: 10, maxFreq: 240, maxDurationSec: 60 }
 
 const PLAIN: FeedbackIntent = { id: 'plain', meaning: '无建议', regions: ['whole-body'] }
 const PULSE: FeedbackIntent = {
@@ -186,7 +186,7 @@ describe('dispatch', () => {
     await connect(harness)
     const fixture = makePlan([
       levelBeat('b1', { strength: 'med' }),
-      levelBeat('b2', { strength: 'high', change: { kind: 'level', targetPercent: 100 } }),
+      levelBeat('b2', { strength: 'high', change: { kind: 'level', targetPercent: 100, durationSec: 600 } }),
       levelBeat('b3', { regions: ['chest'], strength: 'low' }),
       levelBeat('b4', { strength: 'low', targets: [{ deviceId: 'dead', channelId: 'a' }] }),
     ])

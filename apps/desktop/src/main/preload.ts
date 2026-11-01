@@ -9,7 +9,7 @@ contextBridge.exposeInMainWorld('host', {
   unlock: () => ipcRenderer.invoke('host:unlock'),
   stop: (deviceId?: string, channelId?: string) => ipcRenderer.invoke('host:stop', deviceId, channelId),
   demo: (deviceId: string, channelId: string) => ipcRenderer.invoke('host:demo', deviceId, channelId),
-  setCap: (deviceId: string, channelId: string, patch: { maxPercent?: number; maxWaveIntensity?: number; maxDurationSec?: number }) =>
+  setCap: (deviceId: string, channelId: string, patch: { minPercent?: number; maxPercent?: number; minFreq?: number; maxFreq?: number; maxDurationSec?: number }) =>
     ipcRenderer.invoke('host:set-cap', deviceId, channelId, patch),
   waveforms: () => ipcRenderer.invoke('host:waveforms'),
   setWaveform: (deviceId: string, channelId: string, waveformId?: string) =>

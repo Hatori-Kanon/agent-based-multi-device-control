@@ -225,20 +225,24 @@ async function main() {
   console.log(`  resumed state=${resumed.state}; modelCalls=${runner.calls.length}（不重放上一回合）`)
 
   // ── 3/4 ────────────────────────────────────────────────────────────────
-  // Human path only: raise this channel's cap to 40, then open the consent
-  // ceiling at 20; the effective bound is min(40, 20) = 20.
-  await registry.setPolicyByHuman('mock-pulse', 'a', { maxPercent: 40 })
+  // Human path only (v3 semantics): the channel owns an interval [10, 60] and a
+  // frequency band [40, 120]; the session ceiling then narrows the top of that
+  // interval to 25. The model still writes a relative percentage, so 80% of the
+  // effective interval lands at 10 + 0.8 * (25 - 10) = 22.
+  await registry.setPolicyByHuman('mock-pulse', 'a', { minPercent: 10, maxPercent: 60, minFreq: 40, maxFreq: 120 })
   await documents.write('policy', JSON.stringify(policy.snapshot(), null, 2))
-  await host.setCeiling(20)
+  await host.setCeiling(25)
   const clamped = await host.message('继续。')
   const clampPlan = lastPlan(await readAudit(dataDir))
   const action = clampPlan.detail.actions[0]
-  console.log('\n[3/4] 人类设会话上限 X=20（通道 cap=40）')
-  console.log(`  effective = min(40, 20) = ${policy.effective('mock-pulse', 'a').maxPercent}`)
-  console.log(`  model asked targetPercent=80, strength=high → dispatched ${action.percent}% status=${action.status}`)
+  const effective = policy.effective('mock-pulse', 'a')
+  const expected = Math.round(effective.minPercent + 0.8 * (effective.maxPercent - effective.minPercent))
+  console.log('\n[3/4] 人类设通道范围 10–60%（频率 40–120），会话上限 X=25')
+  console.log(`  effective interval = [${effective.minPercent}, ${effective.maxPercent}]（ceiling 收窄上限）`)
+  console.log(`  model asked targetPercent=80（相对量）→ dispatched ${action.percent}% status=${action.status}`)
   console.log(`  session turn=${clamped.turnId}; mock-pulse/a percent=${channelPercent(registry, 'mock-pulse', 'a')}`)
-  if (!(action.percent <= 20) || action.status !== 'clamped') {
-    throw new Error(`the ceiling did not clamp: ${JSON.stringify(action)}`)
+  if (action.percent !== expected || action.percent < effective.minPercent || action.percent > effective.maxPercent) {
+    throw new Error(`the interval mapping is wrong: ${JSON.stringify({ action, effective, expected })}`)
   }
 
   // ── 4/4 ────────────────────────────────────────────────────────────────

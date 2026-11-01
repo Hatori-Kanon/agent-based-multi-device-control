@@ -88,9 +88,9 @@ function channelRow(deviceId, channel) {
   const caps = document.createElement('div')
   caps.className = 'caps'
   caps.append(capControl(deviceId, channel, 'maxPercent', '强度上限', 100, '%'))
-  if (channel.supportsWaveform) {
-    caps.append(capControl(deviceId, channel, 'maxWaveIntensity', '脉宽上限', 100, ''))
-  }
+  // v3：脉宽上限已由「频率范围」取代，而且这个窗口目前没有被主进程加载
+  // （主窗口加载的是 dashboard `/`）。范围编辑只在单窗口应用里提供，这里不
+  // 再渲染已经不存在的 policy 字段。
 
   const durLabel = document.createElement('label')
   const dur = document.createElement('input')

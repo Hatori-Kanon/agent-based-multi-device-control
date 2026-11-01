@@ -446,7 +446,7 @@ describe('XHTKJ through the registry', () => {
     const registry = new DeviceRegistry({
       clock,
       audit,
-      policy: new PolicyStore({ maxPercent: 40, maxWaveIntensity: 80, maxDurationSec: 60 }),
+      policy: new PolicyStore({ minPercent: 0, maxPercent: 40, maxWaveIntensity: 80, minFreq: 10, maxFreq: 240, maxDurationSec: 60 }),
       onError: error => { errors.push(error) },
       tickMs: 50,
     })
@@ -486,7 +486,7 @@ describe('XHTKJ through the registry', () => {
     const registry = new DeviceRegistry({
       clock,
       audit,
-      policy: new PolicyStore({ maxPercent: 40, maxWaveIntensity: 80, maxDurationSec: 60 }),
+      policy: new PolicyStore({ minPercent: 0, maxPercent: 40, maxWaveIntensity: 80, minFreq: 10, maxFreq: 240, maxDurationSec: 60 }),
       onError: error => { errors.push(error) },
       tickMs: 50,
     })

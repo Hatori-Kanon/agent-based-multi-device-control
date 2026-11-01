@@ -12,9 +12,10 @@
  * device state** — no `maxPercent`, no live output, no allowed duration/limit
  * values. `devices_list` returns region / tier / availability only. The two
  * percent-shaped fields in the surface are `apply_plan`'s *request* values
- * (`change.targetPercent`, `change.deltaPercent`): the resolver clamps them to
- * the effective cap and the model never sees the cap or the resulting level, so
- * they are not a raise path (Lead ruling on B1-T8, 2026-11-01).
+ * (`change.targetPercent`, `change.deltaPercent`): both are relative 0-100
+ * values that the resolver maps through the channel's human-set interval. The
+ * model never sees that interval or the resulting level, so they are not a
+ * raise path (Lead ruling on B1-T8, 2026-11-01).
  *
  * Tool schemas are plain JSON Schema objects — no SDK type, no dependency. The
  * static part deliberately carries no `intentId`/`regions` enum: those are
@@ -57,8 +58,18 @@ const LEVEL_CHANGE_SCHEMA: Record<string, unknown> = {
   additionalProperties: false,
   properties: {
     kind: { const: 'level' },
-    targetPercent: { type: 'number', minimum: 0, maximum: 100 },
-    deltaPercent: { type: 'number', minimum: -20, maximum: 20 },
+    targetPercent: {
+      type: 'number',
+      minimum: 0,
+      maximum: 100,
+      description: '0–100 的相对量：100% = 人类设定的通道上限；0 = 停止。',
+    },
+    deltaPercent: {
+      type: 'number',
+      minimum: -20,
+      maximum: 20,
+      description: '在当前输出位置上的相对变化量，同一 0–100 相对尺度。',
+    },
     durationSec: { type: 'number', minimum: 1, maximum: 600 },
   },
 }
@@ -189,7 +200,7 @@ const WAVEFORM_SEGMENT_SCHEMA: Record<string, unknown> = {
 export const M2_TOOL_SCHEMAS: readonly ToolDefinition[] = [
   {
     name: 'apply_plan',
-    description: '本回合的动作计划。turnId 与 phase 由引擎注入，不要自己写。一回合只能调用一次。强度只用 low/med/high，系统会按当前上限换算。',
+    description: '本回合的动作计划。turnId 与 phase 由引擎注入，不要自己写。一回合只能调用一次。强度只用 low/med/high，系统会按人类设定的通道范围换算。',
     parameters: {
       type: 'object',
       required: ['pacing', 'beats'],

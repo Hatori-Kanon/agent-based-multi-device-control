@@ -1,15 +1,16 @@
-// 游玩页前端（B2-T12）。纯静态、无框架、无外链资源：只通过 dashboard 的
-// JSON API 说话（`M2-实施计划.md` §4.12）。与控制台共享同一套 token 约定：
-// token 从地址栏读一次，之后只出现在 `x-control-token` 请求头里 —— 不落
-// 本地存储、不写 DOM 文本、不进日志。
+// 游玩视图前端（v3 单窗口）。纯静态、无框架、无外链资源：只通过 dashboard
+// 的 JSON API 说话。token 从地址栏读一次，之后只出现在 `x-control-token`
+// 请求头里 —— 不落本地存储、不写 DOM 文本、不进日志。
 //
-// 可见性规则（`导演与写作上下文契约.md`）：本页只渲染玩家能看见的内容 ——
-// 台词、选项、阶段、时间。设备强度/上限等数值一律不进 DOM；感知源只显示
-// 「可用/质量」；probe 数值与解析目标只在调试开关打开后才请求与显示。
-// 开关复用宿主 `/api/debug`，默认关闭；关闭时连请求都不发。
+// 可见性规则（`导演与写作上下文契约.md`）：本视图只渲染玩家能看见的内容 ——
+// 台词、选项、阶段、时间；感知源只显示「可用/质量」；probe 数值与解析目标
+// 只在调试开关打开后才请求与显示。v3 的「软上限」是人类自己持有的边界，
+// 所以按 `设备范围与单窗口界面-设计说明.md` §3.3 在大厅与右轨直接可见、可改。
 //
-// 轮询 2Hz：会话与台词每 500ms，设备/部位每 2s，感知每 3s。所有失败都在
-// 页面上显示可读错误，不往 console 裸奔。
+// 轮询 2Hz：会话与台词每 500ms，设备/部位与软上限每 2s，感知每 3s。设备视图
+// 打开时（document.body.dataset.view === 'device'）本视图停止轮询；切回时
+// `viewchange` 监听器立即刷新一次。所有失败都在页面上显示可读错误，不往
+// console 裸奔。
 
 (() => {
   const token = new URLSearchParams(location.search).get('token') ?? ''
@@ -25,8 +26,6 @@
     err: document.getElementById('err'),
     packSelect: document.getElementById('packSelect'),
     plannedMinutes: document.getElementById('plannedMinutes'),
-    ceiling: document.getElementById('ceiling'),
-    ceilingVal: document.getElementById('ceilingVal'),
     start: document.getElementById('start'),
     pause: document.getElementById('pause'),
     resume: document.getElementById('resume'),
@@ -50,6 +49,8 @@
     status: document.getElementById('status'),
     devices: document.getElementById('devices'),
     sensors: document.getElementById('sensors'),
+    softCapsLobby: document.getElementById('softCapsLobby'),
+    softCapsRail: document.getElementById('softCapsRail'),
     debugPanel: document.getElementById('debugPanel'),
     debugProbes: document.getElementById('debugProbes'),
     holdOverlay: document.getElementById('holdOverlay'),
@@ -343,8 +344,8 @@
   function renderStartHint() {
     if (session === null) {
       el.startHint.textContent = el.packSelect.value === ''
-        ? '没有可用的内容包：请先在控制台导入并激活一个包。'
-        : '点「开局」后会以已激活版本的内容包开一局；会话上限只在开局时写入。'
+        ? '没有可用的内容包：请先在设备视图导入并激活一个包。'
+        : '点「开局」后会以已激活版本的内容包开一局；各通道的强度/频率范围沿用「软上限」里的设置。'
       return
     }
     el.startHint.textContent = session.state === 'ended'
@@ -401,10 +402,6 @@
     el.end.disabled = busy || !running || state === 'ended'
     el.packSelect.disabled = busy || running
     el.plannedMinutes.disabled = busy || running
-    // 大厅里这个滑杆是开局设置；进行中它只受锁定影响（布局上大厅会收起）。
-    el.ceiling.disabled = busy || (running && locked)
-    el.ceilingVal.textContent = `${el.ceiling.value}%`
-    paintCeiling()
 
     const sendable = canSend()
     el.message.disabled = !sendable
@@ -413,11 +410,6 @@
     el.message.placeholder = sendable
       ? '说点什么…（Enter 发送，Shift+Enter 换行）'
       : notSendableReason(state, running, locked)
-  }
-
-  /** range 的轨道进度：style.css 用 --fill 画金色已选比例。 */
-  function paintCeiling() {
-    el.ceiling.style.setProperty('--fill', `${el.ceiling.value}%`)
   }
 
   function notSendableReason(state, running, locked) {
@@ -613,6 +605,234 @@
     }
   }
 
+  // ── 软上限（人类持有的通道边界） ────────────────────────────────────────
+  // 大厅与舞台右轨各有一个挂载点，内容相同：按 设备 → 通道 列出强度/频率
+  // 范围。数据来自 /api/snapshot；修改只由这里的滑杆 change 事件发出，走
+  // POST /api/cap（只有人类能改边界，D4 不变）。
+  const MIN_FREQ = 10
+  const MAX_FREQ = 240
+  /** 正在拖动/聚焦的软上限控件（key = device:channel:kind）。 */
+  const capEditing = new Set()
+  /** 每个挂载点各自的重绘签名；大厅与右轨互不影响。 */
+  const capSignatures = new Map()
+
+  function finite(value) {
+    return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+  }
+
+  /** range 的轨道进度：style.css 用 --fill 画金色已选比例。 */
+  function paintRange(input) {
+    const min = Number(input.min)
+    const max = Number(input.max)
+    const value = Number(input.value)
+    const pct = max > min ? ((value - min) / (max - min)) * 100 : 0
+    input.style.setProperty('--fill', `${Math.min(100, Math.max(0, pct))}%`)
+  }
+
+  /** 通道的四个边界字段；缺失时返回 undefined，由 UI 显示「—」并禁用。 */
+  function capsOf(channel) {
+    const minPercent = finite(channel.minPercent)
+    const maxPercent = finite(channel.maxPercent)
+    const minFreq = finite(channel.minFreq)
+    const maxFreq = finite(channel.maxFreq)
+    return {
+      minPercent,
+      maxPercent,
+      minFreq,
+      maxFreq,
+      intensity: minPercent !== undefined && maxPercent !== undefined && maxPercent > minPercent,
+      frequency: minFreq !== undefined && maxFreq !== undefined && maxFreq > minFreq,
+    }
+  }
+
+  function capSignatureOf(snap) {
+    if (snap === null || !Array.isArray(snap.devices)) return 'none'
+    return JSON.stringify({
+      locked: snap.locked === true,
+      devices: snap.devices.map(device => ({
+        id: device.id,
+        name: device.name,
+        channels: (Array.isArray(device.channels) ? device.channels : []).map(channel => {
+          const caps = capsOf(channel)
+          return [channel.id, channel.label, caps.minPercent, caps.maxPercent, caps.minFreq, caps.maxFreq]
+        }),
+      })),
+    })
+  }
+
+  function softCapMounts() {
+    return [el.softCapsLobby, el.softCapsRail].filter(mount => mount !== null)
+  }
+
+  function renderSoftCaps() {
+    const mounts = softCapMounts()
+    if (mounts.length === 0) return
+    const signature = capSignatureOf(snapshot)
+    const active = document.activeElement
+    for (const mount of mounts) {
+      if (capSignatures.get(mount) === signature) continue
+      // 正在这个容器里操作表单控件时不要重建；下一轮轮询会补上。
+      if (active !== null && mount.contains(active) && active.tagName === 'INPUT') continue
+      capSignatures.set(mount, signature)
+      mount.replaceChildren(...softCapNodes(snapshot))
+    }
+  }
+
+  function softCapNodes(snap) {
+    if (snap === null) return [hintNode('正在读取设备…')]
+    const devices = Array.isArray(snap.devices) ? snap.devices : []
+    if (devices.length === 0) return [hintNode('先在设备视图添加并连接设备')]
+    const nodes = []
+    for (const device of devices) {
+      const channels = Array.isArray(device.channels) ? device.channels : []
+      // 一台设备一张卡，卡里再按通道分段：重复设备名读起来像列表被复制了两遍。
+      if (channels.length > 0) nodes.push(softCapCard(device, channels, snap.locked === true))
+    }
+    if (nodes.length === 0) return [hintNode('设备还没有可用通道：先在设备视图连接设备')]
+    return nodes
+  }
+
+  function softCapCard(device, channels, locked) {
+    const card = document.createElement('div')
+    card.className = 'soft-cap'
+    const head = document.createElement('div')
+    head.className = 'soft-cap-head'
+    const name = document.createElement('span')
+    name.className = 'soft-cap-name'
+    name.textContent = device.name ?? device.id ?? '设备'
+    head.append(name)
+    card.append(head)
+    for (const channel of channels) {
+      const block = document.createElement('div')
+      block.className = 'soft-cap-channel'
+      const label = document.createElement('span')
+      label.className = 'tag'
+      label.textContent = channel.label ?? channel.id ?? '通道'
+      block.append(label)
+      const caps = capsOf(channel)
+      const names = {
+        device: device.name ?? device.id ?? '设备',
+        channel: channel.label ?? channel.id ?? '通道',
+      }
+      block.append(softCapRow(device.id, channel.id, 'intensity', caps, locked, names))
+      block.append(softCapRow(device.id, channel.id, 'frequency', caps, locked, names))
+      card.append(block)
+    }
+    return card
+  }
+
+  function softCapRow(deviceId, channelId, kind, caps, locked, names) {
+    const row = document.createElement('div')
+    row.className = 'soft-cap-row'
+    const label = document.createElement('span')
+    label.className = 'soft-cap-label'
+    label.textContent = kind === 'intensity' ? '强度' : '频率'
+    row.append(label)
+
+    const available = kind === 'intensity' ? caps.intensity : caps.frequency
+    if (!available) {
+      const readout = document.createElement('span')
+      readout.className = 'val'
+      readout.textContent = '—'
+      const hint = document.createElement('span')
+      hint.className = 'hint'
+      hint.textContent = '宿主尚未提供该通道范围'
+      row.append(readout, hint)
+      return row
+    }
+
+    const intensity = kind === 'intensity'
+    const loMin = intensity ? caps.minPercent : caps.minFreq
+    const hiMax = intensity ? caps.maxPercent : caps.maxFreq
+    const floor = intensity ? 0 : MIN_FREQ
+    const ceiling = intensity ? 100 : MAX_FREQ
+    // 强度用百分比，频率用协议编码单位（界面上直接写出来，别只藏在 title 里）。
+    const rangeName = `${names?.device ?? deviceId} ${names?.channel ?? channelId} ${intensity ? '强度' : '频率'}`
+
+    const lo = document.createElement('input')
+    lo.type = 'range'
+    lo.min = String(floor)
+    lo.max = String(hiMax - 1)
+    lo.step = '1'
+    lo.value = String(loMin)
+    lo.disabled = locked
+    lo.title = intensity ? '强度下限（必须小于上限）' : '频率下限（编码单位，必须小于上限）'
+    lo.setAttribute('aria-label', `${rangeName}下限`)
+    const hi = document.createElement('input')
+    hi.type = 'range'
+    hi.min = String(loMin + 1)
+    hi.max = String(ceiling)
+    hi.step = '1'
+    hi.value = String(hiMax)
+    hi.disabled = locked
+    hi.title = intensity ? '强度上限（必须大于下限）' : '频率上限（编码单位，必须大于下限）'
+    hi.setAttribute('aria-label', `${rangeName}上限`)
+
+    const readout = document.createElement('span')
+    readout.className = 'val soft-cap-val'
+
+    const key = `${deviceId}:${channelId}:${kind}`
+    const sync = () => {
+      // 联动保证 min < max：下限滑杆的右端永远比上限少 1，反之亦然。
+      lo.max = String(Number(hi.value) - 1)
+      hi.min = String(Number(lo.value) + 1)
+      if (Number(lo.value) > Number(lo.max)) lo.value = lo.max
+      if (Number(hi.value) < Number(hi.min)) hi.value = hi.min
+      paintRange(lo)
+      paintRange(hi)
+      readout.textContent = intensity ? `${lo.value}%–${hi.value}%` : `${lo.value}–${hi.value}（编码）`
+    }
+    const begin = () => capEditing.add(key)
+    const finish = () => capEditing.delete(key)
+    lo.addEventListener('focus', begin)
+    lo.addEventListener('pointerdown', begin)
+    lo.addEventListener('blur', finish)
+    lo.addEventListener('pointerup', finish)
+    lo.addEventListener('input', sync)
+    hi.addEventListener('focus', begin)
+    hi.addEventListener('pointerdown', begin)
+    hi.addEventListener('blur', finish)
+    hi.addEventListener('pointerup', finish)
+    hi.addEventListener('input', sync)
+    lo.addEventListener('change', () => {
+      finish()
+      sync()
+      void postCap(deviceId, channelId, intensity
+        ? { minPercent: Number(lo.value) }
+        : { minFreq: Number(lo.value) })
+    })
+    hi.addEventListener('change', () => {
+      finish()
+      sync()
+      void postCap(deviceId, channelId, intensity
+        ? { maxPercent: Number(hi.value) }
+        : { maxFreq: Number(hi.value) })
+    })
+
+    sync()
+    row.append(lo, hi, readout)
+    return row
+  }
+
+  async function postCap(deviceId, channelId, patch) {
+    try {
+      const body = await api('/api/cap', {
+        method: 'POST',
+        body: JSON.stringify({ deviceId, channelId, patch }),
+      })
+      clearError('cap')
+      // 旧宿主可能只返回快照；新宿主同样如此。拿不到就重新拉一次。
+      if (body !== null && typeof body === 'object' && Array.isArray(body.devices)) applySnapshot(body)
+      else await refreshSnapshot()
+    } catch (error) {
+      noteError('cap', `修改软上限失败：${describe(error)}`)
+      // 失败时把界面拉回服务端的真实值（本地滑杆可能已经先动了）；清掉
+      // 签名才能保证即使服务端值没变也会重画。
+      capSignatures.clear()
+      await refreshSnapshot()
+    }
+  }
+
   // ── 感知 / 调试 ─────────────────────────────────────────────────────────
   function renderSensors(sources) {
     if (!Array.isArray(sources) || sources.length === 0) {
@@ -737,23 +957,30 @@
     }
   }
 
+  /** 采纳一份快照：设备/部位、软上限、锁定状态与按钮可用性一起更新。 */
+  function applySnapshot(snap) {
+    if (snap === null || typeof snap !== 'object') return
+    snapshot = snap
+    const signature = deviceSignatureOf(snapshot, regions)
+    if (signature !== deviceSignature) {
+      deviceSignature = signature
+      // 正在编辑部位时不重画，避免把输入框从光标下拿走。
+      if (!el.devices.contains(document.activeElement)) renderDevices()
+    }
+    renderSoftCaps()
+    renderLock()
+    renderControls()
+  }
+
   async function refreshSnapshot() {
     try {
       const [snap, regionBody] = await Promise.all([api('/api/snapshot'), api('/api/region')])
-      snapshot = snap
       if (regionBody !== null && typeof regionBody === 'object'
         && regionBody.regions !== null && typeof regionBody.regions === 'object') {
         regions = regionBody.regions
       }
       clearError('snapshot')
-      const signature = deviceSignatureOf(snapshot, regions)
-      if (signature !== deviceSignature) {
-        deviceSignature = signature
-        // 正在编辑部位时不重画，避免把输入框从光标下拿走。
-        if (!el.devices.contains(document.activeElement)) renderDevices()
-      }
-      renderLock()
-      renderControls()
+      applySnapshot(snap)
     } catch (error) {
       noteError('snapshot', `读取设备失败：${describe(error)}`)
     }
@@ -815,12 +1042,30 @@
     renderStartHint()
   }
 
+  /** 游玩视图是否可见；设备视图打开时本视图停止高频轮询。 */
+  function playVisible() {
+    return document.body.dataset.view !== 'device'
+  }
+
+  /** 切回游玩视图时立即拉一次全部状态（不等下一个 500ms 窗口）。 */
+  async function refreshAll() {
+    await Promise.all([
+      refreshPacks(),
+      refreshSession(),
+      refreshTranscript(),
+      refreshSnapshot(),
+      refreshSensors(),
+      refreshProbes(),
+    ])
+  }
+
   async function poll() {
-    if (polling) return
+    if (polling || !playVisible()) return
     polling = true
     try {
       ticks += 1
       await refreshSession()
+      if (!playVisible()) return
       await refreshTranscript()
       if (ticks % 4 === 0) await Promise.all([refreshSnapshot(), refreshSensors()])
       if (ticks % 4 === 2) await refreshProbes()
@@ -835,7 +1080,7 @@
     if (busy) return
     const packId = el.packSelect.value
     if (packId === '') {
-      showError('没有可用的内容包：请先在控制台导入并激活一个包')
+      showError('没有可用的内容包：请先在设备视图导入并激活一个包')
       return
     }
     const plannedMinutes = Number(el.plannedMinutes.value)
@@ -843,14 +1088,14 @@
       showError('计划时长请填 1–240 分钟')
       return
     }
-    const ceilingPercent = Number(el.ceiling.value)
     busy = true
     el.start.textContent = '开局中…'
     renderControls()
     try {
+      // v3：不再随开局写会话上限；输出边界由每通道的软上限持有。
       const next = await api('/api/session/start', {
         method: 'POST',
-        body: JSON.stringify({ packId, plannedMinutes, ceilingPercent }),
+        body: JSON.stringify({ packId, plannedMinutes }),
         timeoutMs: 90000, // 开局要跑一整回合，别用轮询的 8s 预算
       })
       resetStream()
@@ -958,6 +1203,9 @@
       showError('急停需要控制台 token：请从启动日志打开本页')
       return
     }
+    // 设备视图的直控滑杆由 app.js 管理；急停按钮只有这一处绑定，用一个
+    // 进程内事件通知它立刻停掉 keepalive（不等下一次 500ms 轮询）。
+    window.dispatchEvent(new CustomEvent('embodied:panic'))
     el.panic.disabled = true
     try {
       await api('/api/panic', { method: 'POST', body: JSON.stringify({ source: 'play-ui' }) })
@@ -975,16 +1223,6 @@
       await Promise.all([refreshSession(), refreshSnapshot()])
     } catch (error) {
       showError(`解锁失败：${describe(error)}`)
-    }
-  }
-
-  async function setCeiling(percent) {
-    try {
-      await api('/api/session/ceiling', { method: 'POST', body: JSON.stringify({ percent }) })
-      clearError('ceiling')
-      el.ceilingVal.textContent = `${percent}%`
-    } catch (error) {
-      noteError('ceiling', `设置会话上限失败：${describe(error)}`)
     }
   }
 
@@ -1041,16 +1279,6 @@
   el.resume.addEventListener('click', () => { void control('/api/session/resume', '继续') })
   el.end.addEventListener('click', () => { void endSession() })
 
-  el.ceiling.addEventListener('input', () => {
-    el.ceilingVal.textContent = `${el.ceiling.value}%`
-    paintCeiling()
-  })
-  el.ceiling.addEventListener('change', () => {
-    // 大厅里的滑杆是开局设置，开局时随 start 一起写入；进行中才走 ceiling 接口。
-    if (session === null) return
-    void setCeiling(Number(el.ceiling.value))
-  })
-
   el.composer.addEventListener('submit', event => {
     event.preventDefault()
     void sendMessage(el.message.value)
@@ -1099,6 +1327,15 @@
   window.addEventListener('blur', cancelHold)
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) cancelHold()
+  })
+
+  // 设备视图打开时本视图停止轮询；切回来立即刷新一次，避免看到旧台词/旧边界。
+  window.addEventListener('viewchange', event => {
+    const view = event.detail !== undefined && event.detail !== null ? event.detail.view : undefined
+    if (view !== 'play') return
+    deviceSignature = ''
+    capSignatures.clear()
+    void refreshAll()
   })
 
   // ── 启动 ────────────────────────────────────────────────────────────────
