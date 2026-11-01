@@ -7,8 +7,10 @@ import {
   assertValidPolicy,
   clampPercentToPolicy,
   DEFAULT_CHANNEL_POLICY,
+  parsePolicySnapshot,
   PolicyStore,
   SafetyError,
+  serializePolicySnapshot,
 } from '../src/index.ts'
 
 describe('channel policy', () => {
@@ -43,8 +45,10 @@ describe('channel policy', () => {
     for (let proto: object | null = store; proto !== null; proto = Object.getPrototypeOf(proto) as object | null) {
       for (const name of Object.getOwnPropertyNames(proto)) names.add(name)
     }
-    const mutators = [...names].filter(name => /^set/i.test(name))
-    expect(mutators).toEqual(['setByHuman'])
+    const mutators = [...names].filter(name => /^set/i.test(name)).sort()
+    // Exactly two human-only setters: a per-channel cap and the session
+    // ceiling. Neither has a model/engine counterpart (D4).
+    expect(mutators).toEqual(['setByHuman', 'setSessionCeilingByHuman'])
   })
 
   it('validates a policy object directly', () => {
@@ -122,5 +126,100 @@ describe('emit-path clamp', () => {
     // cap would be the worst possible response to a bug, so it fails to zero.
     expect(clampPercentToPolicy(policy, Number.NaN)).toBe(0)
     expect(clampPercentToPolicy(policy, Number.POSITIVE_INFINITY)).toBe(0)
+  })
+})
+
+describe('session ceiling', () => {
+  it('bounds every channel without touching the stored caps', () => {
+    const store = new PolicyStore()
+    store.setByHuman('coyote', 'a', { maxPercent: 40 })
+    store.setSessionCeilingByHuman(25)
+
+    expect(store.effective('coyote', 'a').maxPercent).toBe(25)
+    // Other bounds are untouched; only amplitude is bounded by the ceiling.
+    expect(store.effective('coyote', 'a').maxWaveIntensity).toBe(DEFAULT_CHANNEL_POLICY.maxWaveIntensity)
+    // An unoverridden channel is bounded by the lower of default and ceiling.
+    expect(store.effective('coyote', 'b').maxPercent).toBe(DEFAULT_CHANNEL_POLICY.maxPercent)
+
+    // The stored cap is untouched, so releasing the ceiling restores it.
+    expect(store.get('coyote', 'a').maxPercent).toBe(40)
+    store.setSessionCeilingByHuman(100)
+    expect(store.effective('coyote', 'a').maxPercent).toBe(40)
+  })
+
+  it('refuses a ceiling outside 0-100 and leaves the previous value in force', () => {
+    const store = new PolicyStore()
+    expect(() => store.setSessionCeilingByHuman(101)).toThrow(SafetyError)
+    expect(() => store.setSessionCeilingByHuman(-1)).toThrow(SafetyError)
+    expect(() => store.setSessionCeilingByHuman(12.5)).toThrow(SafetyError)
+    expect(store.ceiling()).toBe(100)
+  })
+
+  it('reports previous and next so a ceiling change can be audited', () => {
+    const store = new PolicyStore()
+    expect(store.setSessionCeilingByHuman(35)).toEqual({ previous: 100, next: 35 })
+    expect(store.setSessionCeilingByHuman(100)).toEqual({ previous: 35, next: 100 })
+  })
+})
+
+describe('policy persistence', () => {
+  it('round-trips the explicit overrides and the ceiling', () => {
+    const first = new PolicyStore()
+    first.setByHuman('coyote', 'a', { maxPercent: 25 })
+    // Hub channel ids contain colons; only the first one separates device id.
+    first.setByHuman('buttplug', '0:1:vibrate', { maxPercent: 15 })
+    first.setSessionCeilingByHuman(30)
+
+    const text = serializePolicySnapshot(first.snapshot())
+    const second = new PolicyStore()
+    second.restore(parsePolicySnapshot(JSON.parse(text) as unknown))
+
+    expect(second.get('coyote', 'a').maxPercent).toBe(25)
+    expect(second.get('buttplug', '0:1:vibrate').maxPercent).toBe(15)
+    expect(second.ceiling()).toBe(30)
+    // A channel that was never overridden keeps the conservative default.
+    expect(second.get('coyote', 'b')).toEqual(DEFAULT_CHANNEL_POLICY)
+  })
+
+  it('round-trips an empty store with the default ceiling', () => {
+    const text = serializePolicySnapshot(new PolicyStore().snapshot())
+    const parsed = parsePolicySnapshot(JSON.parse(text) as unknown)
+    expect(parsed.channels).toEqual({})
+    expect(parsed.sessionCeiling).toBe(100)
+  })
+
+  it('fails closed on an unsafe or unknown persisted file', () => {
+    expect(() =>
+      parsePolicySnapshot({
+        version: 1,
+        sessionCeiling: 100,
+        channels: { 'coyote:a': { maxPercent: 101, maxWaveIntensity: 80, maxDurationSec: 60 } },
+      })).toThrow(SafetyError)
+    expect(() => parsePolicySnapshot({ version: 2, sessionCeiling: 100, channels: {} })).toThrow(/version/)
+    expect(() => parsePolicySnapshot({ version: 1, sessionCeiling: 101, channels: {} })).toThrow(SafetyError)
+    // A key without the device:channel shape is rejected, not silently dropped.
+    expect(() =>
+      parsePolicySnapshot({
+        version: 1,
+        sessionCeiling: 100,
+        channels: { coyote: { maxPercent: 10, maxWaveIntensity: 80, maxDurationSec: 60 } },
+      })).toThrow(/device:channel/)
+  })
+
+  it('restores atomically: one bad entry leaves the store untouched', () => {
+    const store = new PolicyStore()
+    store.setByHuman('coyote', 'a', { maxPercent: 30 })
+
+    expect(() =>
+      store.restore({
+        channels: {
+          'coyote:a': { maxPercent: 10, maxWaveIntensity: 80, maxDurationSec: 60 },
+          nope: { maxPercent: 10, maxWaveIntensity: 80, maxDurationSec: 60 },
+        },
+        sessionCeiling: 50,
+      })).toThrow(SafetyError)
+
+    expect(store.get('coyote', 'a').maxPercent).toBe(30)
+    expect(store.ceiling()).toBe(100)
   })
 })

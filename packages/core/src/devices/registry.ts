@@ -18,6 +18,7 @@
 import type { AuditActor, AuditLog } from './audit.ts'
 import { EffectRunner, assertValidEnvelope, clampEnvelopeToCap, type EffectSnapshot, type Envelope } from './effect.ts'
 import { SafetyError } from './errors.ts'
+import type { DispatchEvent } from './events.ts'
 import { assertLevelWithinPolicy, clampPercentToPolicy, type ChannelPolicy, type PolicyStore } from './policy.ts'
 import { SerialQueue } from './queue.ts'
 import type { Channel, ChannelKind, DeviceBackend, DeviceLifecycle } from './types.ts'
@@ -126,6 +127,7 @@ function describe(error: unknown): string {
 
 export class DeviceRegistry {
   private readonly devices = new Map<string, DeviceState>()
+  private readonly listeners = new Set<(event: DispatchEvent) => void>()
   private locked = false
   private lockedReason: string | undefined
   private shuttingDown = false
@@ -134,6 +136,27 @@ export class DeviceRegistry {
 
   get isLocked(): boolean {
     return this.locked
+  }
+
+  /**
+   * Observe accepted dispatches: exactly one event per accepted command.
+   *
+   * Envelope ticks are never events — an effect that runs for a minute is one
+   * `level`/`pattern` dispatch plus a stream of writes, and a reaction probe
+   * must see the dispatch, not the stream. Rejected commands and writes to an
+   * unconnected device produce nothing.
+   *
+   * Listeners are called synchronously after the command is accepted, in
+   * subscription order. A throwing listener is isolated so it can never
+   * interrupt the dispatch chain, and its failure goes to `onError`.
+   *
+   * @returns an unsubscribe function; calling it more than once is harmless.
+   */
+  subscribe(listener: (event: DispatchEvent) => void): () => void {
+    this.listeners.add(listener)
+    return () => {
+      this.listeners.delete(listener)
+    }
   }
 
   /** Add a backend. Its channels become addressable after {@link connect}. */
@@ -360,6 +383,8 @@ export class DeviceRegistry {
   async setLevel(actor: AuditActor, command: LevelCommand): Promise<void> {
     const detail = { ...command }
     if (command.percent === 0) {
+      // Zero is a stop, so it follows the stop path and emits one stop event
+      // rather than a level event.
       await this.stop(actor, command.deviceId, command.channelId)
       return
     }
@@ -382,6 +407,14 @@ export class DeviceRegistry {
       await this.recordFailure(actor, 'set_level', detail, error)
       throw error
     }
+    this.emit({
+      kind: 'level',
+      deviceId: command.deviceId,
+      channelId: command.channelId,
+      at: this.options.clock.now(),
+      percent: command.percent,
+      ...(command.durationSec === undefined ? {} : { durationSec: command.durationSec }),
+    })
     await this.options.audit.record({ actor, action: 'set_level', result: 'ok', detail })
   }
 
@@ -412,6 +445,17 @@ export class DeviceRegistry {
       await this.recordFailure(actor, 'run_pattern', detail, error)
       throw error
     }
+    // One accepted runPattern is one dispatch. When it also selects a waveform
+    // that selection travels on this event instead of emitting a second one.
+    this.emit({
+      kind: 'pattern',
+      deviceId: command.deviceId,
+      channelId: command.channelId,
+      at: this.options.clock.now(),
+      percent: envelope.maxPercent,
+      durationSec: command.durationSec,
+      ...(command.waveformId === undefined ? {} : { waveformId: command.waveformId }),
+    })
     await this.options.audit.record({ actor, action: 'run_pattern', result: 'ok', detail })
   }
 
@@ -431,6 +475,13 @@ export class DeviceRegistry {
       await this.recordFailure(actor, 'set_waveform', detail, error)
       throw error
     }
+    this.emit({
+      kind: 'waveform',
+      deviceId,
+      channelId,
+      at: this.options.clock.now(),
+      ...(waveformId === undefined ? {} : { waveformId }),
+    })
     await this.options.audit.record({ actor, action: 'set_waveform', result: 'ok', detail })
   }
 
@@ -482,6 +533,15 @@ export class DeviceRegistry {
         this.options.onError(error)
       }
     }))
+    // A stop is one command even when it targets many channels; the broad form
+    // uses the audit log's `'all'` sentinel rather than fanning out into N
+    // events that would look like N separate actions.
+    this.emit({
+      kind: 'stop',
+      deviceId: deviceId ?? 'all',
+      channelId: channelId ?? 'all',
+      at: this.options.clock.now(),
+    })
     await this.options.audit.record({ actor, action: 'stop', result: 'ok', detail })
   }
 
@@ -509,6 +569,14 @@ export class DeviceRegistry {
         this.options.onError(error)
       }
     }))
+    // An emergency stop is a single human action, not one action per channel,
+    // so observers see one stop event with the broad `'all'` sentinel.
+    this.emit({
+      kind: 'stop',
+      deviceId: 'all',
+      channelId: 'all',
+      at: this.options.clock.now(),
+    })
   }
 
   /** Clear the emergency-stop latch. Only a human may call this. */
@@ -657,6 +725,30 @@ export class DeviceRegistry {
       ...(this.options.tickMs === undefined ? {} : { tickMs: this.options.tickMs }),
       ...(this.options.random === undefined ? {} : { random: this.options.random }),
     })
+  }
+
+  /**
+   * Fan out one accepted dispatch to observers.
+   *
+   * Same discipline as `AuditLog.record`: an observer must never be able to
+   * break device control, so every listener is isolated and a diagnostic sink
+   * failure cannot escalate into a device-control fault either. Iterating a
+   * copy lets a listener subscribe or unsubscribe while handling an event
+   * without disturbing the current fan-out.
+   */
+  private emit(event: DispatchEvent): void {
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(event)
+      } catch (error) {
+        try {
+          this.options.onError(error)
+        } catch {
+          // The diagnostic sink itself failed; losing the warning must not
+          // escalate into a device-control fault.
+        }
+      }
+    }
   }
 
   /** The only path to the transport. Serialised per device and clamped last. */

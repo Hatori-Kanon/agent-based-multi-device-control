@@ -17,7 +17,9 @@ import {
   DeviceRegistry,
   MockBackend,
   MonsterPartyBackend,
+  parsePolicySnapshot,
   PolicyStore,
+  serializePolicySnapshot,
   WaveformLibrary,
   XhtkjBackend,
   systemClock,
@@ -99,6 +101,13 @@ export interface HostRuntime {
   panic(source: string): Promise<void>
   /** Persist the durable waveform library. */
   saveWaveforms(): Promise<void>
+  /**
+   * Persist human cap changes and the session ceiling to `state/policy.json`.
+   *
+   * Exposed for tests and for the shutdown path; human UI changes already
+   * persist themselves through the console's `setCap` dependency.
+   */
+  savePolicy(): Promise<void>
   shutdown(): Promise<void>
   /** Devices the operator added (protocol + label + live lifecycle). */
   listDevices(): DeviceManagerEntry[]
@@ -222,6 +231,22 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     }
   }
 
+  // Restore human caps (D4). A cap change has to survive a restart, but a
+  // corrupt or hand-edited file must never widen them: parsePolicySnapshot
+  // fails closed and we keep the conservative defaults.
+  const savedPolicy = await documents.read('policy')
+  if (savedPolicy !== undefined) {
+    try {
+      policy.restore(parsePolicySnapshot(JSON.parse(savedPolicy)))
+    } catch (error) {
+      recordError(error)
+    }
+  }
+
+  const savePolicy = async (): Promise<void> => {
+    await documents.write('policy', serializePolicySnapshot(policy.snapshot()))
+  }
+
   const registry = new DeviceRegistry({ clock, audit, policy, waveforms, onError: recordError })
   const controller = new AbortController()
 
@@ -290,8 +315,10 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
           name: entry.label ?? 'DG-LAB Coyote 3.0',
           ...(entry.bleName === undefined ? {} : { bleName: entry.bleName }),
           // Read fresh on every call so a cap change reaches the hardware.
-          maxPercent: channel => policy.get(entry.key, channel).maxPercent,
-          maxWaveIntensity: channel => policy.get(entry.key, channel).maxWaveIntensity,
+          // `effective` is the session ceiling applied on top of the channel
+          // cap, so `BF <= X` holds by construction (D4, rule 4).
+          maxPercent: channel => policy.effective(entry.key, channel).maxPercent,
+          maxWaveIntensity: channel => policy.effective(entry.key, channel).maxWaveIntensity,
           onError: recordError,
         })
       }
@@ -473,6 +500,9 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     rawWrite: async (deviceId, hex, channel) => registry.rawWrite('human', deviceId, hex, channel),
     setCap: async (deviceId, channelId, patch) => {
       await registry.setPolicyByHuman(deviceId, channelId, patch)
+      // Human cap changes persist; the audit line was already written by the
+      // registry, so this call cannot add or alter audit records.
+      await savePolicy()
     },
     demo: async (deviceId, channelId) => {
       await registry.runPattern('human', {
@@ -552,6 +582,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     snapshot: () => registry.snapshot(),
     panic,
     saveWaveforms,
+    savePolicy,
     listDevices,
     addDevice,
     removeDevice,
@@ -566,6 +597,13 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       await intifaceProcess.stop()
       try {
         await saveWaveforms()
+      } catch (error) {
+        onError(error)
+      }
+      // Caps are already persisted on every change; this covers a session
+      // whose ceiling was set but whose last write failed.
+      try {
+        await savePolicy()
       } catch (error) {
         onError(error)
       }

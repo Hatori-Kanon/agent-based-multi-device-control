@@ -7,6 +7,7 @@ import {
   MockBackend,
   PolicyStore,
   SafetyError,
+  WaveformLibrary,
   type AuditRecord,
   type Channel,
   type ChannelPolicy,
@@ -495,5 +496,211 @@ describe('audit trail', () => {
     await registry.settled()
     expect(toy.deviceLevel('a')).toBe(0)
     expect(failures.length).toBeGreaterThan(0)
+  })
+})
+
+/**
+ * The dispatch event type as the registry publishes it.
+ *
+ * Declared from the subscription signature rather than imported, so these
+ * tests remain valid whether or not `index.ts` re-exports the new module yet.
+ */
+type PublishedDispatch = Parameters<Parameters<DeviceRegistry['subscribe']>[0]>[0]
+
+describe('dispatch events follow accepted commands, never envelope ticks', () => {
+  it('emits exactly one dispatch event per accepted command and none for a rejected one', async () => {
+    const h = createHarness()
+    const events: PublishedDispatch[] = []
+    const unsubscribe = h.registry.subscribe(event => { events.push(event) })
+    await h.registry.connect('toy', signal())
+
+    await h.registry.setLevel('model', { deviceId: 'toy', channelId: 'a', percent: 20, durationSec: 5 })
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({ kind: 'level', deviceId: 'toy', channelId: 'a', percent: 20, durationSec: 5 })
+    expect(events[0]?.at).toBe(h.clock.now())
+
+    // A refused command never reaches the dispatch point.
+    await safetyErrorFrom(
+      h.registry.setLevel('model', { deviceId: 'toy', channelId: 'a', percent: 80, durationSec: 5 }),
+    )
+    expect(events).toHaveLength(1)
+
+    await h.registry.runPattern('model', { deviceId: 'toy', channelId: 'b', envelope: steady(25), durationSec: 5 })
+    expect(events).toHaveLength(2)
+    expect(events[1]).toMatchObject({ kind: 'pattern', deviceId: 'toy', channelId: 'b', percent: 25, durationSec: 5 })
+
+    await h.registry.stop('model', 'toy', 'a')
+    expect(events).toHaveLength(3)
+    expect(events[2]).toMatchObject({ kind: 'stop', deviceId: 'toy', channelId: 'a' })
+
+    // A registered but unconnected device refuses before dispatch, so no event.
+    const cold = new MockBackend({ id: 'cold', clock: h.clock })
+    h.registry.register(cold)
+    await safetyErrorFrom(
+      h.registry.setLevel('model', { deviceId: 'cold', channelId: 'main', percent: 10, durationSec: 5 }),
+    )
+    expect(events).toHaveLength(3)
+
+    unsubscribe()
+  })
+
+  it('emits no dispatch event for a per-tick envelope write', async () => {
+    const h = createHarness()
+    const events: PublishedDispatch[] = []
+    h.registry.subscribe(event => { events.push(event) })
+    await h.registry.connect('toy', signal())
+
+    await h.registry.setLevel('model', { deviceId: 'toy', channelId: 'a', percent: 20, durationSec: 5 })
+    await h.registry.runPattern('model', {
+      deviceId: 'toy',
+      channelId: 'b',
+      envelope: { preset: 'wave', minPercent: 5, maxPercent: 30, periodMs: 200, jitter: 0 },
+      durationSec: 5,
+    })
+    await h.registry.settled()
+    const writesBefore = h.toy.writes.length
+
+    // 1 000 ms at tickMs = 50 is twenty envelope samples on channel b.
+    h.clock.advance(1_000)
+    await h.registry.settled()
+
+    // The transport saw the samples...
+    expect(h.toy.writes.length).toBeGreaterThan(writesBefore)
+    // ...but they are parts of one effect, not new actions.
+    expect(events).toHaveLength(2)
+    expect(events[0]).toMatchObject({ kind: 'level', channelId: 'a' })
+    expect(events[1]).toMatchObject({ kind: 'pattern', channelId: 'b' })
+  })
+
+  it('emits one waveform event and folds a runPattern waveform into the pattern event', async () => {
+    const clock = new FakeClock()
+    const store = new MemoryAppendOnlyStore()
+    const errors: unknown[] = []
+    const audit = new AuditLog(store, clock, error => { errors.push(error) })
+    const waveforms = new WaveformLibrary()
+    const registry = new DeviceRegistry({
+      clock,
+      audit,
+      policy: new PolicyStore(TEST_POLICY),
+      waveforms,
+      onError: error => { errors.push(error) },
+      tickMs: 50,
+    })
+    const toy = new MockBackend({
+      id: 'toy',
+      clock,
+      channels: [{ id: 'pulse', kind: 'level', label: 'Pulse', supportsWaveform: true }],
+    })
+    registry.register(toy)
+    const events: PublishedDispatch[] = []
+    registry.subscribe(event => { events.push(event) })
+    await registry.connect('toy', signal())
+    const waveformId = waveforms.list()[0]!.id
+
+    await registry.setWaveform('model', 'toy', 'pulse', waveformId)
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({ kind: 'waveform', deviceId: 'toy', channelId: 'pulse', waveformId })
+
+    // runPattern selects the same waveform internally; that is one dispatch,
+    // not a pattern event plus a waveform event.
+    await registry.runPattern('model', {
+      deviceId: 'toy',
+      channelId: 'pulse',
+      envelope: steady(20),
+      durationSec: 5,
+      waveformId,
+    })
+    expect(events).toHaveLength(2)
+    expect(events[1]).toMatchObject({
+      kind: 'pattern',
+      deviceId: 'toy',
+      channelId: 'pulse',
+      percent: 20,
+      durationSec: 5,
+      waveformId,
+    })
+
+    // Clearing a waveform is still an accepted dispatch; there is no id to carry.
+    await registry.setWaveform('model', 'toy', 'pulse')
+    expect(events).toHaveLength(3)
+    expect(events[2]).toMatchObject({ kind: 'waveform', deviceId: 'toy', channelId: 'pulse' })
+    expect(events[2]).not.toHaveProperty('waveformId')
+  })
+
+  it('stops delivering events after unsubscribe', async () => {
+    const h = createHarness()
+    const events: PublishedDispatch[] = []
+    const unsubscribe = h.registry.subscribe(event => { events.push(event) })
+    await h.registry.connect('toy', signal())
+
+    await h.registry.setLevel('model', { deviceId: 'toy', channelId: 'a', percent: 20, durationSec: 5 })
+    expect(events).toHaveLength(1)
+
+    unsubscribe()
+    unsubscribe()
+    await h.registry.stop('model', 'toy', 'a')
+    expect(events).toHaveLength(1)
+  })
+
+  it('keeps the dispatch chain alive when a listener throws', async () => {
+    const h = createHarness()
+    const seen: string[] = []
+    h.registry.subscribe(() => { throw new Error('broken probe') })
+    h.registry.subscribe(event => { seen.push(event.kind) })
+    await h.registry.connect('toy', signal())
+
+    await h.registry.setLevel('model', { deviceId: 'toy', channelId: 'a', percent: 20, durationSec: 5 })
+    h.clock.advance(50)
+    await h.registry.settled()
+
+    expect(h.toy.deviceLevel('a')).toBe(20)
+    expect(seen).toEqual(['level'])
+    expect(h.errors.some(error => error instanceof Error && error.message === 'broken probe')).toBe(true)
+  })
+
+  it('reports an emergency stop and a broad stop as one stop dispatch each', async () => {
+    const h = createHarness()
+    const events: PublishedDispatch[] = []
+    h.registry.subscribe(event => { events.push(event) })
+    await h.registry.connect('toy', signal())
+    await h.registry.runPattern('model', { deviceId: 'toy', channelId: 'a', envelope: steady(30), durationSec: 60 })
+
+    await h.registry.emergencyStop('hotkey')
+    await h.registry.settled()
+    expect(events).toHaveLength(2)
+    expect(events[0]).toMatchObject({ kind: 'pattern', deviceId: 'toy', channelId: 'a' })
+    expect(events[1]).toEqual({ kind: 'stop', deviceId: 'all', channelId: 'all', at: h.clock.now() })
+
+    // Stops stay accepted while locked, and a broad stop is still one command.
+    await h.registry.stop('model')
+    await h.registry.settled()
+    expect(events).toHaveLength(3)
+    expect(events[2]).toMatchObject({ kind: 'stop', deviceId: 'all', channelId: 'all' })
+  })
+
+  it('treats setLevel(0) as a stop dispatch, not a level dispatch', async () => {
+    const h = createHarness()
+    const events: PublishedDispatch[] = []
+    h.registry.subscribe(event => { events.push(event) })
+    await h.registry.connect('toy', signal())
+
+    await h.registry.setLevel('model', { deviceId: 'toy', channelId: 'a', percent: 0 })
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({ kind: 'stop', deviceId: 'toy', channelId: 'a' })
+  })
+
+  it('does not report a human cap change as a dispatch', async () => {
+    const h = createHarness()
+    const events: PublishedDispatch[] = []
+    h.registry.subscribe(event => { events.push(event) })
+    await h.registry.connect('toy', signal())
+    await h.registry.setLevel('model', { deviceId: 'toy', channelId: 'a', percent: 30, durationSec: 60 })
+
+    await h.registry.setPolicyByHuman('toy', 'a', { maxPercent: 10 })
+    await h.registry.settled()
+
+    // The immediate post-change re-write goes through the transport, not dispatch.
+    expect(h.toy.deviceLevel('a')).toBe(10)
+    expect(events).toHaveLength(1)
   })
 })

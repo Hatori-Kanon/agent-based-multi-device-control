@@ -61,6 +61,26 @@ export interface PolicyChange {
   readonly next: ChannelPolicy
 }
 
+/** Session consent ceiling: no extra restriction until a human narrows it. */
+export const DEFAULT_SESSION_CEILING = 100
+
+/**
+ * Persisted state of a {@link PolicyStore}.
+ *
+ * Deliberately excludes the defaults: a file written by an older build keeps
+ * working after the defaults change, and a corrupted file cannot silently
+ * widen every channel at once.
+ */
+export interface PolicySnapshot {
+  /** Explicit per-channel overrides, keyed `device:channel`. */
+  readonly channels: Readonly<Record<string, ChannelPolicy>>
+  /** Human consent ceiling for the session, 0-100 (see the D4 decision). */
+  readonly sessionCeiling: number
+}
+
+/** Version stamped into `state/policy.json`. */
+export const POLICY_SNAPSHOT_VERSION = 1
+
 function isWholeNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value)
 }
@@ -126,6 +146,7 @@ function key(deviceId: string, channelId: string): string {
 /** Per-channel cap storage with human-only mutation. */
 export class PolicyStore {
   private readonly overrides = new Map<string, ChannelPolicy>()
+  private sessionCeiling = DEFAULT_SESSION_CEILING
 
   /** @param defaults - Applied to any channel without an explicit override. */
   constructor(private readonly defaults: ChannelPolicy = DEFAULT_CHANNEL_POLICY) {
@@ -153,4 +174,135 @@ export class PolicyStore {
     this.overrides.set(key(deviceId, channelId), next)
     return { deviceId, channelId, previous, next }
   }
+
+  /** Current session consent ceiling, 0-100. */
+  ceiling(): number {
+    return this.sessionCeiling
+  }
+
+  /**
+   * Narrow (or release) the session ceiling.
+   *
+   * Human-only: there is no `setSessionCeilingByModel`, and no engine or
+   * content-pack call site may reach this method — that is the D4 boundary.
+   */
+  setSessionCeilingByHuman(percent: number): { readonly previous: number; readonly next: number } {
+    assertCeiling(percent)
+    const previous = this.sessionCeiling
+    this.sessionCeiling = percent
+    return { previous, next: percent }
+  }
+
+  /**
+   * Policy actually in force: the channel cap further bounded by the session
+   * ceiling.
+   *
+   * The emit path and the Coyote `BF` sync read this instead of
+   * {@link PolicyStore.get}, so `BF <= X` holds by construction.
+   */
+  effective(deviceId: string, channelId: string): ChannelPolicy {
+    const base = this.get(deviceId, channelId)
+    return { ...base, maxPercent: Math.min(base.maxPercent, this.sessionCeiling) }
+  }
+
+  /** Serializable state for `state/policy.json`. Sorted so writes are stable. */
+  snapshot(): PolicySnapshot {
+    const channels: Record<string, ChannelPolicy> = {}
+    for (const internal of [...this.overrides.keys()].sort()) {
+      channels[internal.replace('\u0000', ':')] = { ...this.overrides.get(internal)! }
+    }
+    return { channels, sessionCeiling: this.sessionCeiling }
+  }
+
+  /**
+   * Restore a previously persisted snapshot.
+   *
+   * Validates everything first and commits atomically: a file with one unsafe
+   * entry restores nothing, so a hand-edited cap cannot half-apply.
+   *
+   * @throws SafetyError with code `INVALID_POLICY`.
+   */
+  restore(snapshot: PolicySnapshot): void {
+    const next = new Map<string, ChannelPolicy>()
+    for (const [encoded, policy] of Object.entries(snapshot.channels)) {
+      const decoded = decodeSnapshotKey(encoded)
+      if (decoded === undefined) {
+        throw new SafetyError('INVALID_POLICY', `policy snapshot key '${encoded}' must look like device:channel`)
+      }
+      assertValidPolicy(policy)
+      next.set(key(decoded.deviceId, decoded.channelId), { ...policy })
+    }
+    assertCeiling(snapshot.sessionCeiling)
+    this.overrides.clear()
+    for (const [internal, policy] of next) this.overrides.set(internal, policy)
+    this.sessionCeiling = snapshot.sessionCeiling
+  }
+}
+
+function assertCeiling(percent: number): void {
+  if (!isWholeNumber(percent) || percent < 0 || percent > ABSOLUTE_MAX_PERCENT) {
+    throw new SafetyError('INVALID_POLICY', `sessionCeiling must be a whole number from 0 to ${ABSOLUTE_MAX_PERCENT}`)
+  }
+}
+
+function decodeSnapshotKey(encoded: string): { deviceId: string; channelId: string } | undefined {
+  // Split at the first colon only: hub channel ids (Buttplug `0:1:vibrate`)
+  // contain colons themselves.
+  const at = encoded.indexOf(':')
+  if (at <= 0 || at === encoded.length - 1) return undefined
+  return { deviceId: encoded.slice(0, at), channelId: encoded.slice(at + 1) }
+}
+
+/** Serialize a snapshot into the exact text written to `state/policy.json`. */
+export function serializePolicySnapshot(snapshot: PolicySnapshot): string {
+  return `${JSON.stringify(
+    { version: POLICY_SNAPSHOT_VERSION, sessionCeiling: snapshot.sessionCeiling, channels: snapshot.channels },
+    null,
+    2,
+  )}\n`
+}
+
+/**
+ * Parse persisted policy text.
+ *
+ * Fails closed: an unknown version, a missing ceiling or any unsafe cap
+ * throws, and the caller keeps the conservative defaults.
+ *
+ * @throws SafetyError with code `INVALID_POLICY`.
+ */
+export function parsePolicySnapshot(raw: unknown): PolicySnapshot {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new SafetyError('INVALID_POLICY', 'policy snapshot must be an object')
+  }
+  const record = raw as Record<string, unknown>
+  if (record['version'] !== POLICY_SNAPSHOT_VERSION) {
+    throw new SafetyError('INVALID_POLICY', `unsupported policy snapshot version: ${String(record['version'])}`)
+  }
+  const channels = record['channels']
+  if (typeof channels !== 'object' || channels === null || Array.isArray(channels)) {
+    throw new SafetyError('INVALID_POLICY', 'policy snapshot channels must be an object')
+  }
+  const parsed: Record<string, ChannelPolicy> = {}
+  for (const [encoded, value] of Object.entries(channels as Record<string, unknown>)) {
+    if (decodeSnapshotKey(encoded) === undefined) {
+      throw new SafetyError('INVALID_POLICY', `policy snapshot key '${encoded}' must look like device:channel`)
+    }
+    if (typeof value !== 'object' || value === null) {
+      throw new SafetyError('INVALID_POLICY', `policy snapshot entry '${encoded}' must be an object`)
+    }
+    const entry = value as Record<string, unknown>
+    const policy: ChannelPolicy = {
+      maxPercent: entry['maxPercent'] as number,
+      maxWaveIntensity: entry['maxWaveIntensity'] as number,
+      maxDurationSec: entry['maxDurationSec'] as number,
+    }
+    assertValidPolicy(policy)
+    parsed[encoded] = policy
+  }
+  const sessionCeiling = record['sessionCeiling']
+  if (typeof sessionCeiling !== 'number') {
+    throw new SafetyError('INVALID_POLICY', 'policy snapshot sessionCeiling must be a number')
+  }
+  assertCeiling(sessionCeiling)
+  return { channels: parsed, sessionCeiling }
 }

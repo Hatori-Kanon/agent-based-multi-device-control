@@ -49,6 +49,8 @@ export type {
 export { isSafetyError, SafetyError } from './devices/errors.ts'
 export type { SafetyErrorCode } from './devices/errors.ts'
 
+export type { DispatchEvent, DispatchEventKind } from './devices/events.ts'
+
 export {
   ABSOLUTE_MAX_DURATION_SEC,
   ABSOLUTE_MAX_PERCENT,
@@ -57,9 +59,13 @@ export {
   assertValidPolicy,
   clampPercentToPolicy,
   DEFAULT_CHANNEL_POLICY,
+  DEFAULT_SESSION_CEILING,
+  parsePolicySnapshot,
+  POLICY_SNAPSHOT_VERSION,
   PolicyStore,
+  serializePolicySnapshot,
 } from './devices/policy.ts'
-export type { ChannelPolicy, PolicyChange } from './devices/policy.ts'
+export type { ChannelPolicy, PolicyChange, PolicySnapshot } from './devices/policy.ts'
 
 export { SerialQueue } from './devices/queue.ts'
 
@@ -222,3 +228,115 @@ export type {
 } from './backends/buttplug/protocol.ts'
 export { ButtplugBackend, INTIFACE_DEFAULT_URL } from './backends/buttplug/backend.ts'
 export type { ButtplugBackendOptions } from './backends/buttplug/backend.ts'
+
+// ── M2 · perception (A1/A2) ───────────────────────────────────────────────
+export { DEFAULT_RETAIN_MS, FeatureRing } from './sensors/ring-buffer.ts'
+export type { FeatureRingOptions } from './sensors/ring-buffer.ts'
+export { DEFAULT_STALE_AFTER_MS, SensorRegistry } from './sensors/registry.ts'
+export type { SensorRegistryOptions } from './sensors/registry.ts'
+export { analyzeFrame, downsampleGray } from './sensors/imaging.ts'
+export type { AnalyzeResult, FrameFeatures, GrayFrame, MotionState } from './sensors/imaging.ts'
+export { isSensorError, SensorError } from './sensors/types.ts'
+export type {
+  FeatureSample,
+  FeatureWindowStats,
+  SensorErrorCode,
+  SensorKind,
+  SensorQuality,
+  SensorSource,
+  SensorStatus,
+  Snapshot,
+} from './sensors/types.ts'
+
+// ── M2 · control contracts (B1-T4..T6) ───────────────────────────────────
+export { parseBeatPlan, WHOLE_BODY_REGION } from './scenario/beat-plan.ts'
+export type {
+  Beat,
+  BeatChange,
+  BeatPlan,
+  BeatStrength,
+  BeatTarget,
+  IntentDistribution,
+  PlanContext,
+  PlanDrop,
+  PlanPacing,
+  PlanValidation,
+  PlayerChoice,
+  WaveformModulation,
+} from './scenario/beat-plan.ts'
+export { resolvePlan } from './scenario/intents.ts'
+export type {
+  FeedbackIntent,
+  IntentSuggest,
+  ResolvedCommand,
+  ResolvedCommandBody,
+  ResolvedPlan,
+  ResolveChannelSnapshot,
+  ResolveContext,
+  ResolveDeviceSnapshot,
+  ResolveRegistrySnapshot,
+} from './scenario/intents.ts'
+export { DEFAULT_INTENTS, ENVELOPE_DEFAULTS, STRENGTH_RATIO } from './scenario/default-intents.ts'
+
+// ── M2 · content packs (B1-T12..T14) ─────────────────────────────────────
+export { ENGINE_VERSION } from './version.ts'
+export { MemoryContentSource } from './ports/content-source.ts'
+export type { ContentSource } from './ports/content-source.ts'
+export { isValidVersion, parseVersion, satisfiesVersion } from './scenario/semver.ts'
+export type { SemverVersion } from './scenario/semver.ts'
+export { MAX_PACK_BYTES, validatePack } from './scenario/validate.ts'
+export type { ValidatePackInput, ValidationIssue, ValidationSeverity } from './scenario/validate.ts'
+export {
+  ContentPackError,
+  loadPack,
+  PACK_MANIFEST_FILE,
+  PACK_PERSONA_FILE,
+  PACK_SCENARIO_FILE,
+} from './scenario/loader.ts'
+export type {
+  LoadedPack,
+  LoadPackOptions,
+  MetaReaction,
+  MetaReactionOpening,
+  MetaReactionWhen,
+  PackAftercare,
+  PackHistory,
+  PackManifest,
+  PackMode,
+  PackRating,
+  PackSessionEndReason,
+  ScenarioDefinition,
+  ScenarioPhase,
+  ScenarioPhaseWindow,
+  ScenarioRegion,
+  ScenarioSession,
+} from './scenario/loader.ts'
+export { DEFAULT_CHECKPOINTS, MUST_RESOLVE_RATIO, PhaseMachine } from './scenario/phases.ts'
+export type { PhaseCheckpoint, PhaseNode, PhasePlanView } from './scenario/phases.ts'
+
+// ── M2 · model gateway (B1-T1..T2) ───────────────────────────────────────
+export { apiKeyEnvOf, DEFAULT_API_KEY_ENV, isModelError, ModelError, resolveModel } from './agent/model.ts'
+export type {
+  LlmConfig,
+  LlmMessage,
+  ModelConfig,
+  ModelErrorCode,
+  ModelErrorOptions,
+  ModelFinishReason,
+  ModelRole,
+  ModelRunner,
+  ModelTurnRequest,
+  ModelTurnResult,
+  ModelUsage,
+  ToolCall,
+  ToolDefinition,
+} from './agent/model.ts'
+export { ChatCompletionAccumulator, readResponseText, streamChatCompletion } from './agent/transport.ts'
+export type { ChatCompletionAccumulatorOptions, ChatStreamOptions } from './agent/transport.ts'
+export {
+  CapabilityCache,
+  extractJsonObject,
+  OpenAICompatibleRunner,
+  PROVIDER_CHAT_BASE_URLS,
+} from './agent/adapters/openai-compatible.ts'
+export type { ModelCapabilities, OpenAICompatibleOptions } from './agent/adapters/openai-compatible.ts'
