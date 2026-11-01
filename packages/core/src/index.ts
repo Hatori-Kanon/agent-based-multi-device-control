@@ -362,16 +362,66 @@ export {
 } from './agent/prompt.ts'
 export type { PromptSectionKey, SystemPromptInput, TurnMessagesInput } from './agent/prompt.ts'
 
+// ── M2 · context projections (B2-T1/T2) ─────────────────────────────────
+export {
+  buildDirectorContext,
+  DIRECTOR_CHARS_PER_TOKEN,
+  DIRECTOR_CONTEXT_BUDGET_CHARS,
+  DIRECTOR_CONTEXT_BUDGET_TOKENS,
+  DIRECTOR_DEGRADED_INTENT_LIMIT,
+  DIRECTOR_DIALOG_SUMMARY_LIMIT,
+  DIRECTOR_PHASE_GOAL_HEADLINE_CHARS,
+  DIRECTOR_PROBE_LIMIT,
+  DIRECTOR_RECENT_BEAT_LIMIT,
+  estimateDirectorTokens,
+} from './agent/context/director.ts'
+export type {
+  DirectorContext,
+  DirectorContextInput,
+  DirectorDeviceView,
+  DirectorIntentView,
+  DirectorLevel,
+  DirectorPhaseView,
+  DirectorProbeDirection,
+  DirectorProbeEntry,
+  DirectorProbeFact,
+  DirectorSessionFact,
+  DirectorTimeView,
+} from './agent/context/director.ts'
+export {
+  buildWriterContext,
+  COMPRESSED_RECENT_LINES,
+  DEFAULT_WRITER_CONTEXT_BUDGET_CHARS,
+  humanizePlan,
+  MAX_CORPUS_EXCERPTS,
+  MAX_RECENT_LINES,
+  WRITER_CONSTRAINTS,
+  WRITER_TEMPLATE_LINE,
+  writerContextChars,
+} from './agent/context/writer.ts'
+export type {
+  HumanizePlanOptions,
+  RegionLabelSource,
+  WriterContext,
+  WriterContextInput,
+  WriterMustMention,
+} from './agent/context/writer.ts'
+
 export { APPLY_PLAN_TOOL, DEFAULT_TURN_TIMEOUT_MS, LOOK_TOOL, runTurn } from './agent/loop.ts'
 export type { TurnExecutor, TurnLoopInput, TurnLoopOptions, TurnResult } from './agent/loop.ts'
 
 // ── M2 · perception projections / look (A1-T7..T8) ───────────────────────
 export { DEFAULT_SENSOR_BLOCK_BUDGET, sensorPromptBlock, sensorsListPayload } from './sensors/projection.ts'
 export type { SensorsListPayload } from './sensors/projection.ts'
+export { DEFAULT_PROBE_BLOCK_BUDGET, MAX_PROMPT_PROBES, probePromptBlock } from './sensors/projection.ts'
+export type { ProbePromptAudience, ProbePromptBlockOptions } from './sensors/projection.ts'
 export { DEFAULT_LOOK_MAX_AGE_MS, DEFAULT_LOOK_MAX_BYTES, readForLook } from './sensors/look.ts'
 export type { ImageForModel, LookOptions } from './sensors/look.ts'
 
 export { DEFAULT_PROBE_THRESHOLDS, ReactionProbeRecorder } from './sensors/probe.ts'
+
+export { probeDirectorJson, probeWriterBrief } from './sensors/probe-projection.ts'
+export type { ProbeDirection, ProbeDirectorEntry, ProbeMagnitude } from './sensors/probe-projection.ts'
 export type {
   ProbeAction,
   ProbeAuditSink,
@@ -433,6 +483,16 @@ export type {
   TurnTriggerKind,
 } from './engine/state-machine.ts'
 export { DEFAULT_ENGINE_CONFIG, TEMPLATE_LINE, TurnEngine } from './engine/turn-engine.ts'
+
+// ── M2 · turn scheduler (B2-T4) ─────────────────────────────────────────
+export { compareTriggers, planPreemption, priorityRank, PriorityQueue } from './engine/scheduler.ts'
+export type {
+  PreemptAuditAction,
+  PreemptPlan,
+  PreemptReason,
+  PreemptStage,
+  PriorityQueueDecision,
+} from './engine/scheduler.ts'
 export type {
   EndReason,
   EngineConfig,

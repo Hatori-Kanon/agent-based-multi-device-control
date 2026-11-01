@@ -175,3 +175,78 @@ describe('turn state machine', () => {
     expect(h.engine.state).toBe('ended')
   })
 })
+
+describe('P0 wins over the settle tail', () => {
+  function emptyAudit(clock: FakeClock): AuditLog {
+    return new AuditLog(new MemoryAppendOnlyStore(), clock, () => {})
+  }
+
+  it('stays locked when a panic lands while the settle hook is awaiting', async () => {
+    const clock = new FakeClock()
+    const audit = new AuditLog(new MemoryAppendOnlyStore(), clock, () => {})
+    let release: (() => void) | undefined
+    const engine = new TurnEngine({
+      clock,
+      audit,
+      runner: stagedRunner(),
+      onSettle: () => new Promise<void>(resolve => { release = resolve }),
+    })
+
+    const turn = engine.submitPlayerMessage('开始')
+    // Let the turn reach the settle hook.
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    await engine.panic('hotkey')
+    expect(engine.state).toBe('locked')
+
+    release?.()
+    await turn
+    // The emergency latch must survive the tail of the turn it interrupted.
+    expect(engine.state).toBe('locked')
+    await engine.submitPlayerMessage('还能继续吗')
+    expect(engine.state).toBe('locked')
+
+    engine.unlock('我看过了')
+    expect(engine.state).toBe('idle')
+  })
+
+  it('reports a panic during the turn as cancelled, never as a model fallback', async () => {
+    const clock = new FakeClock()
+    const store = new MemoryAppendOnlyStore()
+    const audit = new AuditLog(store, clock, () => {})
+    const engine = new TurnEngine({ clock, audit, runner: hangingRunner() })
+
+    const turn = engine.submitPlayerMessage('慢一点')
+    await Promise.resolve()
+    await engine.panic('hotkey')
+    await turn
+
+    const records = store.lines.map(line => JSON.parse(line) as AuditRecord)
+    expect(engine.state).toBe('locked')
+    expect(engine.snapshot().outcome).toBe('cancelled')
+    expect(records.some(record => record.action === 'plan_fallback')).toBe(false)
+  })
+
+  it('ends a session that panics during aftercare into locked, not ended', async () => {
+    const clock = new FakeClock()
+    const audit = emptyAudit(clock)
+    let releaseEnd: (() => void) | undefined
+    const engine = new TurnEngine({
+      clock,
+      audit,
+      runner: stagedRunner(),
+      onEnd: () => new Promise<void>(resolve => { releaseEnd = resolve }),
+    })
+
+    await engine.submitPlayerMessage('你好')
+    const ending = engine.end('completed')
+    await Promise.resolve()
+    await Promise.resolve()
+    await engine.panic('hotkey')
+    releaseEnd?.()
+    await ending
+
+    expect(engine.state).toBe('locked')
+  })
+})

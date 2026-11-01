@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest'
+import type { ProbeRecord, ProbeVerdict } from '../src/sensors/probe.ts'
+import { probeWriterBrief } from '../src/sensors/probe-projection.ts'
 import {
+  DEFAULT_PROBE_BLOCK_BUDGET,
   DEFAULT_SENSOR_BLOCK_BUDGET,
+  probePromptBlock,
   sensorPromptBlock,
   sensorsListPayload,
 } from '../src/sensors/projection.ts'
-import type { SensorKind, SensorQuality, SensorStatus } from '../src/sensors/types.ts'
+import type { FeatureWindowStats, SensorKind, SensorQuality, SensorStatus } from '../src/sensors/types.ts'
 
 function status(
   id: string,
@@ -98,5 +102,139 @@ describe('sensor projection', () => {
         { id: 'mic-1', kind: 'audio', label: '麦克风', quality: 'stale', freshnessMs: undefined },
       ],
     })
+  })
+})
+
+const PROBE_BASELINE: FeatureWindowStats = {
+  samples: 3,
+  quality: 'ok',
+  motionEnergyMean: 0.05,
+  motionPeak: 0.07,
+  audioLevelMeanPct: 12,
+  audioPeakPct: 14,
+}
+
+const PROBE_WINDOW: FeatureWindowStats = {
+  samples: 6,
+  quality: 'ok',
+  motionEnergyMean: 0.14,
+  motionPeak: 0.22,
+  audioLevelMeanPct: 31,
+  audioPeakPct: 41,
+}
+
+const PROBE_DELTA: Readonly<Record<ProbeVerdict, ProbeRecord['delta']>> = {
+  responded: { motion: 0.17, audioPct: 29 },
+  none: { motion: 0.01, audioPct: 2 },
+  ambiguous: { motion: 0.2, audioPct: 40 },
+  unavailable: undefined,
+}
+
+interface ProbeRecordOverrides {
+  readonly probeId?: string
+  readonly beatId?: string
+  readonly intentId?: string
+  readonly verdict?: ProbeVerdict
+  readonly reason?: ProbeRecord['reason']
+}
+
+function probeRecord(overrides: ProbeRecordOverrides = {}): ProbeRecord {
+  const verdict = overrides.verdict ?? 'responded'
+  const reason = overrides.reason ?? (verdict === 'unavailable' ? 'stale' : undefined)
+  const seen = verdict !== 'unavailable'
+  return {
+    probeId: overrides.probeId ?? 'p-0001',
+    turnId: 1,
+    beatId: overrides.beatId ?? 'b1',
+    intentId: overrides.intentId ?? 'probe-touch',
+    trigger: 'passive',
+    actionAt: 1_000,
+    targets: [{ deviceId: 'coyote-1', channelId: 'A' }],
+    baseline: seen ? PROBE_BASELINE : undefined,
+    window: seen ? PROBE_WINDOW : undefined,
+    delta: PROBE_DELTA[verdict],
+    verdict,
+    ...(reason === undefined ? {} : { reason }),
+  }
+}
+
+describe('probe prompt block', () => {
+  it('adds no probe block at all when no probe was ever registered', () => {
+    for (const audience of ['director', 'writer', 'model'] as const) {
+      expect(probePromptBlock([], { for: audience })).toBe('')
+    }
+    // An empty world and a zero budget are both "no section", never noise.
+    expect(probePromptBlock([probeRecord()], { for: 'writer', budgetChars: 0 })).toBe('')
+    expect(DEFAULT_PROBE_BLOCK_BUDGET).toBe(200)
+  })
+
+  it('injects at most the last three probes', () => {
+    const records = [
+      probeRecord({ probeId: 'p-0001', beatId: 'b-oldest', verdict: 'unavailable', reason: 'stale' }),
+      probeRecord({ probeId: 'p-0002', beatId: 'b-2', verdict: 'ambiguous' }),
+      probeRecord({ probeId: 'p-0003', beatId: 'b-3', verdict: 'none' }),
+      probeRecord({ probeId: 'p-0004', beatId: 'b-newest', verdict: 'responded' }),
+    ]
+
+    const writer = probePromptBlock(records, { for: 'writer' })
+    // The dropped oldest probe was the only unavailable one, so its sentence
+    // must not appear; the remaining three each contribute one line.
+    expect(writer).not.toContain('暂时不在画面')
+    expect(writer.split('\n')).toHaveLength(3)
+    expect(writer).not.toMatch(/\p{Nd}/u)
+
+    const director = probePromptBlock(records, { for: 'director' })
+    expect(director).not.toContain('b-oldest')
+    expect(director).toContain('b-newest')
+    expect(director.split('；')).toHaveLength(3)
+    expect(director.length).toBeLessThanOrEqual(DEFAULT_PROBE_BLOCK_BUDGET)
+
+    // The single-call model gets the same digit-free narrative as the writer.
+    expect(probePromptBlock(records, { for: 'model' })).toBe(writer)
+  })
+
+  it('degrades to narrative when every source is stale', () => {
+    const records = [
+      probeRecord({ probeId: 'p-0001', beatId: 'b1', verdict: 'unavailable', reason: 'stale' }),
+      probeRecord({ probeId: 'p-0002', beatId: 'b2', verdict: 'unavailable', reason: 'stale' }),
+      probeRecord({ probeId: 'p-0003', beatId: 'b3', verdict: 'unavailable', reason: 'stale' }),
+    ]
+
+    const director = probePromptBlock(records, { for: 'director' })
+    // No fake direction/magnitude band: the whole block becomes narrative.
+    expect(director).toBe(`探测：${probeWriterBrief(records)}`)
+    expect(director).toContain('暂时不在画面')
+    expect(director).not.toContain('未知')
+    expect(director).not.toContain('b1')
+    expect(director).not.toMatch(/\p{Nd}/u)
+  })
+
+  it('keeps a mixed batch structured and narrates only the unavailable probe', () => {
+    const records = [
+      probeRecord({ beatId: 'b1', verdict: 'responded' }),
+      probeRecord({ beatId: 'b2', verdict: 'unavailable', reason: 'stale' }),
+    ]
+
+    const director = probePromptBlock(records, { for: 'director' })
+    expect(director).toContain('b1/probe-touch 有反应')
+    expect(director).toContain('暂时不在画面')
+    // A probe that saw nothing gets no invented direction/magnitude band.
+    expect(director).not.toContain('b2/probe-touch')
+    expect(director).not.toContain('未知')
+  })
+
+  it('renders the director as compact facts and never leaks digits to writer/model', () => {
+    const records = [probeRecord({ verdict: 'responded' })]
+    const director = probePromptBlock(records, { for: 'director' })
+    expect(director).toContain('b1/probe-touch')
+    expect(director).toContain('有反应')
+    expect(director).toContain('升')
+    expect(director).toContain('中')
+
+    const writer = probePromptBlock(records, { for: 'writer' })
+    expect(writer).toBe(`探测：${probeWriterBrief(records)}`)
+    expect(writer).not.toMatch(/\p{Nd}/u)
+    expect(writer).not.toContain('0.17')
+    expect(probePromptBlock(records, { for: 'model' })).toBe(writer)
   })
 })

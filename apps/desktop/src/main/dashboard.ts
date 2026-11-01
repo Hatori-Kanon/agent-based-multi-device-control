@@ -19,6 +19,8 @@ import type { ChannelPolicy } from '@embodied/core'
 import { isSensorError } from '@embodied/core'
 import type { FeatureSample, SensorQuality, SensorStatus, Snapshot } from '@embodied/core'
 import type { DeviceManagerEntry, DeviceProtocol } from './bootstrap.ts'
+import { isSessionError } from './play.ts'
+import type { PlayHostStartRequest } from './play.ts'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -30,6 +32,11 @@ const ADDABLE_PROTOCOLS: readonly string[] = ['coyote', 'xhtkj', 'mock']
 /** Every capability the console needs; satisfied by HostRuntime plus audit. */
 export interface DashboardDeps {
   snapshot(): unknown
+  /**
+   * The session service (B1-T16). Optional so a console-only host (or an older
+   * test double) keeps working; the session routes answer 404 without it.
+   */
+  readonly session?: DashboardSession
   panic(source: string): Promise<void>
   unlock(note?: string): Promise<void>
   setCap(deviceId: string, channelId: string, patch: Partial<ChannelPolicy>): Promise<void>
@@ -64,6 +71,14 @@ export interface DashboardDeps {
   sensorFrame(sourceId?: string): Promise<Snapshot | undefined>
   /** Store one externally captured feature sample (unknown source → 400). */
   pushFeatures(sample: FeatureSample): void
+}
+
+/** The one-session API the play routes drive (implemented by `PlayHost`). */
+export interface DashboardSession {
+  start(input: PlayHostStartRequest): Promise<unknown>
+  message(text: string): Promise<unknown>
+  end(reason: string): Promise<unknown>
+  snapshot(): unknown | undefined
 }
 
 export interface DashboardServerOptions {
@@ -106,6 +121,21 @@ function sendJson(response: ServerResponse, status: number, payload: unknown): v
 
 function sendError(response: ServerResponse, status: number, message: string): void {
   sendJson(response, status, { ok: false, error: message })
+}
+
+/**
+ * Map a session refusal to `400`.
+ *
+ * Only {@link SessionError} is a caller-fixable condition (no session, second
+ * start, locked runtime, bad input). Anything else is a host bug and keeps
+ * bubbling up as `500`, where the error log can see it.
+ */
+function sendSessionFailure(response: ServerResponse, error: unknown): void {
+  if (isSessionError(error)) {
+    sendJson(response, 400, { ok: false, error: error.message, code: error.code })
+    return
+  }
+  throw error
 }
 
 async function readBody(request: IncomingMessage): Promise<string> {
@@ -316,6 +346,119 @@ export class DashboardServer {
     const isApi = pathname.startsWith('/api/')
     if (isApi && !tokenMatches(this.options.token, request, url)) {
       sendError(response, 401, 'missing or invalid x-control-token')
+      return
+    }
+
+    // ── Session API (B1-T16) ─────────────────────────────────────────────
+    // One process, one session: `start` is refused while a session exists and
+    // every player action is refused before the first start. The engine and
+    // the ceiling live in `play.ts`; this layer only validates HTTP input and
+    // maps a refusal to 400.
+    if (request.method === 'GET' && pathname === '/api/session') {
+      const session = this.options.deps.session
+      if (session === undefined) {
+        sendError(response, 404, 'the session service is not available')
+        return
+      }
+      const snapshot = session.snapshot()
+      if (snapshot === undefined) {
+        sendError(response, 404, 'no session is open')
+        return
+      }
+      sendJson(response, 200, snapshot)
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/session/start') {
+      const session = this.options.deps.session
+      if (session === undefined) {
+        sendError(response, 404, 'the session service is not available')
+        return
+      }
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(request)
+      } catch (error) {
+        sendError(response, 400, `invalid JSON body: ${error instanceof Error ? error.message : 'unreadable'}`)
+        return
+      }
+      const packId = asOptionalString(body.packId)
+      if (packId === undefined) {
+        sendError(response, 400, 'packId is required')
+        return
+      }
+      const plannedMinutes = body.plannedMinutes
+      if (typeof plannedMinutes !== 'number' || !Number.isFinite(plannedMinutes)) {
+        sendError(response, 400, 'plannedMinutes must be a number of minutes')
+        return
+      }
+      const rawCeiling = body.ceilingPercent
+      if (rawCeiling !== undefined && rawCeiling !== null && typeof rawCeiling !== 'number') {
+        sendError(response, 400, 'ceilingPercent must be a whole number from 0 to 100')
+        return
+      }
+      const input: PlayHostStartRequest = {
+        packId,
+        plannedMinutes,
+        ...(typeof rawCeiling === 'number' ? { ceilingPercent: rawCeiling } : {}),
+      }
+      try {
+        sendJson(response, 200, await session.start(input))
+      } catch (error) {
+        sendSessionFailure(response, error)
+      }
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/session/message') {
+      const session = this.options.deps.session
+      if (session === undefined) {
+        sendError(response, 404, 'the session service is not available')
+        return
+      }
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(request)
+      } catch (error) {
+        sendError(response, 400, `invalid JSON body: ${error instanceof Error ? error.message : 'unreadable'}`)
+        return
+      }
+      const text = asOptionalString(body.text)
+      if (text === undefined) {
+        sendError(response, 400, 'message text is required')
+        return
+      }
+      try {
+        sendJson(response, 200, await session.message(text))
+      } catch (error) {
+        sendSessionFailure(response, error)
+      }
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/session/end') {
+      const session = this.options.deps.session
+      if (session === undefined) {
+        sendError(response, 404, 'the session service is not available')
+        return
+      }
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(request)
+      } catch (error) {
+        sendError(response, 400, `invalid JSON body: ${error instanceof Error ? error.message : 'unreadable'}`)
+        return
+      }
+      const reason = asOptionalString(body.reason)
+      if (reason === undefined) {
+        sendError(response, 400, 'reason is required')
+        return
+      }
+      try {
+        sendJson(response, 200, await session.end(reason))
+      } catch (error) {
+        sendSessionFailure(response, error)
+      }
       return
     }
 

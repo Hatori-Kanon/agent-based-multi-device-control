@@ -27,56 +27,11 @@ export type TurnState =
 /** How a turn finished. Recorded separately from {@link TurnState}. */
 export type TurnOutcome = 'completed' | 'cancelled' | 'preempted' | 'fallback' | 'timeout' | 'blocked'
 
-/**
- * Trigger priority, P1..P5 (`回合引擎与调度-设计草案.md` §2).
- *
- * P0 (panic) never enters the queue, so it has no value here.
- */
-export type TurnPriority = 'player' | 'session' | 'autopilot' | 'observe' | 'maintenance'
-
-/** What produced a trigger. Kept separate from priority: a choice is P1 like a message. */
-export type TurnTriggerKind =
-  | 'player'
-  | 'choice'
-  | 'autopilot'
-  | 'checkpoint'
-  | 'end'
-  | 'resume'
-  | 'observe'
-  | 'maintenance'
-
-/** One cause for a turn. */
-export interface TurnTrigger {
-  readonly priority: TurnPriority
-  readonly kind: TurnTriggerKind
-  /** Clock timestamp of the trigger. */
-  readonly at: number
-  readonly payload?: {
-    readonly text?: string
-    readonly choiceId?: string
-    /** 0..1 position of a time checkpoint (0.5 / 0.8 / 0.9). */
-    readonly checkpoint?: number
-  }
-}
-
-/** Numeric ordering for "who wins" questions. Lower wins. */
-export const TURN_PRIORITY_ORDER: Readonly<Record<TurnPriority, number>> = {
-  player: 1,
-  session: 2,
-  autopilot: 3,
-  observe: 4,
-  maintenance: 5,
-}
-
-/** Triggers that queue behind a busy turn instead of being dropped. */
-export function queuesWhenBusy(priority: TurnPriority): boolean {
-  return priority === 'player' || priority === 'session'
-}
-
-/** Priority P4 triggers never start a turn; they only refresh context. */
-export function startsTurn(priority: TurnPriority): boolean {
-  return priority !== 'observe' && priority !== 'maintenance'
-}
+// Trigger priorities and their ordering moved to `scheduler.ts` in B2-T4, where
+// the queue lives. They are re-exported here so the existing public surface
+// (`index.ts`, hosts, tests) keeps importing them from the state machine.
+export type { TurnPriority, TurnTrigger, TurnTriggerKind } from './scheduler.ts'
+export { queuesWhenBusy, startsTurn, TURN_PRIORITY_ORDER } from './scheduler.ts'
 
 const ALLOWED: Readonly<Record<TurnState, readonly TurnState[]>> = {
   idle: ['planning', 'paused', 'locked', 'ending'],

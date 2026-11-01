@@ -45,6 +45,7 @@ import { log, recentLogs } from './log.ts'
 import { NodeTextSocketTransport } from './node-socket.ts'
 import { FileAppendOnlyStore, FileDocumentStore, readAuditTail } from './node-storage.ts'
 import { PanicServer } from './panic-server.ts'
+import { DirectoryPackSource, PlayHost } from './play.ts'
 import { cameraSensorSource, DEFAULT_CAMERA_FPS, type CameraHost } from './sensors/camera-host.ts'
 import { createModelRunner, llmSummaryOf, loadLlmSettings, settingsFromConfig, singleCallModel } from './llm.ts'
 import type { LlmSummary, SettingsEnv } from './settings.ts'
@@ -146,6 +147,15 @@ export interface HostRuntime {
   readonly llm: LlmConfig
   /** Key-free LLM status — the only LLM shape the console may display. */
   llmSummary(): LlmSummary
+  /**
+   * Host session service (B1-T16): one pack-backed session per process.
+   *
+   * Exposed for embedded hosts and tests; the console drives it through the
+   * `/api/session/*` routes. Its `panic`/`unlock` methods are wired into the
+   * runtime's own stop path so the engine's LOCKED latch and the registry's
+   * latch move together.
+   */
+  readonly play: PlayHost
   readonly panicToken: string
   readonly panicAddress: { host: string; port: number } | undefined
   /** The control console's token and bind address. */
@@ -399,6 +409,22 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
   }
   const pushFeatures = (sample: FeatureSample): void => { sensors.push(sample) }
 
+  // ── Host session service (B1-T16) ───────────────────────────────────────
+  // One session per process. Packs are read from the documented interim layout
+  // (`content/packs/<id>/<version>/`) until B2-T14's registry owns that lookup;
+  // swapping the source does not change the session API.
+  const play = new PlayHost({
+    clock,
+    audit,
+    registry,
+    policy,
+    waveforms,
+    sensors,
+    runner: modelRunner,
+    savePolicy,
+    packs: new DirectoryPackSource(options.dataDir),
+  })
+
   // ── Device manifest: which units exist and how to reach them ────────────
   // New manifests are seeded with the well-known units; older files are
   // migrated once by the manifest version. From then on the persisted list is
@@ -618,7 +644,11 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
   let panicServer: PanicServer | undefined
   let panicAddress: { host: string; port: number } | undefined
 
-  const panic = async (source: string): Promise<void> => { await registry.emergencyStop(source) }
+  const panic = async (source: string): Promise<void> => {
+    // The session engine's P0 path locks its own latch and its hook cuts the
+    // devices; with no session this still reaches `registry.emergencyStop`.
+    await play.panic(source)
+  }
 
   if (options.withPanicServer !== false) {
     panicServer = new PanicServer({
@@ -641,8 +671,19 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
 
   const dashboardDeps: DashboardDeps = {
     snapshot: () => registry.snapshot(),
+    session: {
+      start: async input => await play.start(input),
+      message: async text => await play.message(text),
+      end: async reason => await play.end(reason),
+      snapshot: () => play.snapshot(),
+    },
     panic,
-    unlock: async note => { await registry.unlock('human', note) },
+    unlock: async note => {
+      await registry.unlock('human', note)
+      // Unlocking is human-only; the engine's LATCH is released by the same
+      // gesture so a panicked session does not stay deaf forever.
+      play.unlock(note)
+    },
     listDevices,
     addDevice: async protocol => addDevice(protocol),
     removeDevice: async key => removeDevice(key),
@@ -727,6 +768,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     sensors,
     modelRunner,
     llm,
+    play,
     panicToken,
     panicAddress,
     dashboardToken,
@@ -751,6 +793,8 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       if (stopped) return
       stopped = true
       controller.abort()
+      // Cancel the session's engine timers/queued turns before the devices go.
+      play.dispose()
       await panicServer?.stop()
       await dashboardServer?.stop()
       await registry.shutdown()

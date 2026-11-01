@@ -95,7 +95,8 @@ export interface ProbeRecord {
  * The one audit method the recorder uses.
  *
  * A deliberately minimal shape: `devices/audit.ts`'s `AuditLog` satisfies it
- * structurally, and the full `reaction_probe` audit contract is A2-T3's.
+ * structurally. The `detail` payload is fixed by {@link auditDetail} (A2-T3):
+ * perception facts only, never a device target percentage or policy cap.
  */
 export interface ProbeAuditSink {
   record(entry: {
@@ -234,24 +235,12 @@ export class ReactionProbeRecorder {
           actor: 'system',
           action: 'reaction_probe',
           result: 'ok',
-          detail: {
-            probeId: record.probeId,
-            turnId: record.turnId,
-            beatId: record.beatId,
-            intentId: record.intentId,
-            trigger: record.trigger,
-            actionAt: record.actionAt,
-            targets: record.targets,
-            baseline: record.baseline,
-            window: record.window,
-            delta: record.delta,
-            verdict: record.verdict,
-            ...(record.reason === undefined ? {} : { reason: record.reason }),
-          },
+          detail: auditDetail(record),
         })
       } catch {
-        // A diagnostic sink must never break probe settling (A2-T3 keeps the
-        // real failure policy; AuditLog.record itself never throws).
+        // A diagnostic sink must never break probe settling: the record is
+        // already settled, and a lost audit line is reported by AuditLog's own
+        // failure handler. The verdict therefore cannot depend on the sink.
       }
     }
   }
@@ -325,6 +314,40 @@ export class ReactionProbeRecorder {
       verdict,
       ...(reason === undefined ? {} : { reason }),
     }
+  }
+}
+
+/**
+ * The exact `detail` of one `reaction_probe` audit line (M2 plan §4.2, A2-T3).
+ *
+ * Key set: `{probeId,turnId,beatId,intentId,trigger,actionAt,targets,baseline,
+ * window,delta,verdict,reason?}` — and nothing else. Two invariants:
+ *
+ * 1. **Perception only.** No device target percentage, policy cap, intensity
+ *    or duration appears here: the audit line must never become a second,
+ *    unaudited channel through which commanded device levels leak into an
+ *    append-only file.
+ * 2. **Targets are ids.** Each target is copied down to
+ *    `{deviceId, channelId}`, so an over-wide caller cannot smuggle a level
+ *    onto the audit trail.
+ *
+ * The recorder calls the sink after the record is settled; a throwing sink is
+ * swallowed there, so the verdict never depends on the audit sink.
+ */
+function auditDetail(record: ProbeRecord): Readonly<Record<string, unknown>> {
+  return {
+    probeId: record.probeId,
+    turnId: record.turnId,
+    beatId: record.beatId,
+    intentId: record.intentId,
+    trigger: record.trigger,
+    actionAt: record.actionAt,
+    targets: record.targets.map(target => ({ deviceId: target.deviceId, channelId: target.channelId })),
+    baseline: record.baseline,
+    window: record.window,
+    delta: record.delta,
+    verdict: record.verdict,
+    ...(record.reason === undefined ? {} : { reason: record.reason }),
   }
 }
 
