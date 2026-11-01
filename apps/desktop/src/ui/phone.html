@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  Phone emergency-stop / status page (A1-T9).
+
+  The page itself is exempt from the control token (a page navigation cannot
+  carry headers, and a phone needs to load it before it can paste the token).
+  Every API call it makes does send `x-control-token`, so an anonymous visitor
+  can look at the page but cannot stop the session.
+
+  This page deliberately does NOT capture camera or audio: phone browsers need
+  a secure context (HTTPS) for getUserMedia, and M2 keeps capture on the PC's
+  USB camera (plan §8.1 conflict #4).
+-->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'">
+<title>Embodied 手机急停</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh;
+    font: 16px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: #0d0d12; color: #e8e8ee;
+    display: flex; align-items: center; justify-content: center;
+  }
+  main { width: min(92vw, 420px); padding: 20px 0; }
+  h1 { font-size: 18px; margin: 0 0 16px; letter-spacing: .04em; }
+  #locked-banner {
+    display: none; margin-bottom: 16px; padding: 12px 16px;
+    background: #3d1420; border: 1px solid #8d2642; border-radius: 12px;
+    font-weight: 650;
+  }
+  #locked-banner.on { display: block; }
+  #status { color: #9a9aa6; font-size: 13px; min-height: 22px; margin-bottom: 18px; }
+  #panic-button {
+    display: block; width: 100%; min-height: 30vh;
+    font-size: 30px; font-weight: 800; letter-spacing: .16em;
+    background: #8d1230; border: 2px solid #c22b4f; color: #fff;
+    border-radius: 22px; cursor: pointer;
+  }
+  #panic-button:hover { background: #a81738; }
+  #panic-button:active { transform: translateY(1px); }
+  #panic-button:disabled { opacity: .45; cursor: default; }
+  .token-row { display: flex; gap: 8px; margin-top: 18px; }
+  .token-row input {
+    flex: 1; min-width: 0; background: #1b1b24; border: 1px solid #34343f; color: inherit;
+    border-radius: 8px; padding: 8px 10px; font: inherit; font-size: 13px;
+  }
+  .token-row button {
+    background: #23232d; border: 1px solid #3a3a46; color: inherit;
+    border-radius: 8px; padding: 8px 14px; font: inherit; font-size: 13px; cursor: pointer;
+  }
+  #message { color: #8a8a96; font-size: 12px; margin-top: 10px; min-height: 18px; }
+  footer { color: #5f5f6a; font-size: 11px; margin-top: 16px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Embodied 手机急停</h1>
+  <div id="locked-banner">输出已被锁定。需要在 PC 控制台解锁后才能重新输出。</div>
+  <div id="status">正在读取状态…</div>
+
+  <button id="panic-button">紧急停止</button>
+
+  <div class="token-row">
+    <input id="token" type="password" autocomplete="off" spellcheck="false"
+           placeholder="控制台 token（控制台 URL 的 ?token= 后面那段）">
+    <button id="save-token">保存</button>
+  </div>
+  <div id="message"></div>
+  <footer>刷新频率 1 秒。所有请求都要带控制台 token；本页不采集摄像头/麦克风。</footer>
+</main>
+<script>
+  (() => {
+    const STORAGE_KEY = 'embodied.dashboard.token'
+    const tokenInput = document.getElementById('token')
+    const panicButton = document.getElementById('panic-button')
+    const lockedBanner = document.getElementById('locked-banner')
+    const statusLine = document.getElementById('status')
+    const messageLine = document.getElementById('message')
+
+    // The console hands out URLs shaped /?token=...; the phone page accepts the
+    // same query so an operator can just scan/paste the whole address once.
+    const fromQuery = new URLSearchParams(location.search).get('token')
+    tokenInput.value = fromQuery || localStorage.getItem(STORAGE_KEY) || ''
+    if (fromQuery) localStorage.setItem(STORAGE_KEY, fromQuery)
+
+    function token() { return tokenInput.value.trim() }
+    function say(text) { messageLine.textContent = text }
+
+    document.getElementById('save-token').addEventListener('click', () => {
+      localStorage.setItem(STORAGE_KEY, token())
+      say('token 已保存到本机浏览器')
+      void refresh()
+    })
+
+    function renderLocked(locked) {
+      lockedBanner.classList.toggle('on', locked)
+      panicButton.disabled = locked
+    }
+
+    async function api(path, init) {
+      const headers = { 'x-control-token': token(), ...(init && init.headers ? init.headers : {}) }
+      return fetch(path, { ...(init || {}), headers })
+    }
+
+    async function refresh() {
+      if (token().length === 0) {
+        renderLocked(false)
+        statusLine.textContent = '请先填入控制台 token'
+        return
+      }
+      try {
+        const response = await api('/api/snapshot')
+        if (response.status === 401) {
+          renderLocked(false)
+          statusLine.textContent = 'token 无效或已更换，请重新填入'
+          return
+        }
+        const snapshot = await response.json()
+        // The banner is driven by the snapshot payload, not by local state:
+        // another device may have triggered the stop.
+        renderLocked(snapshot && snapshot.locked === true)
+        const count = snapshot && Array.isArray(snapshot.devices) ? snapshot.devices.length : 0
+        statusLine.textContent = snapshot && snapshot.locked === true
+          ? '输出已锁定 · ' + count + ' 台设备'
+          : '可输出 · ' + count + ' 台设备'
+      } catch (error) {
+        statusLine.textContent = '连接失败：' + (error && error.message ? error.message : String(error))
+      }
+    }
+
+    async function panic() {
+      if (token().length === 0) {
+        say('急停需要控制台 token；请先填入并保存')
+        return
+      }
+      panicButton.disabled = true
+      say('正在急停…')
+      try {
+        const response = await api('/api/panic', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source: 'phone' }),
+        })
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}))
+          say('急停失败：' + (body.error || response.status))
+          return
+        }
+        say('已急停。输出锁定，需在 PC 控制台解锁。')
+      } catch (error) {
+        say('急停失败：' + (error && error.message ? error.message : String(error)))
+      } finally {
+        void refresh()
+      }
+    }
+
+    panicButton.addEventListener('click', () => { void panic() })
+    setInterval(() => { void refresh() }, 1_000)
+    void refresh()
+  })()
+</script>
+</body>
+</html>

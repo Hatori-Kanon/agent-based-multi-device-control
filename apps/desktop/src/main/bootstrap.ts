@@ -19,6 +19,7 @@ import {
   MonsterPartyBackend,
   parsePolicySnapshot,
   PolicyStore,
+  SensorRegistry,
   serializePolicySnapshot,
   WaveformLibrary,
   XhtkjBackend,
@@ -27,8 +28,11 @@ import {
   type Clock,
   type DeviceBackend,
   type DeviceLifecycle,
+  type FeatureSample,
   type RegistrySnapshot,
+  type SensorStatus,
   type SerializedWaveform,
+  type Snapshot,
 } from '@embodied/core'
 import { IntifaceProcess, type IntifaceAvailability } from './intiface.ts'
 import { DashboardServer, type DashboardDeps } from './dashboard.ts'
@@ -36,6 +40,7 @@ import { log, recentLogs } from './log.ts'
 import { NodeTextSocketTransport } from './node-socket.ts'
 import { FileAppendOnlyStore, FileDocumentStore, readAuditTail } from './node-storage.ts'
 import { PanicServer } from './panic-server.ts'
+import { cameraSensorSource, DEFAULT_CAMERA_FPS, type CameraHost } from './sensors/camera-host.ts'
 
 export interface HostRuntimeOptions {
   /** Root for the audit log, session state, and the panic token. */
@@ -69,6 +74,18 @@ export interface HostRuntimeOptions {
    */
   readonly bleTransport?: BleTransport
   /**
+   * Camera capture host (the Electron hidden-window worker).
+   *
+   * Omitted in headless runs: the sensor registry then simply has no image
+   * source. When supplied, the wiring registers one `SensorSource` and starts
+   * capture unless {@link withCamera} is false (tests, camera disabled).
+   */
+  readonly cameraHost?: CameraHost
+  /** Start camera capture on boot. Defaults to true when a host is supplied. */
+  readonly withCamera?: boolean
+  /** Camera feature push rate; the capture host clamps it to 1-2 Hz. */
+  readonly cameraFps?: number
+  /**
    * MonsterParty share-link token.
    *
    * Operator configuration only. It never becomes a tool argument, a tool
@@ -89,6 +106,14 @@ export interface HostRuntime {
   readonly policy: PolicyStore
   readonly waveforms: WaveformLibrary
   readonly documents: FileDocumentStore
+  /**
+   * Named perception sources (A1-T6).
+   *
+   * Always present and usable: without a camera host it is simply empty, so
+   * `sensors_list` and the console degrade to "no sources" instead of a
+   * missing dependency.
+   */
+  readonly sensors: SensorRegistry
   readonly panicToken: string
   readonly panicAddress: { host: string; port: number } | undefined
   /** The control console's token and bind address. */
@@ -97,6 +122,12 @@ export interface HostRuntime {
   /** Whether an Intiface engine was found, and who owns it. */
   readonly intiface: { availability: IntifaceAvailability; url: string; owned: boolean }
   snapshot(): RegistrySnapshot
+  /** Source list + derived quality + freshness (console `GET /api/sensors`). */
+  sensorsStatus(): readonly SensorStatus[]
+  /** Newest JPEG of one image source, or the first image source when omitted. */
+  sensorFrame(sourceId?: string): Promise<Snapshot | undefined>
+  /** Store one externally captured feature sample (HTTP ingest). */
+  pushFeatures(sample: FeatureSample): void
   /** Human emergency stop from any out-of-band source. */
   panic(source: string): Promise<void>
   /** Persist the durable waveform library. */
@@ -249,6 +280,55 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
 
   const registry = new DeviceRegistry({ clock, audit, policy, waveforms, onError: recordError })
   const controller = new AbortController()
+
+  // ── Perception sources (A1-T6) ──────────────────────────────────────────
+  // One registry always exists, camera or not: the console API and the model
+  // tools then have a single place to read perception from, and "no source"
+  // is a supported state rather than a missing dependency.
+  const sensors = new SensorRegistry({ clock, onError: recordError })
+  if (options.cameraHost !== undefined) {
+    const camera = options.cameraHost
+    sensors.register(cameraSensorSource(camera))
+    // The capture end owns the `unavailable` signal (plan §8.7 ruling 5):
+    // the registry derives `stale` from its clock but must not guess that a
+    // camera disappeared, so the host pushes a sample that says so.
+    camera.onFeatures(sample => {
+      try {
+        sensors.push(sample)
+      } catch (error) {
+        recordError(error)
+      }
+    })
+    if (options.withCamera !== false) {
+      try {
+        const devices = await camera.listDevices()
+        const first = devices[0]
+        if (first === undefined) {
+          log('[camera] no video input found; the sensor source will report unavailable')
+        } else {
+          await camera.start(first.deviceId, { fps: options.cameraFps ?? DEFAULT_CAMERA_FPS })
+        }
+      } catch (error) {
+        recordError(error)
+        // A refused getUserMedia still leaves a registered source; make its
+        // loss explicit instead of letting it read as "camera fine, no data".
+        try {
+          sensors.push({ sourceId: camera.sourceId, ts: clock.now(), frameAgeMs: 0, quality: 'unavailable' })
+        } catch (pushError) {
+          recordError(pushError)
+        }
+      }
+    }
+  }
+  const firstImageSourceId = (): string | undefined =>
+    sensors.statuses().find(status => status.kind === 'image')?.id
+  const sensorsStatus = (): readonly SensorStatus[] => sensors.statuses()
+  const sensorFrame = async (sourceId?: string): Promise<Snapshot | undefined> => {
+    const target = sourceId ?? firstImageSourceId()
+    if (target === undefined) return undefined
+    return sensors.latestSnapshot(target)
+  }
+  const pushFeatures = (sample: FeatureSample): void => { sensors.push(sample) }
 
   // ── Device manifest: which units exist and how to reach them ────────────
   // New manifests are seeded with the well-known units; older files are
@@ -543,6 +623,9 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     },
     auditTail: async limit => readAuditTail(join(options.dataDir, 'audit', 'device.jsonl'), limit),
     recentErrors: () => recentErrors,
+    sensorsStatus,
+    sensorFrame,
+    pushFeatures,
     recentLogs,
   }
 
@@ -550,6 +633,8 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     dashboardServer = new DashboardServer({
       deps: dashboardDeps,
       token: dashboardToken,
+      // Ingested samples are stamped on the runtime's clock, never Date.now.
+      now: () => clock.now(),
       ...(options.dashboardHost === undefined ? {} : { host: options.dashboardHost }),
       ...(options.dashboardPort === undefined ? {} : { port: options.dashboardPort }),
       ...(options.dashboardStaticDir === undefined ? {} : { staticDir: options.dashboardStaticDir }),
@@ -570,6 +655,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     policy,
     waveforms,
     documents,
+    sensors,
     panicToken,
     panicAddress,
     dashboardToken,
@@ -580,6 +666,9 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       owned: intifaceProcess.owned,
     },
     snapshot: () => registry.snapshot(),
+    sensorsStatus,
+    sensorFrame,
+    pushFeatures,
     panic,
     saveWaveforms,
     savePolicy,

@@ -340,3 +340,62 @@ export {
   PROVIDER_CHAT_BASE_URLS,
 } from './agent/adapters/openai-compatible.ts'
 export type { ModelCapabilities, OpenAICompatibleOptions } from './agent/adapters/openai-compatible.ts'
+
+// ── M2 · model tool surface and prompts (B1-T8..T9) ─────────────────────
+export {
+  BEAT_PLAN_ENGINE_FIELDS,
+  isModelTool,
+  M2_HUMAN_ONLY_TOOL_NAMES,
+  M2_MODEL_TOOL_NAMES,
+  M2_MODEL_TOOLS,
+  M2_TOOL_SCHEMAS,
+  M2_TOOL_SCHEMAS_BY_NAME,
+} from './agent/tools.ts'
+export type { M2HumanOnlyToolName, M2ModelToolName, M2ToolName } from './agent/tools.ts'
+export {
+  buildSystemPrompt,
+  buildTurnMessages,
+  DEFAULT_SYSTEM_PROMPT_BUDGET_CHARS,
+  PROMPT_SACRIFICE_ORDER,
+  PROMPT_SECTION_ORDER,
+  PROMPT_TRUNCATION_MARK,
+} from './agent/prompt.ts'
+export type { PromptSectionKey, SystemPromptInput, TurnMessagesInput } from './agent/prompt.ts'
+
+// ── M2 · perception projections / look (A1-T7..T8) ───────────────────────
+export { DEFAULT_SENSOR_BLOCK_BUDGET, sensorPromptBlock, sensorsListPayload } from './sensors/projection.ts'
+export type { SensorsListPayload } from './sensors/projection.ts'
+export { DEFAULT_LOOK_MAX_AGE_MS, DEFAULT_LOOK_MAX_BYTES, readForLook } from './sensors/look.ts'
+export type { ImageForModel, LookOptions } from './sensors/look.ts'
+
+// ── M2 · plan execution (B1-T7) ─────────────────────────────────────────
+export { PlanExecutor } from './execution/executor.ts'
+export type {
+  DispatchDiagnostics,
+  DispatchResult,
+  DispatchStatus,
+  PlanExecutorOptions,
+  ProbeAction,
+  ProbeRegistrar,
+  ProbeTarget,
+} from './execution/executor.ts'
+
+// ── M2 · pack import and registry (B2-T14 core half) ────────────────────
+export { MAX_ZIP_BYTES, MAX_ZIP_ENTRIES, readZip, ZipError } from './scenario/zip.ts'
+export type { RawInflate, ReadZipOptions, ZipErrorCode } from './scenario/zip.ts'
+export {
+  MemoryPackStore,
+  PACKS_PREFIX,
+  PackRegistry,
+  PackRegistryError,
+  REGISTRY_KEY,
+} from './scenario/pack-registry.ts'
+export type {
+  InstallPackOptions,
+  InstallResult,
+  InstalledPackVersion,
+  PackRegistryEntry,
+  PackRegistryErrorCode,
+  PackRegistryOptions,
+  PackStore,
+} from './scenario/pack-registry.ts'

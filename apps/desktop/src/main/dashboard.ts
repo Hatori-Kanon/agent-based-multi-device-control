@@ -16,6 +16,8 @@ import type { AddressInfo } from 'node:net'
 import { dirname, join, normalize, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ChannelPolicy } from '@embodied/core'
+import { isSensorError } from '@embodied/core'
+import type { FeatureSample, SensorQuality, SensorStatus, Snapshot } from '@embodied/core'
 import type { DeviceManagerEntry, DeviceProtocol } from './bootstrap.ts'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -56,6 +58,12 @@ export interface DashboardDeps {
   recentErrors(): { ts: number; message: string }[]
   /** Background diagnostic log ring buffer (newest last). */
   recentLogs(): string[]
+  /** Perception sources + derived quality + freshness (A1-T6). */
+  sensorsStatus(): readonly SensorStatus[]
+  /** Newest JPEG of one image source; undefined when none is available. */
+  sensorFrame(sourceId?: string): Promise<Snapshot | undefined>
+  /** Store one externally captured feature sample (unknown source → 400). */
+  pushFeatures(sample: FeatureSample): void
 }
 
 export interface DashboardServerOptions {
@@ -68,6 +76,8 @@ export interface DashboardServerOptions {
   readonly staticDir?: string
   /** In-memory static content; takes precedence over `staticDir`. */
   readonly staticFiles?: Readonly<Record<string, string>>
+  /** Clock used to stamp ingested feature samples. Defaults to `Date.now`. */
+  readonly now?: () => number
   readonly onError?: (error: unknown) => void
 }
 
@@ -158,6 +168,55 @@ function asPolicyPatch(value: unknown): Partial<ChannelPolicy> | undefined {
   return Object.keys(patch).length === 0 ? undefined : patch
 }
 
+/** Perceived qualities an external capture end may report. */
+const SENSOR_QUALITIES: readonly SensorQuality[] = ['ok', 'dim', 'bright', 'blocked', 'stale', 'unavailable']
+
+function asSensorQuality(value: unknown): SensorQuality | undefined {
+  return typeof value === 'string' && (SENSOR_QUALITIES as readonly string[]).includes(value)
+    ? (value as SensorQuality)
+    : undefined
+}
+
+/** Optional numeric feature fields a capture end may report. */
+type FeatureNumbers = Pick<
+  FeatureSample,
+  | 'motionEnergy'
+  | 'motionPeak'
+  | 'staticRatio'
+  | 'centerMotionRatio'
+  | 'lumaMean'
+  | 'lumaStd'
+  | 'overexposedRatio'
+  | 'underexposedRatio'
+  | 'audioLevelPct'
+  | 'bpm'
+>
+
+const FEATURE_NUMBER_KEYS = [
+  'motionEnergy',
+  'motionPeak',
+  'staticRatio',
+  'centerMotionRatio',
+  'lumaMean',
+  'lumaStd',
+  'overexposedRatio',
+  'underexposedRatio',
+  'audioLevelPct',
+  'bpm',
+] as const satisfies readonly (keyof FeatureNumbers)[]
+
+/** Absent features stay absent — never fabricated as 0 (same rule as core). */
+function asFeatureFields(body: Record<string, unknown>): Partial<FeatureNumbers> {
+  const out: Partial<FeatureNumbers> = {}
+  for (const key of FEATURE_NUMBER_KEYS) {
+    const value = body[key]
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      ;(out as Record<string, number>)[key] = value
+    }
+  }
+  return out
+}
+
 /** Static file allowlist with traversal containment. */
 function resolveStatic(staticDir: string, safeName: string): string | undefined {
   const resolved = join(staticDir, safeName)
@@ -171,11 +230,19 @@ const STATIC_TYPES: Readonly<Record<string, string>> = {
   '.css': 'text/css; charset=utf-8',
 }
 
+/** Static console files. `/phone` is an alias for the phone stop page (A1-T9). */
+const STATIC_FILES = new Set(['index.html', 'app.js', 'style.css', 'phone.html'])
+
 export class DashboardServer {
   private server: Server | undefined
 
   constructor(private readonly options: DashboardServerOptions) {
     if (options.token.length < 16) throw new Error('dashboard token must be at least 16 characters')
+  }
+
+  /** One clock for ingested samples, injectable so tests get deterministic ts. */
+  private now(): number {
+    return this.options.now?.() ?? Date.now()
   }
 
   start(): Promise<{ host: string; port: number }> {
@@ -252,10 +319,13 @@ export class DashboardServer {
       return
     }
 
-    // Static console files.
+    // Static console files. `/phone` is the phone stop/status page (A1-T9):
+    // a page navigation cannot carry headers, so it is exempt from the token
+    // like the console itself — the page's own API calls still authenticate.
     if (request.method === 'GET' && !isApi) {
-      const safeName = normalize(pathname === '/' ? '/index.html' : pathname).replace(/^([/\\])+/u, '')
-      if (!new Set(['index.html', 'app.js', 'style.css']).has(safeName)) {
+      const requested = pathname === '/' ? '/index.html' : pathname === '/phone' ? '/phone.html' : pathname
+      const safeName = normalize(requested).replace(/^([/\\])+/u, '')
+      if (!STATIC_FILES.has(safeName)) {
         sendError(response, 404, 'not found')
         return
       }
@@ -277,6 +347,62 @@ export class DashboardServer {
         'Cache-Control': 'no-store',
       })
       response.end(content)
+      return
+    }
+
+    if (request.method === 'GET' && pathname === '/api/sensors') {
+      sendJson(response, 200, { sources: this.options.deps.sensorsStatus() })
+      return
+    }
+
+    if (request.method === 'GET' && pathname === '/api/sensors/frame') {
+      const snapshot = await this.options.deps.sensorFrame(asOptionalString(url.searchParams.get('sourceId')))
+      if (snapshot === undefined) {
+        sendError(response, 404, 'no snapshot is available for that sensor source')
+        return
+      }
+      const bytes = Buffer.from(snapshot.bytes)
+      response.writeHead(200, {
+        'Content-Type': snapshot.mime,
+        'Content-Length': bytes.length,
+        'Cache-Control': 'no-store',
+        'X-Sensor-Ts': String(snapshot.ts),
+      })
+      response.end(bytes)
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/sensors/features') {
+      const body = await readJsonBody(request)
+      const sourceId = asOptionalString(body.sourceId)
+      if (sourceId === undefined) {
+        sendError(response, 400, 'sourceId is required')
+        return
+      }
+      const quality = asSensorQuality(body.quality)
+      if (quality === undefined) {
+        sendError(response, 400, `quality must be one of: ${SENSOR_QUALITIES.join(', ')}`)
+        return
+      }
+      const sample: FeatureSample = {
+        sourceId,
+        ts: asNumber(body.ts, this.now()),
+        frameAgeMs: asNumber(body.frameAgeMs, 0),
+        quality,
+        ...asFeatureFields(body),
+      }
+      try {
+        this.options.deps.pushFeatures(sample)
+      } catch (error) {
+        // A capture end pushing for a source nobody registered is a caller
+        // bug, not a server fault: answer 400 with the registry's own words.
+        if (isSensorError(error) && error.code === 'UNKNOWN_SOURCE') {
+          sendError(response, 400, error.message)
+          return
+        }
+        throw error
+      }
+      sendJson(response, 200, { ok: true, sourceId })
       return
     }
 

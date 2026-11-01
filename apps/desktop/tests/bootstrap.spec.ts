@@ -412,3 +412,19 @@ describe('waveform persistence', () => {  it('carries a promoted waveform across
     expect(revived.waveforms.require(kept.id).frames).toEqual(kept.frames)
   })
 })
+
+describe('perception wiring', () => {
+  it('always exposes a sensor registry and degrades to no sources without a camera', async () => {
+    const clock = new FakeClock()
+    runtime = await createHostRuntime({ dataDir: root, clock, withPanicServer: false, withButtplug: false })
+
+    expect(runtime.sensorsStatus()).toEqual([])
+    expect(await runtime.sensorFrame()).toBeUndefined()
+    // An external capture end cannot invent a source: the registry throws its
+    // typed UNKNOWN_SOURCE error, which the HTTP layer maps to 400.
+    expect(() => {
+      runtime!.pushFeatures({ sourceId: 'ghost-cam', ts: clock.now(), frameAgeMs: 0, quality: 'ok' })
+    }).toThrow(/ghost-cam/)
+    expect(runtime.sensors.statuses()).toEqual([])
+  })
+})

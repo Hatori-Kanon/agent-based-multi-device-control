@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'">
+<title>Camera worker</title>
+</head>
+<body style="margin:0;background:#000">
+<!--
+  Hidden capture worker.
+
+  `getUserMedia` and a real <video>/<canvas> only exist in a renderer, so this
+  page owns the MediaStream and the 32x24 grey downsampling. The main process
+  drives it through executeJavaScript (the same pattern as the BLE worker) and
+  receives the documented `{type:'features',sample}` / `{type:'jpeg',bytes}`
+  payloads.
+
+  The page loads `dist/camera-renderer.js`, an esbuild bundle of camera.js that
+  also contains the shared @embodied/core feature extractor — so the renderer
+  and the unit tests run exactly the same feature code.
+
+  The video element is 1x1 and transparent rather than display:none: some
+  Chromium builds stop presenting frames for a display:none video, and a
+  frame-starved canvas reads as a dead camera.
+-->
+<video id="video" playsinline muted
+       style="position:fixed;width:1px;height:1px;opacity:0;pointer-events:none"></video>
+<script src="../../dist/camera-renderer.js"></script>
+</body>
+</html>

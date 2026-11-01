@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { FakeClock, type AuditRecord } from '@embodied/core'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createHostRuntime, type HostRuntime } from '../src/main/bootstrap.ts'
+import type { CameraHost } from '../src/main/sensors/camera-host.ts'
 
 let root: string
 let runtime: HostRuntime | undefined
@@ -273,5 +274,166 @@ describe('DashboardServer', () => {
     const host = await start()
     const response = await fetch(`${base(host)}/api/does-not-exist`, { headers: headers(host.dashboardToken) })
     expect(response.status).toBe(404)
+  })
+})
+
+/** A camera host that records whether capture was started. */
+function fakeCameraHost(): { host: CameraHost; startCalls: () => number } {
+  let startCalls = 0
+  const host: CameraHost = {
+    sourceId: 'usb-cam-1',
+    label: 'USB 摄像头',
+    listDevices: async () => [{ deviceId: 'cam-1', label: 'USB Camera' }],
+    start: async () => { startCalls += 1 },
+    stop: async () => {},
+    latestJpeg: async () => undefined,
+    onFeatures: () => () => {},
+  }
+  return { host, startCalls: () => startCalls }
+}
+
+describe('perception wiring', () => {
+  it('wires a sensor registry without starting a camera when the camera flag is off', async () => {
+    const clock = new FakeClock()
+    const camera = fakeCameraHost()
+    const host = await createHostRuntime({
+      dataDir: root,
+      clock,
+      withPanicServer: false,
+      withButtplug: false,
+      cameraHost: camera.host,
+      withCamera: false,
+    })
+    runtime = host
+
+    // The source exists from boot, but capture never starts while the flag is off.
+    expect(camera.startCalls()).toBe(0)
+    expect(host.sensorsStatus()).toHaveLength(1)
+    expect(host.sensorsStatus()[0]).toMatchObject({ id: 'usb-cam-1', kind: 'image', quality: 'unavailable' })
+
+    const response = await fetch(`${base(host)}/api/sensors`, { headers: headers(host.dashboardToken) })
+    expect(response.status).toBe(200)
+    const body = await response.json() as { sources: Array<{ id: string; kind: string; quality: string }> }
+    expect(body.sources).toHaveLength(1)
+    expect(body.sources[0]).toMatchObject({ id: 'usb-cam-1', kind: 'image', quality: 'unavailable' })
+  })
+
+  it('starts the camera when the flag allows it', async () => {
+    const clock = new FakeClock()
+    const camera = fakeCameraHost()
+    runtime = await createHostRuntime({
+      dataDir: root,
+      clock,
+      withPanicServer: false,
+      withButtplug: false,
+      cameraHost: camera.host,
+    })
+    expect(camera.startCalls()).toBe(1)
+  })
+
+  it('answers 400 for a feature sample of an unregistered source instead of 500', async () => {
+    const host = await start()
+    const response = await fetch(`${base(host)}/api/sensors/features`, {
+      method: 'POST',
+      headers: headers(host.dashboardToken, true),
+      body: JSON.stringify({ sourceId: 'ghost-cam', quality: 'ok', ts: 0, frameAgeMs: 0, lumaMean: 99 }),
+    })
+    expect(response.status).toBe(400)
+    const body = await response.json() as { ok: boolean; error: string }
+    expect(body.ok).toBe(false)
+    expect(body.error).toContain('ghost-cam')
+  })
+
+  it('accepts a feature sample for a registered source and serves its JPEG frame', async () => {
+    const clock = new FakeClock()
+    const camera = fakeCameraHost()
+    camera.host.latestJpeg = async () => ({ bytes: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), ts: clock.now() })
+    const host = await createHostRuntime({
+      dataDir: root,
+      clock,
+      withPanicServer: false,
+      withButtplug: false,
+      cameraHost: camera.host,
+      withCamera: false,
+    })
+    runtime = host
+
+    const push = await fetch(`${base(host)}/api/sensors/features`, {
+      method: 'POST',
+      headers: headers(host.dashboardToken, true),
+      body: JSON.stringify({
+        sourceId: 'usb-cam-1',
+        quality: 'ok',
+        frameAgeMs: 5,
+        motionEnergy: 0.2,
+        lumaMean: 120,
+      }),
+    })
+    expect(push.status).toBe(200)
+
+    const listed = await fetch(`${base(host)}/api/sensors`, { headers: headers(host.dashboardToken) })
+    const sensors = await listed.json() as { sources: Array<{ id: string; quality: string; lastTs?: number }> }
+    expect(sensors.sources[0]).toMatchObject({ id: 'usb-cam-1', quality: 'ok' })
+    // The injected clock stamps the sample, never the wall clock.
+    expect(sensors.sources[0]?.lastTs).toBe(clock.now())
+
+    const frame = await fetch(`${base(host)}/api/sensors/frame?sourceId=usb-cam-1`, {
+      headers: headers(host.dashboardToken),
+    })
+    expect(frame.status).toBe(200)
+    expect(frame.headers.get('content-type')).toBe('image/jpeg')
+    expect([...new Uint8Array(await frame.arrayBuffer())]).toEqual([0xff, 0xd8, 0xff, 0xd9])
+    expect(frame.headers.get('x-sensor-ts')).toBe(String(clock.now()))
+
+    const missing = await fetch(`${base(host)}/api/sensors/frame?sourceId=nope`, {
+      headers: headers(host.dashboardToken),
+    })
+    expect(missing.status).toBe(404)
+  })
+})
+
+describe('phone stop page', () => {
+  it('serves the phone page without a token but refuses its panic post without one', async () => {
+    const host = await start()
+
+    const page = await fetch(`${base(host)}/phone`)
+    expect(page.status).toBe(200)
+    expect(page.headers.get('content-type')).toContain('text/html')
+    const html = await page.text()
+    expect(html).toContain('panic-button')
+    expect(html).toContain('/api/panic')
+    expect(html).toContain('紧急停止')
+
+    const anonymous = await fetch(`${base(host)}/api/panic`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'phone' }),
+    })
+    expect(anonymous.status).toBe(401)
+
+    const allowed = await fetch(`${base(host)}/api/panic`, {
+      method: 'POST',
+      headers: headers(host.dashboardToken, true),
+      body: JSON.stringify({ source: 'phone' }),
+    })
+    expect(allowed.status).toBe(200)
+    expect(((await allowed.json()) as { locked: boolean }).locked).toBe(true)
+  })
+
+  it('renders the locked banner from the snapshot payload', async () => {
+    const host = await start()
+    const html = await (await fetch(`${base(host)}/phone`)).text()
+    // The page carries the banner element and reads it from the snapshot API.
+    expect(html).toContain('id="locked-banner"')
+    expect(html).toContain('/api/snapshot')
+    expect(html).toContain('locked')
+
+    await fetch(`${base(host)}/api/panic`, {
+      method: 'POST',
+      headers: headers(host.dashboardToken, true),
+      body: JSON.stringify({ source: 'phone' }),
+    })
+    const snapshot = await fetch(`${base(host)}/api/snapshot`, { headers: headers(host.dashboardToken) })
+    expect(((await snapshot.json()) as { locked: boolean }).locked).toBe(true)
   })
 })

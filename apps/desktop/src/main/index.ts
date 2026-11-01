@@ -14,6 +14,7 @@ import type { ChannelPolicy } from '@embodied/core'
 import { createBleWorker, type BleWorker } from './ble/electron-bridge.ts'
 import { createHostRuntime, type HostRuntime } from './bootstrap.ts'
 import { readAuditTail } from './node-storage.ts'
+import { createCameraWorker, type CameraWorker } from './sensors/camera-window.ts'
 
 /** Global emergency stop. Chosen to be reachable one-handed and unlikely to clash. */
 const PANIC_ACCELERATOR = 'Control+Alt+X'
@@ -23,12 +24,13 @@ const PANIC_ACCELERATOR = 'Control+Alt+X'
  * prints it at startup so a stale dist/main.mjs is never mistaken for current
  * code — which already cost one debugging round.
  */
-const BUILD_TOKEN = 'embodied-build-c8fb7'
+const BUILD_TOKEN = 'embodied-build-c8fb8'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
 let runtime: HostRuntime | undefined
 let bleWorker: BleWorker | undefined
+let cameraWorker: CameraWorker | undefined
 let window: BrowserWindow | undefined
 let quitting = false
 
@@ -146,13 +148,22 @@ async function createWindow(): Promise<void> {
 async function shutdown(): Promise<void> {
   const current = runtime
   const worker = bleWorker
+  const camera = cameraWorker
   runtime = undefined
   bleWorker = undefined
+  cameraWorker = undefined
   if (current !== undefined) {
     try {
       await current.shutdown()
     } catch (error) {
       console.error('[embodied] shutdown failed', error)
+    }
+  }
+  if (camera !== undefined) {
+    try {
+      await camera.close()
+    } catch (error) {
+      console.error('[embodied] camera worker shutdown failed', error)
     }
   }
   if (worker !== undefined) {
@@ -165,7 +176,7 @@ async function shutdown(): Promise<void> {
 }
 
 app.on('before-quit', event => {
-  if (quitting || (runtime === undefined && bleWorker === undefined)) return
+  if (quitting || (runtime === undefined && bleWorker === undefined && cameraWorker === undefined)) return
   quitting = true
   event.preventDefault()
   void shutdown().finally(() => { app.exit(0) })
@@ -185,20 +196,20 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
 
 void app.whenReady().then(async () => {
   console.log(`[embodied] build token: ${BUILD_TOKEN}`)
-  // Web Bluetooth requests flow through Electron's session permission system.
-  // Without granting `bluetooth` the hidden worker's requestDevice is refused
-  // with zero candidates and no error details — the console then reports
-  // "no Bluetooth devices were found at all" on machines with a perfectly
-  // healthy adapter. This is the permission-layer half of the pair; the
-  // device-selection half is the `select-bluetooth-device` handler in
-  // createBleWorker.
+  // Web Bluetooth and camera capture both flow through Electron's session
+  // permission system. Without granting `bluetooth` the hidden worker's
+  // requestDevice is refused with zero candidates and no error details — the
+  // console then reports "no Bluetooth devices were found at all" on machines
+  // with a perfectly healthy adapter. Without `media` the hidden camera page's
+  // getUserMedia is refused the same silent way.
+  const allowedPermissions = new Set(['bluetooth', 'media'])
   session.defaultSession.setPermissionCheckHandler((_contents, permission) => {
-    // Electron's TypeScript union does not list 'bluetooth' yet, though the
-    // runtime ships it; cast through string.
-    return (permission as string) === 'bluetooth'
+    // Electron's TypeScript union does not list every runtime permission yet;
+    // cast through string.
+    return allowedPermissions.has(permission as string)
   })
   session.defaultSession.setPermissionRequestHandler((_contents, permission, callback) => {
-    callback((permission as string) === 'bluetooth')
+    callback(allowedPermissions.has(permission as string))
   })
 
   // The BLE worker is optional: without it the runtime still serves the mock
@@ -206,6 +217,14 @@ void app.whenReady().then(async () => {
   // Bluetooth adapter.
   try {
     bleWorker = await createBleWorker(reportError)
+  } catch (error) {
+    reportError(error)
+  }
+
+  // Same for the camera worker: a machine without a camera (or with the OS
+  // camera privacy switch off) still runs the console and the mock devices.
+  try {
+    cameraWorker = await createCameraWorker({ onError: reportError })
   } catch (error) {
     reportError(error)
   }
@@ -218,6 +237,7 @@ void app.whenReady().then(async () => {
     // dashboard.ts depends on whether the code runs from src/ or dist/.
     dashboardStaticDir: join(app.getAppPath(), 'src', 'ui'),
     ...(bleWorker === undefined ? {} : { bleTransport: bleWorker.transport }),
+    ...(cameraWorker === undefined ? {} : { cameraHost: cameraWorker.host }),
     // Operator configuration only; never reaches a tool argument or result.
     ...(process.env.EMBODIED_MONSTERPARTY_TOKEN === undefined
       ? {}

@@ -6,7 +6,7 @@
   "description": "Electron shell hosting the device safety runtime",
   "main": "dist/main.mjs",
   "scripts": {
-    "build": "esbuild src/main/index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/main.mjs --external:electron --external:ws && esbuild src/main/preload.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/preload.cjs --external:electron && esbuild src/main/ble/preload-ble.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/preload-ble.cjs --external:electron",
+    "build": "esbuild src/main/index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/main.mjs --external:electron --external:ws && esbuild src/main/preload.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/preload.cjs --external:electron && esbuild src/main/ble/preload-ble.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/preload-ble.cjs --external:electron && esbuild src/main/sensors/preload-camera.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/preload-camera.cjs --external:electron && esbuild src/renderer/camera.js --bundle --platform=browser --target=chrome120 --format=iife --outfile=dist/camera-renderer.js",
     "build:dev": "esbuild src/dev-server.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/dev-server.mjs --external:ws --loader:.html=text --loader:.js=text",
     "dev": "pnpm run build:dev && node dist/dev-server.mjs",
     "start": "pnpm run build && electron .",
