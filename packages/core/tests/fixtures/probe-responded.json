@@ -1,0 +1,12 @@
+{
+  "name": "responded-on-motion-delta",
+  "expect": { "verdict": "responded" },
+  "action": { "turnId": 7, "beatId": "b1", "intentId": "probe-touch", "at": 1500 },
+  "samples": [
+    { "sourceId": "usb-cam-1", "kind": "image", "ts": 0, "motionEnergy": 0.05, "motionPeak": 0.06 },
+    { "sourceId": "usb-cam-1", "kind": "image", "ts": 1000, "motionEnergy": 0.04, "motionPeak": 0.05 },
+    { "sourceId": "usb-cam-1", "kind": "image", "ts": 1500, "motionEnergy": 0.12, "motionPeak": 0.13 },
+    { "sourceId": "usb-cam-1", "kind": "image", "ts": 2500, "motionEnergy": 0.2, "motionPeak": 0.3 },
+    { "sourceId": "usb-cam-1", "kind": "image", "ts": 3500, "motionEnergy": 0.18, "motionPeak": 0.26 }
+  ]
+}

@@ -5,10 +5,15 @@
  * the engine only needs to answer "does this version fall inside this range".
  * Supported range forms are:
  *
- * - exact `1.2.3`
- * - `>=1.2.3` and/or `<2.0.0` comparators, space separated (`">=0.2 <1.0"`)
- * - caret `^1.2.3` (same-major up to the next major, or next minor when major is 0)
- * - tilde `~1.2.3` (same minor)
+ * - exact `1.2.3`; a partial exact like `1.2` is accepted and means exactly
+ *   **`1.2.0`** — it is not a wildcard and does not match `1.2.9`;
+ * - `>=1.2.3` and/or `<2.0.0` comparators, space separated (`">=0.2 <1.0"`).
+ *   Repeated comparators intersect with AND semantics, the way npm treats
+ *   them: the effective lower bound is the **maximum** of every `>=` operand
+ *   and the effective upper bound is the **minimum** of every `<` operand
+ *   (`">=2.0 >=1.0"` is `>=2.0.0`, not `>=1.0.0`);
+ * - caret `^1.2.3` (same-major up to the next major, or next minor when major is 0);
+ * - tilde `~1.2.3` (same minor).
  *
  * Anything else — `>`, `<=`, wildcards, `||`, prerelease tags, build metadata —
  * throws instead of guessing: an authoring mistake in `pack.json#engine` must
@@ -105,12 +110,15 @@ function parseBounds(range: string): Bounds {
   for (const token of tokens) {
     if (token.startsWith('>=')) {
       const operand = parsePartial(token.slice(2))
-      lowerInclusive = { major: operand.major, minor: operand.minor, patch: operand.patch }
+      // AND semantics (npm): the tightest lower bound wins, so
+      // ">=2.0 >=1.0" means >=2.0.0 rather than the last token winning.
+      if (lowerInclusive === undefined || compare(operand, lowerInclusive) > 0) lowerInclusive = operand
       continue
     }
     if (token.startsWith('<')) {
       const operand = parsePartial(token.slice(1))
-      upperExclusive = { major: operand.major, minor: operand.minor, patch: operand.patch }
+      // AND semantics: the tightest upper bound wins ("<2.0 <1.5" is <1.5.0).
+      if (upperExclusive === undefined || compare(operand, upperExclusive) < 0) upperExclusive = operand
       continue
     }
     if (token.startsWith('^') || token.startsWith('~')) {
@@ -125,6 +133,7 @@ function parseBounds(range: string): Bounds {
     if (PARTIAL_VERSION.test(token)) {
       if (tokens.length !== 1) unsupported(`combined range "${range}"`)
       const operand = parsePartial(token)
+      // Explicit, intentional semantics: "1.2" means 1.2.0, not 1.2.x.
       exact = { major: operand.major, minor: operand.minor, patch: operand.patch }
       continue
     }

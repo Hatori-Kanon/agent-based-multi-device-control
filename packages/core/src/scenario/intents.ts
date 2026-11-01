@@ -345,6 +345,9 @@ function buildBody(
   warnings: string[],
 ): BodyResult {
   const policy = policyOf(channel)
+  // D16/R1: `texture` may arrive on the change (D9's landing place) or on the
+  // beat. It is carried through as `modulation` only — M2 never applies it.
+  const modulation = change?.texture ?? beat.texture
 
   // `stop` is the one intent whose resolution is not a strength ratio.
   // A zero level is how the registry stops a channel: `percent 0` with no
@@ -369,7 +372,7 @@ function buildBody(
         envelope: steadyEnvelope(percent),
         durationSec: timing.durationSec,
         ...(waveform.waveformId === undefined ? {} : { waveformId: waveform.waveformId }),
-        ...(beat.texture === undefined ? {} : { modulation: beat.texture }),
+        ...(modulation === undefined ? {} : { modulation }),
       },
       clamped: timing.clamped,
       degraded: waveform.degraded,
@@ -379,8 +382,10 @@ function buildBody(
   if (change?.kind === 'level') {
     const requested = requestPercent(change, channel, policy, strength)
     const percent = clampPercentToPolicy(policy, requested)
-    // A level change keeps its own hold time, else inherits the intent's
-    // suggestion (e.g. ambient-field's 30s), else the documented 2s default.
+    // R4/§4.3: a level change's `durationSec` is an authorised hold time. It
+    // wins over the intent's suggestion (e.g. ambient-field's 30s), else the
+    // documented 2s default applies; either way it is clamped to the
+    // channel's `maxDurationSec` (the registry enforces the same bound).
     const suggested = intent.suggest?.durationSec
     const timing = clampDuration(change.durationSec ?? suggested, channel, beat.id, warnings)
     return {
@@ -403,7 +408,7 @@ function buildBody(
         envelope: presetEnvelope(suggest.preset, percent),
         durationSec: timing.durationSec,
         ...(waveform.waveformId === undefined ? {} : { waveformId: waveform.waveformId }),
-        ...(beat.texture === undefined ? {} : { modulation: beat.texture }),
+        ...(modulation === undefined ? {} : { modulation }),
       },
       clamped: timing.clamped,
       degraded: waveform.degraded,
@@ -417,7 +422,7 @@ function buildBody(
         envelope: steadyEnvelope(percent),
         durationSec: timing.durationSec,
         ...(waveform.waveformId === undefined ? {} : { waveformId: waveform.waveformId }),
-        ...(beat.texture === undefined ? {} : { modulation: beat.texture }),
+        ...(modulation === undefined ? {} : { modulation }),
       },
       clamped: timing.clamped,
       degraded: waveform.degraded,

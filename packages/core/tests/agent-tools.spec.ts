@@ -62,7 +62,8 @@ function collectPropertyRefs(tools: readonly ToolDefinition[]): PropertyRef[] {
 
 function planContext(): PlanContext {
   const intents = new Map<string, FeedbackIntent>(DEFAULT_INTENTS.map(intent => [intent.id, intent]))
-  return { intents, regions: ['chest', 'whole-body'] }
+  // R3: turnId/phase are engine-injected through the context, never from model JSON.
+  return { intents, regions: ['chest', 'whole-body'], turnId: 1, phase: 'build' }
 }
 
 /** A plan whose shape follows the apply_plan argument schema exactly. */
@@ -254,6 +255,9 @@ describe('M2 model tool surface', () => {
     const { plan, dropped, warnings } = parseBeatPlan(sample, ctx)
     expect(dropped).toEqual([])
     expect(warnings).toEqual([])
+    // R3: the parser takes the engine fields from the context only.
+    expect(plan.turnId).toBe(1)
+    expect(plan.phase).toBe('build')
     expect(plan.pacing).toBe('build')
     expect(plan.nextTurnAfterSec).toBe(20)
     expect(plan.beats).toHaveLength(1)

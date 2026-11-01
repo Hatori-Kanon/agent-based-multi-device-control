@@ -362,11 +362,27 @@ export {
 } from './agent/prompt.ts'
 export type { PromptSectionKey, SystemPromptInput, TurnMessagesInput } from './agent/prompt.ts'
 
+export { APPLY_PLAN_TOOL, DEFAULT_TURN_TIMEOUT_MS, LOOK_TOOL, runTurn } from './agent/loop.ts'
+export type { TurnExecutor, TurnLoopInput, TurnLoopOptions, TurnResult } from './agent/loop.ts'
+
 // ── M2 · perception projections / look (A1-T7..T8) ───────────────────────
 export { DEFAULT_SENSOR_BLOCK_BUDGET, sensorPromptBlock, sensorsListPayload } from './sensors/projection.ts'
 export type { SensorsListPayload } from './sensors/projection.ts'
 export { DEFAULT_LOOK_MAX_AGE_MS, DEFAULT_LOOK_MAX_BYTES, readForLook } from './sensors/look.ts'
 export type { ImageForModel, LookOptions } from './sensors/look.ts'
+
+export { DEFAULT_PROBE_THRESHOLDS, ReactionProbeRecorder } from './sensors/probe.ts'
+export type {
+  ProbeAction,
+  ProbeAuditSink,
+  ProbeDegradeReason,
+  ProbeRecord,
+  ProbeTarget,
+  ProbeThresholds,
+  ProbeTrigger,
+  ProbeVerdict,
+  ReactionProbeRecorderOptions,
+} from './sensors/probe.ts'
 
 // ── M2 · plan execution (B1-T7) ─────────────────────────────────────────
 export { PlanExecutor } from './execution/executor.ts'
@@ -375,9 +391,7 @@ export type {
   DispatchResult,
   DispatchStatus,
   PlanExecutorOptions,
-  ProbeAction,
   ProbeRegistrar,
-  ProbeTarget,
 } from './execution/executor.ts'
 
 // ── M2 · pack import and registry (B2-T14 core half) ────────────────────
@@ -399,3 +413,34 @@ export type {
   PackRegistryOptions,
   PackStore,
 } from './scenario/pack-registry.ts'
+
+// ── M2 · turn engine (B1-T11) ───────────────────────────────────────────
+export {
+  assertTransition,
+  canTransition,
+  isTerminalState,
+  queuesWhenBusy,
+  refusesNewTurns,
+  startsTurn,
+  TURN_PRIORITY_ORDER,
+  TURN_STATES,
+} from './engine/state-machine.ts'
+export type {
+  TurnOutcome,
+  TurnPriority,
+  TurnState,
+  TurnTrigger,
+  TurnTriggerKind,
+} from './engine/state-machine.ts'
+export { DEFAULT_ENGINE_CONFIG, TEMPLATE_LINE, TurnEngine } from './engine/turn-engine.ts'
+export type {
+  EndReason,
+  EngineConfig,
+  EngineEvent,
+  EngineSnapshot,
+  TurnEngineHooks,
+  TurnEngineOptions,
+  TurnRequest,
+  TurnRunner,
+  TurnRunnerResult,
+} from './engine/turn-engine.ts'

@@ -12,7 +12,8 @@ import {
   type Channel,
   type ChannelPolicy,
 } from '../src/index.ts'
-import { PlanExecutor, type ProbeAction, type ProbeRegistrar } from '../src/execution/executor.ts'
+import { PlanExecutor, type ProbeRegistrar } from '../src/execution/executor.ts'
+import type { ProbeAction } from '../src/sensors/probe.ts'
 import type { Beat, BeatChange, BeatPlan, BeatStrength, BeatTarget, PlanDrop } from '../src/scenario/beat-plan.ts'
 import { DEFAULT_INTENTS } from '../src/scenario/default-intents.ts'
 import type { FeedbackIntent, ResolveContext, ResolveRegistrySnapshot } from '../src/scenario/intents.ts'

@@ -31,26 +31,9 @@ import type { BeatPlan, PlanDrop, PlanValidation } from '../scenario/beat-plan.t
 import { resolvePlan, type ResolveContext, type ResolvedCommand } from '../scenario/intents.ts'
 import type { WaveformLibrary } from '../waveform/library.ts'
 
-/** One device/channel pair a probe covers. */
-export interface ProbeTarget {
-  readonly deviceId: string
-  readonly channelId: string
-}
-
-/**
- * One dispatched action, as the probe recorder sees it.
- *
- * Shape matches `sensors/probe.ts`'s `ProbeAction` (§4.2): when A2-T1 lands,
- * `ReactionProbeRecorder` can be passed as a {@link ProbeRegistrar} directly.
- */
-export interface ProbeAction {
-  readonly turnId: number
-  readonly beatId: string
-  readonly intentId: string
-  /** `Clock.now()` of the accepted dispatch, not of the registration call. */
-  readonly at: number
-  readonly targets: readonly ProbeTarget[]
-}
+// The probe shape is owned by the recorder (A2-T1); duplicating it here made
+// `index.ts` export two different types under the same name.
+import type { ProbeAction, ProbeTarget } from '../sensors/probe.ts'
 
 /**
  * The minimal reaction-probe interface the executor needs.

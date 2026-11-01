@@ -388,3 +388,22 @@ describe('OpenAICompatibleRunner', () => {
     expect(http.callCount).toBe(0)
   })
 })
+
+describe('sse tail handling (R7)', () => {
+  it('does not treat a trailing [DONE] sentinel as a completion chunk', async () => {
+    const { runner } = harness({
+      replies: [{
+        chunks: [
+          `data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: 'assistant', content: '他靠近。' } }] })}\n\n`,
+          // EOF right after the sentinel: no trailing blank line, so the tail
+          // path (not the blank-line dispatch) sees `data: [DONE]`.
+          'data: [DONE]',
+        ],
+      }],
+    })
+    const result = await runner.run(request({ tools: [] }))
+    expect(result.text).toBe('他靠近。')
+    expect(result.toolCalls).toEqual([])
+    expect(result.finishReason).toBe('stop')
+  })
+})

@@ -110,6 +110,9 @@ describe('content-pack loader', () => {
     expect(pack.waveforms).toEqual([])
     expect(pack.phaseNotes.size).toBe(0)
     expect(pack.warnings).toEqual([])
+    // Builtins are always resolvable; a bare id only looks at the pack.
+    expect(pack.resolveWaveform('builtin:tide')?.id).toBe('tide')
+    expect(pack.resolveWaveform('tide')).toBeUndefined()
   })
 
   it('loads a scenario pack with host, phase notes and namespaced waveforms', async () => {
@@ -220,5 +223,57 @@ describe('content-pack loader', () => {
     const climb = pack.waveforms.find(waveform => waveform.id === 'tentacle-pure:climb')
     expect(climb?.frames).toHaveLength(10)
     expect(climb?.loop).toBe(false)
+  })
+
+  it('resolves pack-local, namespaced and builtin waveform references', async () => {
+    const pack = await loadPack(new MemoryContentSource(scenarioFiles()))
+
+    expect(pack.waveforms.map(waveform => waveform.id)).toEqual(['tentacle-pure:gentle'])
+    // Local id (what a `suggest.waveform` in the pack usually writes).
+    expect(pack.resolveWaveform('gentle')?.id).toBe('tentacle-pure:gentle')
+    // Already namespaced id — the form the waveform library hands out.
+    expect(pack.resolveWaveform('tentacle-pure:gentle')?.id).toBe('tentacle-pure:gentle')
+    // `builtin:` points at the engine library.
+    expect(pack.resolveWaveform('builtin:tide')?.id).toBe('tide')
+    // The frozen spec requires `builtin:` for engine assets, so a bare builtin
+    // id is only ever looked up in the pack namespace.
+    expect(pack.resolveWaveform('tide')).toBeUndefined()
+    expect(pack.resolveWaveform('bubble')).toBeUndefined()
+    expect(pack.resolveWaveform('other-pack:gentle')).toBeUndefined()
+    expect(pack.resolveWaveform('')).toBeUndefined()
+    expect(pack.resolveWaveform('  ')).toBeUndefined()
+  })
+
+  it('guarantees that every accepted suggest.waveform resolves at runtime', async () => {
+    const files = scenarioFiles()
+    const scenario = JSON.parse(JSON.stringify(SCENARIO_JSON)) as Record<string, unknown>
+    const accepted = ['gentle', 'tentacle-pure:gentle', 'builtin:tide']
+    const intentIds = ['probe-touch', 'ambient-field', 'soothe']
+    scenario['feedbackIntents'] = accepted.map((reference, index) => ({
+      id: intentIds[index],
+      meaning: reference,
+      regions: ['chest'],
+      suggest: { waveform: reference },
+    }))
+    files['scenario.json'] = JSON.stringify(scenario)
+
+    const pack = await loadPack(new MemoryContentSource(files))
+    // Validation passed, therefore every reference must resolve (S5 closure).
+    expect(pack.warnings).toEqual([])
+    for (const reference of accepted) expect(pack.resolveWaveform(reference), reference).toBeDefined()
+
+    // An unknown reference is warning-only and stays unresolvable; the engine
+    // falls back to a default waveform instead of failing the pack.
+    ;(scenario['feedbackIntents'] as unknown[]).push({
+      id: 'breach',
+      meaning: '未知波形引用',
+      regions: ['chest'],
+      suggest: { waveform: 'bubble' },
+    })
+    files['scenario.json'] = JSON.stringify(scenario)
+    const warned = await loadPack(new MemoryContentSource(files))
+    expect(warned.warnings.join('\n')).toContain('suggest.waveform "bubble"')
+    expect(warned.resolveWaveform('bubble')).toBeUndefined()
+    for (const reference of accepted) expect(warned.resolveWaveform(reference), reference).toBeDefined()
   })
 })

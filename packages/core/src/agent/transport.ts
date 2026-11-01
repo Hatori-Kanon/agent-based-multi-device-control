@@ -264,8 +264,12 @@ async function* decodeSseChunks(
       }
     }
     if (dataLines.length > 0) {
+      // R7: EOF may arrive right after `data: [DONE]` with no trailing blank
+      // line, so the tail dispatch must honour the sentinel too — otherwise the
+      // sentinel reaches the accumulator as a completion chunk.
       const payload = dataLines.join('\n')
       if (payload.trim() !== '') {
+        if (isDoneSentinel(payload)) return
         emitted += 1
         yield payload
       }

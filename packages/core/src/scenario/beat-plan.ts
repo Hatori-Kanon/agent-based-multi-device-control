@@ -63,8 +63,24 @@ export interface BeatChange {
   readonly deltaPercent?: number
   /** `kind='waveform'`. */
   readonly waveformId?: string
-  /** `kind='waveform'`: 1..600 (also accepted on `level` as a hold time). */
+  /**
+   * Hold time in seconds, 1-600.
+   *
+   * `kind='waveform'` requires it. `kind='level'` also accepts it, as an
+   * **authorised part of the contract** (§4.3): a level change may say how
+   * long the level should be held, and the resolver keeps that duration while
+   * clamping it to the channel's `maxDurationSec` at dispatch time (R4).
+   */
   readonly durationSec?: number
+  /**
+   * Runtime modulation of the selected waveform (D16, D9's "texture travels
+   * with the change").
+   *
+   * Parsed and range-checked only — M2 never applies it (`M2-实施计划.md`
+   * §8.6). The beat-level {@link Beat.texture} field is kept as well, for
+   * plans that put the modulation on the beat instead.
+   */
+  readonly texture?: WaveformModulation
 }
 
 /** One channel a beat drives explicitly, overriding the beat defaults field by field. */
@@ -126,6 +142,16 @@ export interface BeatPlan {
 export interface PlanContext {
   readonly intents: ReadonlyMap<string, FeedbackIntent>
   readonly regions: readonly string[]
+  /**
+   * Engine-injected turn identity. `parseBeatPlan` takes `turnId`/`phase`
+   * **only** from here: the raw plan is model output, so copies found in it
+   * are ignored with an "engine field ignored" warning (R3). Absent ⇒ `0`
+   * silently — a caller without an engine context (schema-conformance tests,
+   * read-only use) must not see warnings.
+   */
+  readonly turnId?: number
+  /** Engine-injected phase id; same rule as {@link PlanContext.turnId}. Absent ⇒ `''`. */
+  readonly phase?: string
   /** Default 3. */
   readonly maxBeats?: number
   /** Default 3. */
@@ -242,13 +268,16 @@ function beatIdOf(value: unknown): string | undefined {
  * Never throws: anything unreadable becomes an empty plan with a `dropped`
  * entry, and every individually illegal element is removed while the rest of
  * the plan survives.
+ *
+ * `turnId`/`phase` are engine fields (R3): they come from `ctx` only, never
+ * from the model's JSON.
  */
 export function parseBeatPlan(raw: unknown, ctx: PlanContext): PlanValidation {
   try {
     return parsePlan(raw, ctx)
   } catch (error) {
     return {
-      plan: emptyPlan(0, ''),
+      plan: emptyPlan(readTurnId(ctx), readPhase(ctx)),
       dropped: [{ rule: 'plan', reason: 'the beat plan could not be read; it was replaced by an empty plan' }],
       warnings: [`beat plan parser recovered from an unexpected value (${describe(error)})`],
     }
@@ -258,14 +287,15 @@ export function parseBeatPlan(raw: unknown, ctx: PlanContext): PlanValidation {
 function parsePlan(raw: unknown, ctx: PlanContext): PlanValidation {
   const dropped: PlanDrop[] = []
   const warnings: string[] = []
+  const turnId = readTurnId(ctx)
+  const phase = readPhase(ctx)
   const record = asRecord(raw)
   if (record === undefined) {
     dropped.push({ rule: 'plan', reason: `a beat plan must be a JSON object, got ${describe(raw)}` })
-    return { plan: emptyPlan(0, ''), dropped, warnings }
+    return { plan: emptyPlan(turnId, phase), dropped, warnings }
   }
 
-  const turnId = readTurnId(record, warnings)
-  const phase = readPhase(record, warnings)
+  warnIgnoredEngineFields(record, warnings)
   const pacing = readPacing(record, dropped)
   if (pacing === undefined) return { plan: emptyPlan(turnId, phase), dropped, warnings }
 
@@ -297,21 +327,39 @@ function parsePlan(raw: unknown, ctx: PlanContext): PlanValidation {
   return { plan, dropped, warnings }
 }
 
-function readTurnId(record: UnknownRecord, warnings: string[]): number {
-  const value = record['turnId']
+/**
+ * `turnId`/`phase` are engine fields: read them from the context only (R3).
+ *
+ * The raw plan is model output, so a copy found there proves nothing — it is
+ * ignored and reported. A context without engine fields (schema-conformance
+ * tests, read-only callers) is normal, not an error: it gets a safe default
+ * and **no warning**, so `warnings` stays assertable and only ever describes
+ * model output. An unusable supplied value is likewise defaulted silently —
+ * the safety property comes from never trusting the raw JSON.
+ */
+function readTurnId(ctx: PlanContext): number {
+  const value = ctx.turnId
   if (value === undefined) return 0
   if (typeof value === 'number' && Number.isInteger(value) && value >= 0) return value
-  warnings.push(`turnId must be a non-negative integer, got ${describe(value)}; defaulting to 0`)
   return 0
 }
 
-function readPhase(record: UnknownRecord, warnings: string[]): string {
-  const value = record['phase']
+function readPhase(ctx: PlanContext): string {
+  const value = ctx.phase
   if (value === undefined) return ''
-  if (isNonEmptyString(value)) return value
-  warnings.push(`phase must be a non-empty string, got ${describe(value)}; defaulting to ""`)
+  if (typeof value === 'string') return value
   return ''
 }
+
+/** Raw copies of engine fields are ignored (R3); say so once per field. */
+function warnIgnoredEngineFields(record: UnknownRecord, warnings: string[]): void {
+  for (const field of ['turnId', 'phase'] as const) {
+    if (Object.prototype.hasOwnProperty.call(record, field)) {
+      warnings.push(`engine field ${describe(field)} was ignored; the parser takes it from the context`)
+    }
+  }
+}
+
 
 function readPacing(record: UnknownRecord, dropped: PlanDrop[]): PlanPacing | undefined {
   const value = record['pacing']
@@ -496,14 +544,20 @@ function parseChange(
   if (kind === 'waveform') {
     const change = parseWaveformChange(record, beatId, dropped, warnings)
     if (change !== undefined) {
-      warnIgnoredKeys(record, ['kind', 'waveformId', 'durationSec'], beatId, 'change', warnings)
+      warnIgnoredKeys(record, ['kind', 'waveformId', 'durationSec', 'texture'], beatId, 'change', warnings)
     }
     return change
   }
   if (kind === 'level') {
     const change = parseLevelChange(record, beatId, dropped, warnings)
     if (change !== undefined) {
-      warnIgnoredKeys(record, ['kind', 'targetPercent', 'deltaPercent', 'durationSec'], beatId, 'change', warnings)
+      warnIgnoredKeys(
+        record,
+        ['kind', 'targetPercent', 'deltaPercent', 'durationSec', 'texture'],
+        beatId,
+        'change',
+        warnings,
+      )
     }
     return change
   }
@@ -572,11 +626,17 @@ function parseLevelChange(
     }
   }
 
+  // D16: `texture` is parsed and range-checked here too (R1); it never takes
+  // effect in M2. Reuses the beat-level parser so both landing places behave
+  // identically.
+  const texture = parseTexture(record['texture'], beatId, warnings)
+
   const change: BeatChange = {
     kind: 'level',
     ...(targetPercent === undefined ? {} : { targetPercent }),
     ...(deltaPercent === undefined ? {} : { deltaPercent }),
     ...(durationSec === undefined ? {} : { durationSec }),
+    ...(texture === undefined ? {} : { texture }),
   }
   return change
 }
@@ -607,7 +667,13 @@ function parseWaveformChange(
     warnings.push(`beat ${beatId}: invalid change dropped; falling back to the intent suggestion`)
     return undefined
   }
-  return { kind: 'waveform', waveformId: waveformIdRaw, durationSec: durationRaw }
+  const texture = parseTexture(record['texture'], beatId, warnings)
+  return {
+    kind: 'waveform',
+    waveformId: waveformIdRaw,
+    durationSec: durationRaw,
+    ...(texture === undefined ? {} : { texture }),
+  }
 }
 
 function warnIgnoredKeys(

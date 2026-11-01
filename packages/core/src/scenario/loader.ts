@@ -161,6 +161,19 @@ export interface LoadedPack {
   readonly scenario?: ScenarioDefinition
   /** Validated pack waveforms, ids already namespaced as `<packId>:<waveId>`. */
   readonly waveforms: readonly Waveform[]
+  /**
+   * Resolve a `suggest.waveform`-style reference to the waveform it means.
+   *
+   * The resolution rules are exactly the ones validation accepts, so
+   * "`validatePack` passed" implies "the runtime can resolve it" (S5):
+   * - `builtin:<id>` → the engine's builtin waveform library;
+   * - `<packId>:<id>` → this pack's namespaced asset;
+   * - bare `<id>` → this pack's `<packId>:<id>`.
+   *
+   * Unresolvable references return `undefined`; execution then falls back to a
+   * default waveform and keeps playing (`内容包规范.md` §4.5).
+   */
+  readonly resolveWaveform: (reference: string) => Waveform | undefined
   /** Non-blocking problems the UI/author should see, in deterministic order. */
   readonly warnings: readonly string[]
 }
@@ -325,7 +338,7 @@ async function loadWaveforms(
   files: readonly string[],
   issues: ValidationIssue[],
   warnings: string[],
-): Promise<{ readonly waveforms: readonly Waveform[]; readonly localIds: ReadonlySet<string> }> {
+): Promise<{ readonly waveforms: readonly Waveform[] }> {
   const assetFiles = files.filter(file => file.startsWith('waveforms/') && file.endsWith('.json'))
   if (assetFiles.includes('waveforms/index.json')) {
     warnings.push(
@@ -347,21 +360,54 @@ async function loadWaveforms(
     seen.add(candidate.localId)
     parsed.push(candidate)
   }
-  return { localIds: seen, waveforms: parsed.map(entry => entry.waveform) }
+  return { waveforms: parsed.map(entry => entry.waveform) }
 }
 
-function builtinWaveformIds(): ReadonlySet<string> {
-  return new Set(createBuiltinWaveforms().map(waveform => waveform.id))
+/** Waveforms shipped by the engine, indexed by their unprefixed id. */
+function builtinWaveformIndex(): ReadonlyMap<string, Waveform> {
+  return new Map(createBuiltinWaveforms().map(waveform => [waveform.id, waveform]))
+}
+
+interface WaveformResolution {
+  /** Pack waveforms with the `<packId>:` namespace applied (fixed at load). */
+  readonly waveforms: readonly Waveform[]
+  /**
+   * Single source of truth for `suggest.waveform` resolution (S5). Validation
+   * and the returned {@link LoadedPack.resolveWaveform} both go through it, so
+   * the two can never disagree.
+   */
+  readonly resolveWaveform: (reference: string) => Waveform | undefined
+}
+
+function createWaveformResolution(packId: string, localWaveforms: readonly Waveform[]): WaveformResolution {
+  const prefix = `${packId}:`
+  const waveforms = localWaveforms.map(waveform => ({ ...waveform, id: `${prefix}${waveform.id}` }))
+  const packIndex = new Map(waveforms.map(waveform => [waveform.id, waveform]))
+  const builtins = builtinWaveformIndex()
+  const resolveWaveform = (reference: string): Waveform | undefined => {
+    if (typeof reference !== 'string') return undefined
+    const trimmed = reference.trim()
+    if (trimmed.length === 0) return undefined
+    if (trimmed.startsWith('builtin:')) {
+      const id = trimmed.slice('builtin:'.length)
+      return id.length === 0 ? undefined : builtins.get(id)
+    }
+    if (trimmed.startsWith(prefix)) return packIndex.get(trimmed)
+    return packIndex.get(`${prefix}${trimmed}`)
+  }
+  return { waveforms, resolveWaveform }
 }
 
 /**
  * Warn about `suggest.waveform` references that cannot resolve; execution falls
  * back to a default waveform and keeps playing (`内容包规范.md` §4.5).
+ *
+ * This deliberately calls the same resolver the runtime gets, so a reference
+ * that passes validation is guaranteed to resolve (S5).
  */
 function checkWaveformReferences(
   scenario: ScenarioDefinition | undefined,
-  packIds: ReadonlySet<string>,
-  builtins: ReadonlySet<string>,
+  resolveWaveform: (reference: string) => Waveform | undefined,
   warnings: string[],
 ): void {
   if (scenario === undefined) return
@@ -372,13 +418,11 @@ function checkWaveformReferences(
     if (typeof intent !== 'object' || intent === null) continue
     const reference = intent.suggest?.waveform
     if (reference === undefined) continue
-    const builtinId = reference.startsWith('builtin:') ? reference.slice('builtin:'.length) : reference
-    const resolves = packIds.has(reference) || builtins.has(builtinId)
-    if (!resolves) {
-      warnings.push(
-        `scenario.json: feedbackIntents "${intent.id}": suggest.waveform "${reference}" is neither a pack waveform nor a builtin id; execution falls back to a default waveform`,
-      )
-    }
+    if (typeof reference !== 'string') continue
+    if (resolveWaveform(reference) !== undefined) continue
+    warnings.push(
+      `scenario.json: feedbackIntents "${intent.id}": suggest.waveform "${reference}" is neither a pack waveform (bare or "<packId>:<id>") nor a builtin "builtin:<id>"; execution falls back to a default waveform`,
+    )
   }
 }
 
@@ -503,6 +547,9 @@ export async function loadPack(source: ContentSource, options: LoadPackOptions =
   }
 
   const waveformResult = await loadWaveforms(source, files, issues, loaderWarnings)
+  // Namespace pack waveform ids once; the same resolver object backs both the
+  // validation warning pass and `LoadedPack.resolveWaveform` (S5).
+  const waveformResolution = createWaveformResolution(manifestId, waveformResult.waveforms)
 
   // Phase notes: a missing note is a warning, not a failure (`内容包规范.md` §8).
   // The graph is re-read defensively: this runs before the validation errors
@@ -515,7 +562,7 @@ export async function loadPack(source: ContentSource, options: LoadPackOptions =
       const noteFile = `phases/${phase.id}.md`
       if (sizes.has(noteFile)) phaseNotes.set(phase.id, await readTextOrThrow(source, noteFile))
     }
-    checkWaveformReferences(scenario, waveformResult.localIds, builtinWaveformIds(), loaderWarnings)
+    checkWaveformReferences(scenario, waveformResolution.resolveWaveform, loaderWarnings)
   }
 
   const warnings = [
@@ -552,7 +599,8 @@ export async function loadPack(source: ContentSource, options: LoadPackOptions =
     manifest,
     persona,
     phaseNotes,
-    waveforms: waveformResult.waveforms.map(waveform => ({ ...waveform, id: `${manifestId}:${waveform.id}` })),
+    waveforms: waveformResolution.waveforms,
+    resolveWaveform: waveformResolution.resolveWaveform,
     warnings,
     ...(normalizedScenario === undefined ? {} : { scenario: normalizedScenario }),
     ...(host === undefined ? {} : { host }),

@@ -235,6 +235,28 @@ describe('clamping and the strength conversion', () => {
     expect(durationOf(command.body)).toBe(10)
     expect(command.clamped).toBe(true)
   })
+
+  it('keeps an authorised level-change hold time and clamps it to the channel cap', () => {
+    // R4 / §4.3: `durationSec` on a level change is part of the contract. It
+    // is kept as a hold time, then clamped to `maxDurationSec` like any other.
+    const registry = snapshot(device('toy', [channel('a', 'chest', { maxDurationSec: 10 })]))
+    const ctx = context(registry, PLAIN_INTENT_MAP)
+    const hold = (durationSec: number): ResolvedCommand =>
+      firstCommand(
+        resolvePlan(
+          plan([levelBeat('b1', { intentId: 'plain', regions: ['chest'], change: { kind: 'level', durationSec } })]),
+          ctx,
+        ).commands,
+      )
+
+    const within = hold(8)
+    expect(within.body).toEqual({ kind: 'level', percent: 14, durationSec: 8 })
+    expect(within.clamped).toBe(false)
+
+    const over = hold(600)
+    expect(over.body).toEqual({ kind: 'level', percent: 14, durationSec: 10 })
+    expect(over.clamped).toBe(true)
+  })
 })
 
 describe('region routing and distribution', () => {
@@ -442,6 +464,27 @@ describe('pattern bodies', () => {
 
     expect(command.body.kind).toBe('pattern')
     if (command.body.kind === 'pattern') expect(command.body.modulation).toEqual({ rate: 1.5 })
+  })
+
+  it('carries a change texture through as pattern modulation', () => {
+    // R1: texture lands on the change; it is still only passed through as
+    // modulation and never applied in M2 (D16).
+    const registry = snapshot(device('toy', [channel('a', 'chest', { supportsWaveform: true })]))
+    const command = firstCommand(
+      resolvePlan(
+        plan([
+          levelBeat('b1', {
+            intentId: 'plain',
+            regions: ['chest'],
+            change: { kind: 'waveform', waveformId: 'climb', durationSec: 4, texture: { rate: 1.2 } },
+          }),
+        ]),
+        context(registry, PLAIN_INTENT_MAP),
+      ).commands,
+    )
+
+    expect(command.body.kind).toBe('pattern')
+    if (command.body.kind === 'pattern') expect(command.body.modulation).toEqual({ rate: 1.2 })
   })
 
   it('resolves the stop intent to a zero level', () => {

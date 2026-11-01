@@ -19,7 +19,8 @@ const INTENTS: ReadonlyMap<string, FeedbackIntent> = new Map([
   ['ambient-field', intent('ambient-field')],
 ])
 
-const CTX: PlanContext = { intents: INTENTS, regions: ['whole-body', 'chest'] }
+/** Engine fields arrive through the context (R3); the raw plan is model output. */
+const CTX: PlanContext = { intents: INTENTS, regions: ['whole-body', 'chest'], turnId: 7, phase: 'probe' }
 
 function rawBeat(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return { id: 'b1', intentId: 'probe-touch', regions: ['chest'], strength: 'low', ...overrides }
@@ -27,8 +28,6 @@ function rawBeat(overrides: Record<string, unknown> = {}): Record<string, unknow
 
 function rawPlan(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    turnId: 7,
-    phase: 'probe',
     pacing: 'probe',
     beats: [rawBeat()],
     ...overrides,
@@ -154,11 +153,29 @@ describe('parseBeatPlan never throws', () => {
 })
 
 describe('beats, ids and counts', () => {
-  it('reads turnId and phase the engine injected next to the model arguments', () => {
-    const result = parseBeatPlan(rawPlan({ turnId: 42, phase: 'escalate' }), CTX)
+  it('takes turnId and phase from the engine context, never from the model output', () => {
+    const result = parseBeatPlan(rawPlan({ turnId: 999, phase: 'peak' }), CTX)
 
-    expect(result.plan.turnId).toBe(42)
-    expect(result.plan.phase).toBe('escalate')
+    // R3: forged copies are ignored; the engine context wins.
+    expect(result.plan.turnId).toBe(7)
+    expect(result.plan.phase).toBe('probe')
+    expect(result.warnings).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining('engine field "turnId" was ignored'),
+        expect.stringContaining('engine field "phase" was ignored'),
+      ]),
+    )
+  })
+
+  it('defaults engine fields silently when the context supplies none', () => {
+    const noEngineContext: PlanContext = { intents: INTENTS, regions: ['whole-body', 'chest'] }
+    const result = parseBeatPlan({ pacing: 'probe', beats: [rawBeat()] }, noEngineContext)
+
+    expect(result.plan.turnId).toBe(0)
+    expect(result.plan.phase).toBe('')
+    // Callers without an engine context must not see warnings: `warnings` only
+    // ever describes model output.
+    expect(result.warnings).toEqual([])
   })
 
   it('keeps at most three beats and drops the rest with a warning', () => {
@@ -283,6 +300,35 @@ describe('change, targets and texture validation', () => {
 
     expect(firstBeat(result).targets).toEqual([{ deviceId: 'toy', channelId: 'a', strength: 'low' }])
     expect(result.dropped.filter(drop => drop.rule === 'target')).toHaveLength(3)
+  })
+
+  it('parses change.texture as a range-checked field instead of an unknown key', () => {
+    // R1 / D9: texture lives on the change. It must not be reported as an
+    // unknown change field, and its own range rules still apply.
+    const waveformChange = parseBeatPlan(
+      rawPlan({
+        beats: [
+          rawBeat({
+            change: { kind: 'waveform', waveformId: 'tide', durationSec: 4, texture: { rate: 1.5, intensityScale: 0.5 } },
+          }),
+        ],
+      }),
+      CTX,
+    )
+    expect(firstBeat(waveformChange).change).toEqual({
+      kind: 'waveform',
+      waveformId: 'tide',
+      durationSec: 4,
+      texture: { rate: 1.5, intensityScale: 0.5 },
+    })
+    expect(waveformChange.warnings.some(warning => warning.includes('unknown change field'))).toBe(false)
+
+    const levelChange = parseBeatPlan(
+      rawPlan({ beats: [rawBeat({ change: { kind: 'level', texture: { rate: 9, phaseOffset: 0.25 } } })] }),
+      CTX,
+    )
+    expect(firstBeat(levelChange).change).toEqual({ kind: 'level', texture: { phaseOffset: 0.25 } })
+    expect(levelChange.warnings.some(warning => warning.includes('texture.rate'))).toBe(true)
   })
 
   it('drops illegal texture fields but keeps the rest', () => {

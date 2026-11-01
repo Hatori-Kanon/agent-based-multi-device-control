@@ -30,6 +30,9 @@ import {
   type DeviceBackend,
   type DeviceLifecycle,
   type FeatureSample,
+  type FetchLike,
+  type LlmConfig,
+  type ModelRunner,
   type PolicySnapshot,
   type RegistrySnapshot,
   type SensorStatus,
@@ -43,6 +46,8 @@ import { NodeTextSocketTransport } from './node-socket.ts'
 import { FileAppendOnlyStore, FileDocumentStore, readAuditTail } from './node-storage.ts'
 import { PanicServer } from './panic-server.ts'
 import { cameraSensorSource, DEFAULT_CAMERA_FPS, type CameraHost } from './sensors/camera-host.ts'
+import { createModelRunner, llmSummaryOf, loadLlmSettings, settingsFromConfig, singleCallModel } from './llm.ts'
+import type { LlmSummary, SettingsEnv } from './settings.ts'
 
 export interface HostRuntimeOptions {
   /** Root for the audit log, session state, and the panic token. */
@@ -88,6 +93,18 @@ export interface HostRuntimeOptions {
   /** Camera feature push rate; the capture host clamps it to 1-2 Hz. */
   readonly cameraFps?: number
   /**
+   * In-memory LLM config override (tests, embedded hosts).
+   *
+   * Omitted, the host reads `<dataDir>/state/llm.json` and falls back to the
+   * built-in DeepSeek single-call default. The API key is never part of this
+   * object: `LlmConfig` has no key field.
+   */
+  readonly llmConfig?: LlmConfig
+  /** Environment map for API-key lookup. Defaults to `process.env`. */
+  readonly llmEnv?: SettingsEnv
+  /** Network boundary for the model gateway. Defaults to `globalThis.fetch`. */
+  readonly llmFetch?: FetchLike
+  /**
    * MonsterParty share-link token.
    *
    * Operator configuration only. It never becomes a tool argument, a tool
@@ -116,6 +133,19 @@ export interface HostRuntime {
    * missing dependency.
    */
   readonly sensors: SensorRegistry
+  /**
+   * Assembled model gateway (B1-T15).
+   *
+   * Construction performs no network IO; the first request happens when a turn
+   * actually runs. Built from the single-call model (director role, `null` →
+   * default) for the M2 pipeline; split mode builds role runners from
+   * {@link llm} without changing this field's meaning.
+   */
+  readonly modelRunner: ModelRunner
+  /** Effective LLM config (by construction it carries no API key). */
+  readonly llm: LlmConfig
+  /** Key-free LLM status — the only LLM shape the console may display. */
+  llmSummary(): LlmSummary
   readonly panicToken: string
   readonly panicAddress: { host: string; port: number } | undefined
   /** The control console's token and bind address. */
@@ -297,6 +327,25 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
   const savePolicy = async (): Promise<void> => {
     await documents.write('policy', serializePolicySnapshot(policy.snapshot()))
   }
+
+  // ── Model gateway (B1-T15) ──────────────────────────────────────────────
+  // Settings come from `state/llm.json`; the API key is resolved
+  // environment-first and is never copied into the config object. Assembling
+  // the runner performs NO network IO — the first request happens on the first
+  // turn, so booting offline (or without a key) is a supported state.
+  const llmEnv = options.llmEnv ?? process.env
+  const llmSettings = options.llmConfig === undefined
+    ? await loadLlmSettings(options.dataDir, llmEnv)
+    : settingsFromConfig(options.llmConfig, llmEnv)
+  const llm = llmSettings.config
+  const modelRunner = createModelRunner({
+    model: singleCallModel(llm),
+    ...(llmSettings.apiKey === undefined ? {} : { apiKey: llmSettings.apiKey }),
+    fetch: options.llmFetch ?? globalThis.fetch,
+    clock,
+    env: llmEnv,
+  })
+  const llmSummary = (): LlmSummary => llmSummaryOf(llmSettings)
 
   const registry = new DeviceRegistry({ clock, audit, policy, waveforms, onError: recordError })
   const controller = new AbortController()
@@ -676,6 +725,8 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     waveforms,
     documents,
     sensors,
+    modelRunner,
+    llm,
     panicToken,
     panicAddress,
     dashboardToken,
@@ -689,6 +740,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     sensorsStatus,
     sensorFrame,
     pushFeatures,
+    llmSummary,
     panic,
     saveWaveforms,
     savePolicy,

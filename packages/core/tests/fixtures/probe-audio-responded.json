@@ -1,0 +1,11 @@
+{
+  "name": "responded-on-audio-delta",
+  "expect": { "verdict": "responded" },
+  "action": { "turnId": 8, "beatId": "b2", "intentId": "probe-touch", "at": 1000 },
+  "samples": [
+    { "sourceId": "mic-1", "kind": "audio", "ts": 0, "audioLevelPct": 10 },
+    { "sourceId": "mic-1", "kind": "audio", "ts": 800, "audioLevelPct": 12 },
+    { "sourceId": "mic-1", "kind": "audio", "ts": 1200, "audioLevelPct": 20 },
+    { "sourceId": "mic-1", "kind": "audio", "ts": 2000, "audioLevelPct": 41 }
+  ]
+}
