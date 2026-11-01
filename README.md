@@ -2,7 +2,7 @@
 
 Agent 主持的具身角色扮演系统：摄像头/麦克风感知 + 多设备并行物理反馈，安全边界由硬件与人类共同持有。
 
-**当前状态：M0、M1 完成** —— 安全底座、波形子系统，以及**四个真实后端**：郊狼 V3（BLE）、谜姬 XHTKJ（BLE 直连）、MonsterParty（云中继）、Buttplug/Intiface（集线器）。尚缺感知源、agent 循环与剧本系统（M2）。
+**当前状态：M0、M1 已交付；M2 设计已冻结（2026-11-01），代码未开工。** 安全底座、波形子系统，以及**五个真实后端**：郊狼 V3（BLE）、谜姬 XHTKJ（BLE 直连）、安可尼 JH1（ankni 流式）、MonsterParty（云中继）、Buttplug/Intiface（集线器）。M2 = 感知源 + 回合引擎 + 内容包 —— 设计见 [`设计文档.md`](设计文档.md) 的 §0.5 / §10，任务分解见 [`M2-实施计划.md`](M2-实施计划.md)，冻结前审计见 [`analysis/m2-design-audit.md`](analysis/m2-design-audit.md)。
 
 ## 文档
 
@@ -18,20 +18,23 @@ Agent 主持的具身角色扮演系统：摄像头/麦克风感知 + 多设备�
 | `导演与写作上下文契约.md` | M2 草案：两个投影各读什么、预算与降级、模型配置 |
 | `内容包规范.md` | M2 草案：内容包（DLC）清单、`scenario.json`、校验与作者工作流 |
 | `跨会话记忆与游戏性后果-设计草案.md` | M2 草案：账本、会话级上限、DLC 声明式反应 |
+| `M2-实施计划.md` | M2 原子任务、接口契约、验收测试与并行度 |
+| `analysis/m2-design-audit.md` | M2 冻结前的独立一致性审计（9 阻塞 / 31 应修 / 7 可选） |
 | `analysis/` | 证据笔记：AI-for-Coyote 后端/产品面、己方基线、HW9 心率带与 RR 调研 |
 
-## 四个真实后端，三种失效语义
+## 五个真实后端，三种失效语义
 
 这是本项目最重要的一张表：
 
 | 后端 | 传输 | 凭据 | 形态 | 宿主进程死亡后 |
 |---|---|---|---|---|
 | **郊狼 V3** | BLE 直连 | 无 | 单设备 | ✅ **自动归零**（100ms `B0` 流停止即停止输出） |
+| **安可尼 JH1（ankni）** | BLE 直连 | 无 | 单设备 | ✅ **自动归零**（流式重发停止即停止输出） |
 | **谜姬 XHTKJ** | BLE 直连 | 无 | 单设备 | ❌ 继续输出 |
 | **MonsterParty** | WebSocket 云中继 | 分享链接 token（易过期） | 单设备 | ❌ 继续输出 |
 | **Buttplug / Intiface** | WebSocket 到本机引擎 | 无 | **集线器**（多设备，可扫描） | ❌ 继续输出 |
 
-只有郊狼有硬件 dead-man switch。其余三个只能靠宿主定时器加三条急停路径——这就是为什么 mock 里刻意保留了 `mock-hold` 这个「宿主死了还在输出」的对照。
+郊狼与安可尼是**流式**后端：宿主一停刷新就归零。其余三个是「宿主死了还在输出」，只能靠宿主定时器加三条急停路径——这就是为什么 mock 里刻意保留了 `mock-hold` 这个对照。
 
 **谜姬设备两条路都能走**：云中继（分享链接）和直连 BLE。直连没有一次性 token 的运维摩擦，是长会话的首选。
 
@@ -162,9 +165,11 @@ Electron 窗口加载的就是控制台网页，它由运行时内置的 HTTP �
 ## 测试
 
 ```
-packages/core    249 passed
-apps/desktop      68 passed
+packages/core    263 passed (13 files)
+apps/desktop      84 passed (7 files)
 ```
+
+两份套件要在**各自包目录**下跑（从仓库根跑会跨包解析依赖，`ws` 之类会加载不到）。命令见下节。
 
 M0 的四项验收：
 
@@ -189,17 +194,21 @@ M1 的三项出口条件：
 - `pnpm run <script>` 会以管道 stdio 派生子进程，在沙箱下报 `spawn EPERM`。所以验证时直接调工具：
 
 ```powershell
-node packages/core/node_modules/typescript/bin/tsc --noEmit -p packages/core/tsconfig.json
-node packages/core/node_modules/vitest/vitest.mjs run --pool=threads
+cd packages/core  ; node node_modules/vitest/vitest.mjs run --pool=threads
+cd apps/desktop   ; node ../../packages/core/node_modules/vitest/vitest.mjs run --pool=threads
+cd packages/core  ; node node_modules/typescript/bin/tsc --noEmit -p tsconfig.json
 ```
 
 **沙箱外不需要这么做**，正常 `pnpm run check` 即可。
 
-## M1 剩余
+## M1 遗留
 
-Buttplug 后端（移植 dsh-toy 的 v3/v4 协议与 Intiface 校验下载）。你没有 Buttplug 设备，所以它只做 fixture 测试，等有硬件再联调。
+两项，都不阻塞 M2：
 
-## M1 待定的最后一项：Intiface 校验下载
+- **ankni 旋转方向编码**：候选帧探测四轮未收敛（`1e56105` … `fea2776`），当前后端只保证"能转、能停"，方向字段待真机再定。
+- **Intiface 校验下载**：明确不做，理由见下。
+
+## Intiface 校验下载：为什么不做
 
 参考实现（dsh-toy）会在没装 Intiface 时自动下载官方引擎、逐平台校验 SHA-256、再用手写的 ZIP 读取器只解出那一个可执行文件。那是很认真的供应链代码，但**本仓库目前没有采用**，原因有三：
 
