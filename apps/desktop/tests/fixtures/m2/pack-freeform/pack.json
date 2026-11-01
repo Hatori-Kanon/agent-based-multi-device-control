@@ -1,0 +1,11 @@
+{
+  "id": "demo",
+  "name": "M2 端到端验收包",
+  "version": "1.0.0",
+  "engine": ">=0.2 <1.0",
+  "mode": "freeform",
+  "rating": "all",
+  "author": "B2-T13",
+  "description": "M2-B2 端到端与 demo 用的 freeform 最小包。",
+  "boundaries": ["不做真实伤害", "不脱离角色"]
+}

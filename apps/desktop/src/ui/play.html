@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  游玩页（B2-T12）。与控制台同源、同一套 token 约定：页面本身不带业务逻辑，
+  所有状态都来自 dashboard 的 JSON API；token 只从地址栏读一次，随后只进
+  `x-control-token` 请求头，不写 localStorage、不写 DOM、不进日志。
+
+  可见性规则（`导演与写作上下文契约.md`）：本页只出现玩家能看见的内容——
+  台词、选项、阶段、时间。设备数值（强度/脉宽/上限）与原始感知特征一律不
+  渲染；probe 数值与解析目标只在「调试」打开后请求与显示（复用 /api/debug，
+  默认关闭）。
+
+  CSP 与 index.html 一致：没有外链脚本/字体/图片，只加载同源 /play.js。
+-->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'">
+<title>Embodied 游玩</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px 20px 40px;
+    font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: #0d0d12; color: #e8e8ee;
+  }
+  header.top { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  h1 { font-size: 17px; margin: 0; letter-spacing: .04em; }
+  .status-pill { font-size: 12px; color: #8a8a96; border: 1px solid #2a2a34; border-radius: 999px; padding: 2px 10px; }
+  .status-pill.on { color: #5fd08a; border-color: #2c5c3d; }
+  .status-pill.bad { color: #ef8095; border-color: #7d2642; }
+  .spacer { flex: 1; }
+
+  button {
+    font: inherit; color: inherit; background: #23232d; border: 1px solid #3a3a46;
+    border-radius: 8px; padding: 6px 12px; cursor: pointer;
+  }
+  button:hover { background: #2b2b37; }
+  button:disabled { opacity: .4; cursor: default; }
+  button.mini { font-size: 12px; padding: 4px 10px; }
+
+  /* 急停常驻：任何时刻都在页面上，不依赖会话状态。 */
+  #panic {
+    font-size: 16px; font-weight: 800; letter-spacing: .06em;
+    background: #8d1230; border: 1px solid #c22b4f; color: #fff;
+    border-radius: 10px; padding: 10px 22px;
+  }
+  #panic:hover { background: #a81738; }
+  #panic:active { transform: translateY(1px); }
+  #debugToggle.on { color: #e6c267; border-color: #6b5a24; }
+
+  #lockBanner {
+    display: none; align-items: center; gap: 12px;
+    background: #3d1420; border: 1px solid #8d2642; border-radius: 10px;
+    padding: 10px 16px; margin-bottom: 12px;
+  }
+  #lockBanner.on { display: flex; }
+  #lockBanner span { flex: 1; }
+
+  #err { color: #ef8095; min-height: 20px; font-size: 12.5px; margin: 6px 0 2px; }
+
+  .panel { background: #14141b; border: 1px solid #262631; border-radius: 12px; padding: 12px 14px; margin-bottom: 14px; }
+  .panel h3 { margin: 0 0 10px; font-size: 13px; font-weight: 650; }
+  .panel h3 small { color: #767682; font-weight: 400; margin-left: 8px; }
+
+  .bar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .bar label { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: #9a9aa6; }
+  .bar .acts { display: flex; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+  input[type=number] {
+    width: 64px; background: #1b1b24; border: 1px solid #34343f; color: inherit;
+    border-radius: 6px; padding: 3px 7px; font: inherit; font-size: 12px;
+  }
+  input[type=text] {
+    background: #1b1b24; border: 1px solid #34343f; color: inherit; border-radius: 6px;
+    padding: 3px 7px; font: inherit; font-size: 12px; min-width: 0;
+  }
+  input[type=range] { width: 110px; accent-color: #4d8fd4; }
+  select {
+    background: #1b1b24; border: 1px solid #34343f; color: inherit;
+    border-radius: 6px; padding: 3px 6px; font: inherit; font-size: 12px; max-width: 240px;
+  }
+  .val { font-variant-numeric: tabular-nums; color: #d9d9e2; min-width: 38px; display: inline-block; text-align: right; }
+  .hint { color: #6a6a76; font-size: 11.5px; }
+
+  .grid { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 14px; align-items: start; }
+  @media (max-width: 980px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+
+  #currentLine {
+    margin: 0; min-height: 3.4em; font-size: 16.5px; line-height: 1.85;
+    color: #f0eef5; white-space: pre-wrap; word-break: break-word;
+  }
+  #turnInfo { color: #767682; font-weight: 400; margin-left: 8px; }
+
+  #lines {
+    max-height: 42vh; min-height: 120px; overflow-y: auto;
+    background: #0b0b10; border-radius: 10px; padding: 10px 12px;
+    font-size: 13.5px; line-height: 1.75;
+  }
+  #lines .entry { margin-bottom: 9px; white-space: pre-wrap; word-break: break-word; }
+  #lines .entry:last-child { margin-bottom: 0; }
+  #lines .who { font-size: 10.5px; margin-right: 7px; color: #767682; }
+  #lines .entry.player .who { color: #e6c267; }
+  #lines .entry.assistant .who { color: #6fb4ef; }
+  #lines .entry.player .text { color: #d9d2b8; }
+
+  #choices { display: flex; flex-direction: column; gap: 8px; }
+  #choices button {
+    text-align: left; padding: 9px 12px; background: #1c2430; border-color: #2f4358;
+  }
+  #choices button:hover { background: #233043; }
+
+  .composer { display: flex; gap: 8px; align-items: flex-end; }
+  .composer textarea {
+    flex: 1; min-height: 58px; resize: vertical;
+    background: #1b1b24; border: 1px solid #34343f; color: inherit;
+    border-radius: 8px; padding: 8px 10px; font: inherit; font-size: 13px; line-height: 1.5;
+  }
+
+  #status { display: grid; grid-template-columns: auto 1fr; gap: 5px 12px; margin: 0; font-size: 12.5px; }
+  #status dt { color: #767682; }
+  #status dd { margin: 0; color: #d9d9e2; word-break: break-word; }
+
+  .device { border-top: 1px solid #1f1f28; padding: 8px 0; }
+  .device:first-child { border-top: 0; padding-top: 0; }
+  .device-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .device-head .name { font-size: 12.5px; font-weight: 650; }
+  .life { font-size: 10.5px; padding: 0 7px; border-radius: 999px; border: 1px solid #3a3a46; color: #8a8a96; }
+  .life.ready { color: #5fd08a; border-color: #2c5c3d; }
+  .life.failed { color: #ef8095; border-color: #7d2642; }
+  .region-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+  .region-row .label { flex: 1; font-size: 12px; color: #b6b6c4; }
+  .region-row input { width: 118px; }
+
+  #sensors { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: #9a9aa6; }
+  #sensors .sensor { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .q-ok { color: #5fd08a; }
+  .q-warn { color: #e6c267; }
+  .q-bad { color: #ef8095; }
+
+  #debugProbes { max-height: 220px; overflow-y: auto; font: 11px/1.7 ui-monospace, Consolas, monospace; }
+  #debugProbes div { white-space: pre-wrap; word-break: break-all; color: #b6b6c4; }
+
+  footer { margin-top: 6px; color: #5f5f6a; font-size: 11.5px; }
+  footer div + div { margin-top: 3px; }
+  code { background: #1b1b24; padding: 1px 5px; border-radius: 5px; color: #b6b6c4; }
+</style>
+</head>
+<body>
+  <header class="top">
+    <h1>Embodied 游玩</h1>
+    <span class="status-pill" id="conn">连接中…</span>
+    <span class="spacer"></span>
+    <button id="debugToggle" aria-pressed="false" title="显示 probe 数值与解析结果（默认关闭；不影响审计与模型上下文）">调试</button>
+    <button id="panic" title="立即停止所有输出并锁定">紧急停止</button>
+  </header>
+
+  <div id="lockBanner">
+    <span><strong>输出已被锁定。</strong>所有写入都会被拒绝；解锁后才能继续这一局。</span>
+    <button id="unlock">解锁</button>
+  </div>
+
+  <div id="err" role="status" aria-live="polite"></div>
+
+  <div class="panel">
+    <div class="bar">
+      <label>内容包 <select id="packSelect"><option value="" disabled>（读取中…）</option></select></label>
+      <label>计划时长 <input id="plannedMinutes" type="number" min="1" max="240" step="5" value="30"> 分钟</label>
+      <label title="会话上限只能由人类在这里写入（POST /api/session/ceiling），引擎与内容包都没有提高它的路径；开局后可用">会话上限 X
+        <input id="ceiling" type="range" min="0" max="100" step="5" value="100" disabled>
+        <span class="val" id="ceilingVal">100%</span>
+      </label>
+      <span class="acts">
+        <button id="start">开始</button>
+        <button id="pause" disabled>暂停</button>
+        <button id="resume" disabled>继续</button>
+        <button id="end" disabled>结束</button>
+      </span>
+    </div>
+    <div class="hint" id="startHint" style="margin-top:8px">点「开始」后用已激活版本的内容包开一局；上限滑块在开局后生效，恢复也要手动调回。</div>
+  </div>
+
+  <div class="grid">
+    <section>
+      <div class="panel">
+        <h3>现在<span id="turnInfo">未开局</span></h3>
+        <p id="currentLine" aria-live="polite">（尚未开局）</p>
+      </div>
+
+      <div class="panel">
+        <h3>对话<small>已结算的台词；玩家发言只在本页回显</small></h3>
+        <div id="lines"><div class="hint">（还没有台词）</div></div>
+      </div>
+
+      <div class="panel" id="choicesPanel" style="display:none">
+        <h3>选择<small>0–3 个选项；点选即是一句玩家发言</small></h3>
+        <div id="choices"></div>
+      </div>
+
+      <form class="panel composer" id="composer">
+        <textarea id="message" rows="2" placeholder="开局后可以发言…"></textarea>
+        <button id="send" type="submit" disabled>发送</button>
+      </form>
+    </section>
+
+    <aside>
+      <div class="panel">
+        <h3>状态</h3>
+        <dl id="status">
+          <dt>状态</dt><dd>未开局</dd>
+          <dt>阶段</dt><dd>—</dd>
+          <dt>时间</dt><dd>—</dd>
+          <dt>内容包</dt><dd>—</dd>
+        </dl>
+      </div>
+
+      <div class="panel">
+        <h3>设备与部位<small>部位标签是人类配置；本页不显示强度数值</small></h3>
+        <div id="devices"><div class="hint">正在读取…</div></div>
+      </div>
+
+      <div class="panel">
+        <h3>感知<small>只显示可用性与质量，不显示任何测量值</small></h3>
+        <div id="sensors"><div class="hint">正在读取…</div></div>
+      </div>
+
+      <div class="panel" id="debugPanel" style="display:none">
+        <h3>调试<small>probe 数值与解析结果；关闭时不请求、不渲染</small></h3>
+        <div id="debugProbes"></div>
+      </div>
+    </aside>
+  </div>
+
+  <footer>
+    <div>轮询 2Hz（会话/台词 500ms，设备/部位 2s，感知 3s）；所有 API 都要 <code>x-control-token</code>。</div>
+    <div>token 只在地址栏：本页不写 localStorage、不写日志。急停走 <code>/api/panic</code>，随时可用。</div>
+    <div>默认不请求、不渲染 probe 数值与解析结果；需要时点右上角「调试」（复用 <code>/api/debug</code>）。</div>
+  </footer>
+
+  <script src="/play.js"></script>
+</body>
+</html>

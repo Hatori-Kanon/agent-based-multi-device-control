@@ -20,6 +20,15 @@ import { createCameraWorker, type CameraWorker } from './sensors/camera-window.t
 const PANIC_ACCELERATOR = 'Control+Alt+X'
 
 /**
+ * Opens the play page (B2-T12) in its own window.
+ *
+ * The play page is the same HTTP page the console serves (`/play`); it is not
+ * another Electron entry point. The shortcut mirrors the console's open path:
+ * a normal BrowserWindow loading the dashboard URL with the token in the query.
+ */
+const PLAY_ACCELERATOR = 'Control+Alt+P'
+
+/**
  * Bump whenever the main-process bundle changes meaningfully. The launcher
  * prints it at startup so a stale dist/main.mjs is never mistaken for current
  * code — which already cost one debugging round.
@@ -32,6 +41,7 @@ let runtime: HostRuntime | undefined
 let bleWorker: BleWorker | undefined
 let cameraWorker: CameraWorker | undefined
 let window: BrowserWindow | undefined
+let playWindow: BrowserWindow | undefined
 let quitting = false
 
 function dataDir(): string {
@@ -120,12 +130,26 @@ function registerIpc(): void {
   })
 }
 
-async function createWindow(): Promise<void> {
+/**
+ * Same-origin page URL carrying the control token in the query.
+ *
+ * This is the console's existing convention: the page's own fetch() calls send
+ * `x-control-token`, while a page navigation cannot carry headers at all. The
+ * token therefore stays in the URL (never in the page, storage or a log line
+ * beyond the startup log that already prints the console URL).
+ */
+function dashboardPageUrl(pathname: string): string | undefined {
   const address = runtime?.dashboardAddress
-  if (address === undefined) {
+  const token = runtime?.dashboardToken
+  if (address === undefined || token === undefined) return undefined
+  return `http://${address.host}:${address.port}${pathname}?token=${encodeURIComponent(token)}`
+}
+
+async function createWindow(): Promise<void> {
+  const url = dashboardPageUrl('/')
+  if (url === undefined) {
     throw new Error('the control console did not start; cannot open the window')
   }
-  const url = `http://${address.host}:${address.port}/?token=${encodeURIComponent(runtime!.dashboardToken)}`
   window = new BrowserWindow({
     width: 1080,
     height: 800,
@@ -142,6 +166,35 @@ async function createWindow(): Promise<void> {
   // The console is an HTTP page served by the runtime; a phone on the LAN can
   // open the same address once the dashboard is bound beyond loopback.
   await window.loadURL(url)
+}
+
+/**
+ * Open the play page (B2-T12) in its own window.
+ *
+ * Same origin, same token-in-query rule as the console: the page does its own
+ * fetch() calls with `x-control-token`. No preload is attached — the play page
+ * talks HTTP only, so its window needs no IPC surface.
+ */
+async function openPlayWindow(): Promise<void> {
+  const url = dashboardPageUrl('/play')
+  if (url === undefined) return
+  if (playWindow !== undefined) {
+    playWindow.focus()
+    return
+  }
+  playWindow = new BrowserWindow({
+    width: 1120,
+    height: 880,
+    title: 'Embodied 游玩',
+    backgroundColor: '#0d0d12',
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  })
+  playWindow.on('closed', () => { playWindow = undefined })
+  await playWindow.loadURL(url)
 }
 
 /** Cut output before the process goes away, whatever the exit path. */
@@ -260,10 +313,24 @@ void app.whenReady().then(async () => {
     console.error(`[embodied] could not register ${PANIC_ACCELERATOR}; use the on-screen stop button`)
   }
 
+  // Play page entry (B2-T12). The console stays the device console; the play
+  // page opens beside it and can be reopened at any time.
+  const playRegistered = globalShortcut.register(PLAY_ACCELERATOR, () => {
+    void openPlayWindow().catch(reportError)
+  })
+  if (!playRegistered) {
+    console.error(`[embodied] could not register ${PLAY_ACCELERATOR}; open the play URL printed below instead`)
+  }
+
   await createWindow()
 
-  if (runtime.dashboardAddress !== undefined) {
-    console.log(`[embodied] console: http://${runtime.dashboardAddress.host}:${runtime.dashboardAddress.port}/?token=${runtime.dashboardToken}`)
+  const consoleUrl = dashboardPageUrl('/')
+  if (consoleUrl !== undefined) {
+    console.log(`[embodied] console: ${consoleUrl}`)
+  }
+  const playUrl = dashboardPageUrl('/play')
+  if (playUrl !== undefined) {
+    console.log(`[embodied] play: ${playUrl} (${PLAY_ACCELERATOR} opens it in its own window)`)
   }
   if (runtime.panicAddress !== undefined) {
     console.log(`[embodied] out-of-band stop: POST http://${runtime.panicAddress.host}:${runtime.panicAddress.port}/panic`)

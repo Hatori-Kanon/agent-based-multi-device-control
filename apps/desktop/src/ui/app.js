@@ -23,6 +23,7 @@
     wfImport: document.getElementById('wfImport'),
     wfGrid: document.getElementById('wfGrid'),
     sensors: document.getElementById('sensors'),
+    playOpen: document.getElementById('playOpen'),
     debugToggle: document.getElementById('debugToggle'),
     debugPanel: document.getElementById('debugPanel'),
     debugProbes: document.getElementById('debugProbes'),
@@ -562,6 +563,12 @@
     }
     await renderDebugProbes()
   }
+
+  // The play page is a sibling console page; the token travels in the query,
+  // exactly like the console's own entry URL (no storage, no referrer deps).
+  el.playOpen.addEventListener('click', () => {
+    window.open(`/play?token=${encodeURIComponent(token)}`, '_blank', 'noopener')
+  })
 
   el.debugToggle.addEventListener('click', async () => {
     try {

@@ -15,6 +15,10 @@ import { join } from 'node:path'
 import { createHostRuntime } from './main/bootstrap.ts'
 import indexHtml from './ui/index.html?text'
 import appJs from './ui/app.js?text'
+// B2-T12: the play page is part of the same in-memory bundle, so start-dev.bat
+// reaches /play without Electron and without a disk lookup.
+import playHtml from './ui/play.html?text'
+import playJs from './ui/play.js?text'
 
 const dataDir = process.env.EMBODIED_DATA_DIR ?? join(process.cwd(), '.dev-data')
 const port = Number(process.env.EMBODIED_DASHBOARD_PORT ?? 0)
@@ -29,6 +33,8 @@ const runtime = await createHostRuntime({
   dashboardStaticFiles: {
     'index.html': indexHtml,
     'app.js': appJs,
+    'play.html': playHtml,
+    'play.js': playJs,
   },
   onError: error => { console.error('[dev-server]', error) },
 })
@@ -40,6 +46,9 @@ if (address === undefined) {
 }
 const consoleUrl = `http://${address.host}:${address.port}/?token=${runtime.dashboardToken}`
 console.log(`[dev-server] console: ${consoleUrl}`)
+// Same token-in-query convention; opening the console URL and swapping the
+// path would work too, but printing it means nobody has to.
+console.log(`[dev-server] play: http://${address.host}:${address.port}/play?token=${runtime.dashboardToken}`)
 console.log(`[dev-server] data: ${dataDir}`)
 
 // Convenience for the one-click batch script; opt-in so embedding the server

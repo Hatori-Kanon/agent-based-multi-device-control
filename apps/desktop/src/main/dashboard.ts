@@ -379,8 +379,21 @@ const STATIC_TYPES: Readonly<Record<string, string>> = {
   '.css': 'text/css; charset=utf-8',
 }
 
-/** Static console files. `/phone` is an alias for the phone stop page (A1-T9). */
-const STATIC_FILES = new Set(['index.html', 'app.js', 'style.css', 'phone.html'])
+/** Static console files. `/phone` and `/play` are page aliases (A1-T9, B2-T12). */
+const STATIC_FILES = new Set(['index.html', 'app.js', 'style.css', 'phone.html', 'play.html', 'play.js'])
+
+/**
+ * Page aliases → static file name.
+ *
+ * The play page is a static page plus its script, not a new business route:
+ * `/play` only renames `/play.html`, and the allowlist still decides what can
+ * be served (a request for `/play.json` is a clean 404).
+ */
+const STATIC_ALIASES: Readonly<Record<string, string>> = {
+  '/': '/index.html',
+  '/phone': '/phone.html',
+  '/play': '/play.html',
+}
 
 export class DashboardServer {
   private server: Server | undefined
@@ -839,11 +852,13 @@ export class DashboardServer {
       return
     }
 
-    // Static console files. `/phone` is the phone stop/status page (A1-T9):
-    // a page navigation cannot carry headers, so it is exempt from the token
-    // like the console itself — the page's own API calls still authenticate.
+    // Static console files. `/phone` is the phone stop/status page (A1-T9) and
+    // `/play` is the play page (B2-T12): a page navigation cannot carry
+    // headers, so these are exempt from the token like the console itself —
+    // the page's own API calls still authenticate. The allowlist is the whole
+    // static surface (no directory serving), so an unknown name is a 404.
     if (request.method === 'GET' && !isApi) {
-      const requested = pathname === '/' ? '/index.html' : pathname === '/phone' ? '/phone.html' : pathname
+      const requested = STATIC_ALIASES[pathname] ?? pathname
       const safeName = normalize(requested).replace(/^([/\\])+/u, '')
       if (!STATIC_FILES.has(safeName)) {
         sendError(response, 404, 'not found')

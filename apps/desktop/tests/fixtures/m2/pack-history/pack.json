@@ -1,0 +1,18 @@
+{
+  "id": "demo",
+  "name": "M2 跨会话验收包",
+  "version": "1.0.0",
+  "engine": ">=0.2 <1.0",
+  "mode": "freeform",
+  "rating": "all",
+  "author": "B2-T13",
+  "description": "声明 history/metaReactions 的 freeform 包：上一局 left_early → 本局开场语气 cold。",
+  "boundaries": ["不做真实伤害"],
+  "history": { "read": true, "windowHours": 72, "lastN": 1 },
+  "metaReactions": [
+    {
+      "when": { "endReason": ["left_early"] },
+      "opening": { "tone": "cold", "firstIntent": "soothe" }
+    }
+  ]
+}

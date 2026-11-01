@@ -960,3 +960,192 @@ describe('session controls (B2-T11)', () => {
     }
   })
 })
+
+describe('play page (B2-T12)', () => {
+  const PLAY_TOKEN = 'play-token-0123456789abcdef'
+
+  /** The snapshot `GET /api/session` serves: 0–3 options, no device numbers. */
+  function playSnapshot(): Record<string, unknown> {
+    return {
+      state: 'idle',
+      turnId: 3,
+      phase: 'scene',
+      elapsedMin: 6,
+      remainingMin: 24,
+      lastLine: '（她把灯调暗了一点）',
+      choices: [
+        { id: 'c1', label: '往后退一步', tag: 'resist' },
+        { id: 'c2', label: '留在原地', tag: 'passive' },
+        { id: 'c3', label: '开口求饶', tag: 'plead' },
+      ],
+      outcome: 'completed',
+      checkpoint: 0.5,
+      mustResolve: false,
+      sessionId: 'session-play-1',
+      packId: 'tentacle-pure',
+      packVersion: '1.0.0',
+    }
+  }
+
+  /** Minimal deps: only the session snapshot and the static files are read. */
+  function playDeps(calls: string[]): DashboardDeps {
+    const unused = (): never => { throw new Error('not used by the play-page routes') }
+    return {
+      snapshot: () => ({ locked: false, devices: [] }),
+      session: {
+        start: async () => playSnapshot(),
+        message: async () => playSnapshot(),
+        end: async () => playSnapshot(),
+        snapshot: () => playSnapshot(),
+        pause: async () => playSnapshot(),
+        resume: async () => playSnapshot(),
+        choose: async (choiceId: string) => {
+          calls.push(`choice:${choiceId}`)
+          return playSnapshot()
+        },
+        transcript: () => [{ turnId: 1, at: 1_000, text: '（她把灯调暗了一点）' }],
+      },
+      listPacks: async () => [],
+      importPack: async () => unused(),
+      activatePack: async () => unused(),
+      panic: async () => unused(),
+      unlock: async () => unused(),
+      setCap: async () => unused(),
+      demo: async () => unused(),
+      pattern: async () => unused(),
+      stop: async () => unused(),
+      connect: async () => unused(),
+      scan: async () => unused(),
+      listDevices: () => unused(),
+      addDevice: async () => unused(),
+      removeDevice: async () => unused(),
+      rawWrite: async () => unused(),
+      listWaveforms: () => unused(),
+      importWaveform: async () => unused(),
+      promoteWaveform: async () => unused(),
+      setWaveform: async () => unused(),
+      auditTail: async () => unused(),
+      recentErrors: () => unused(),
+      recentLogs: () => unused(),
+      sensorsStatus: () => [],
+      sensorFrame: async () => unused(),
+      pushFeatures: () => unused(),
+    }
+  }
+
+  it('serves the play page and its script through the static whitelist', async () => {
+    const host = await start()
+    // A page navigation cannot carry headers: `/play` (and `/play.js`) must be
+    // readable without the token, exactly like the console and the phone page.
+    const page = await fetch(`${base(host)}/play`)
+    expect(page.status).toBe(200)
+    expect(page.headers.get('content-type')).toContain('text/html')
+    const html = await page.text()
+    expect(html).toContain('Embodied 游玩')
+    expect(html).toContain('/play.js')
+    expect(html).toMatch(/connect-src 'self'/)
+    // Safety chrome is in the markup: a persistent stop button and the LOCKED
+    // banner. The debug panel ships hidden — off is the default view.
+    expect(html).toContain('id="panic"')
+    expect(html).toContain('紧急停止')
+    expect(html).toContain('id="lockBanner"')
+    expect(html).toContain('id="choices"')
+    expect(html).toContain('会话上限')
+    expect(html).toContain('id="debugPanel" style="display:none"')
+    // No probe/tool field name and no probe number may appear in the default
+    // page — the player only sees narrative, options and time.
+    expect(html).not.toMatch(/motionEnergy|motionPeak|staticRatio|centerMotionRatio|lumaMean|lumaStd|overexposedRatio|underexposedRatio|audioLevelPct|bpm/u)
+    expect(html).not.toContain('0.31')
+
+    const script = await fetch(`${base(host)}/play.js`)
+    expect(script.status).toBe(200)
+    expect(script.headers.get('content-type')).toContain('javascript')
+    const js = await script.text()
+    // The three surfaces the page drives besides the session snapshot.
+    expect(js).toContain('/api/session/transcript')
+    expect(js).toContain('/api/session/ceiling')
+    expect(js).toContain('/api/panic')
+    // Token convention: query once, then the header — never persisted, and no
+    // bare console.error when a poll fails.
+    expect(js).not.toContain('localStorage')
+    expect(js).not.toMatch(/\bconsole\./u)
+
+    // The allowlist is still a whitelist: only the two named files are served.
+    expect((await fetch(`${base(host)}/play.json`)).status).toBe(404)
+    expect((await fetch(`${base(host)}/src/ui/play.html`)).status).toBe(404)
+  })
+
+  it('renders choices from the session snapshot and posts the picked id', async () => {
+    const calls: string[] = []
+    const server = new DashboardServer({ deps: playDeps(calls), token: PLAY_TOKEN })
+    const address = await server.start()
+    const url = `http://${address.host}:${address.port}`
+    try {
+      // What the page renders from: 0–3 options, each with a player-visible label.
+      const snapshot = await fetch(`${url}/api/session`, { headers: headers(PLAY_TOKEN) })
+      expect(snapshot.status).toBe(200)
+      const body = (await snapshot.json()) as { choices: Array<{ id: string; label: string }> }
+      expect(body.choices.map(choice => choice.id)).toEqual(['c1', 'c2', 'c3'])
+      expect(body.choices.every(choice => typeof choice.label === 'string')).toBe(true)
+
+      // The script draws the buttons from that list (capped at three) and posts
+      // the picked id — the assertion is on the data flow, since the suite has
+      // no browser/DOM harness.
+      const script = await (await fetch(`${url}/play.js`)).text()
+      expect(script).toContain('current.choices')
+      expect(script).toContain('choice.label')
+      expect(script).toContain('.slice(0, 3)')
+      expect(script).toContain('choiceId')
+      expect(script).toContain('/api/session/choice')
+
+      // Clicking an option posts exactly that id to the token-guarded route.
+      const picked = await fetch(`${url}/api/session/choice`, {
+        method: 'POST',
+        headers: headers(PLAY_TOKEN, true),
+        body: JSON.stringify({ choiceId: 'c2' }),
+      })
+      expect(picked.status).toBe(200)
+      expect(calls).toEqual(['choice:c2'])
+
+      // Anonymous clicks are refused like every other data endpoint.
+      const anonymous = await fetch(`${url}/api/session/choice`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ choiceId: 'c1' }),
+      })
+      expect(anonymous.status).toBe(401)
+    } finally {
+      await server.stop()
+    }
+  })
+
+  it('serves the play page from the in-memory bundle the dev server ships', async () => {
+    // `start-dev.bat` runs `dev-server.ts`, which inlines the UI files into the
+    // bundle and hands them over as `staticFiles`; this is that exact path.
+    const { readFile } = await import('node:fs/promises')
+    const [playHtmlText, playJsText] = await Promise.all([
+      readFile(join(process.cwd(), 'src', 'ui', 'play.html'), 'utf8'),
+      readFile(join(process.cwd(), 'src', 'ui', 'play.js'), 'utf8'),
+    ])
+    const calls: string[] = []
+    const server = new DashboardServer({
+      deps: playDeps(calls),
+      token: PLAY_TOKEN,
+      staticFiles: { 'play.html': playHtmlText, 'play.js': playJsText },
+    })
+    const address = await server.start()
+    const url = `http://${address.host}:${address.port}`
+    try {
+      const page = await fetch(`${url}/play`)
+      expect(page.status).toBe(200)
+      expect(await page.text()).toContain('/play.js')
+
+      const script = await fetch(`${url}/play.js`)
+      expect(script.status).toBe(200)
+      expect(script.headers.get('content-type')).toContain('javascript')
+      expect(await script.text()).toContain('/api/session/transcript')
+    } finally {
+      await server.stop()
+    }
+  })
+})
