@@ -1,8 +1,16 @@
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
-import { FakeClock, type AuditRecord } from '@embodied/core'
+import {
+  FakeClock,
+  M2_MODEL_TOOLS,
+  probeDirectorJson,
+  probePromptBlock,
+  type AuditRecord,
+  type ProbeRecord,
+} from '@embodied/core'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createHostRuntime, type HostRuntime } from '../src/main/bootstrap.ts'
+import { DashboardServer, type DashboardDeps } from '../src/main/dashboard.ts'
 import type { CameraHost } from '../src/main/sensors/camera-host.ts'
 
 let root: string
@@ -274,6 +282,208 @@ describe('DashboardServer', () => {
     const host = await start()
     const response = await fetch(`${base(host)}/api/does-not-exist`, { headers: headers(host.dashboardToken) })
     expect(response.status).toBe(404)
+  })
+})
+
+const DEBUG_TOKEN = 'debug-console-token'
+
+/** One settled probe with numbers the default console must never render. */
+const DEBUG_PROBE: ProbeRecord = {
+  probeId: 'p-0007',
+  turnId: 3,
+  beatId: 'b-2',
+  intentId: 'probe-touch',
+  trigger: 'passive',
+  actionAt: 12_000,
+  targets: [{ deviceId: 'mock-pulse', channelId: 'a' }],
+  baseline: undefined,
+  window: undefined,
+  delta: { motion: 0.31, audioPct: 18 },
+  verdict: 'responded',
+}
+
+/**
+ * The smallest dependency set the debug routes need (A2-T7).
+ *
+ * Everything the debug paths do not touch throws, so a later refactor that
+ * makes `GET /api/debug` reach for, say, `listWaveforms` fails loudly instead
+ * of silently widening the console's read surface.
+ */
+function debugDeps(records: readonly ProbeRecord[]): DashboardDeps {
+  const unused = (): never => { throw new Error('not used by the debug routes') }
+  return {
+    snapshot: () => ({ locked: false, devices: [] }),
+    session: {
+      start: async () => unused(),
+      message: async () => unused(),
+      end: async () => unused(),
+      snapshot: () => ({ phase: 'scene', lastLine: '……', choices: [] }),
+    },
+    panic: async () => unused(),
+    unlock: async () => unused(),
+    setCap: async () => unused(),
+    demo: async () => unused(),
+    pattern: async () => unused(),
+    stop: async () => unused(),
+    connect: async () => unused(),
+    scan: async () => unused(),
+    listDevices: () => unused(),
+    addDevice: async () => unused(),
+    removeDevice: async () => unused(),
+    rawWrite: async () => unused(),
+    listWaveforms: () => unused(),
+    importWaveform: async () => unused(),
+    promoteWaveform: async () => unused(),
+    setWaveform: async () => unused(),
+    auditTail: async () => unused(),
+    recentErrors: () => unused(),
+    recentLogs: () => unused(),
+    sensorsStatus: () => [],
+    sensorFrame: async () => unused(),
+    pushFeatures: () => unused(),
+    probes: () => records,
+  }
+}
+
+async function startDebugServer(records: readonly ProbeRecord[]): Promise<{ server: DashboardServer; base: string }> {
+  const server = new DashboardServer({ deps: debugDeps(records), token: DEBUG_TOKEN })
+  const address = await server.start()
+  return { server, base: `http://${address.host}:${address.port}` }
+}
+
+describe('debug mode (A2-T7)', () => {
+  it('hides probe numbers and resolved commands unless debug mode is on', async () => {
+    const { server, base: url } = await startDebugServer([DEBUG_PROBE])
+    try {
+      // The contract: `debugMode()` is process-local and off by default.
+      expect(server.debugMode()).toBe(false)
+      const off = await fetch(`${url}/api/debug`, { headers: headers(DEBUG_TOKEN) })
+      expect(off.status).toBe(200)
+      expect(await off.json()).toEqual({ enabled: false })
+
+      // Off is a refusal, not an empty list: "[]" would be indistinguishable
+      // from "no probe settled yet", and the error body must not leak a single
+      // number, probe id or resolved target.
+      const hidden = await fetch(`${url}/api/debug/probes`, { headers: headers(DEBUG_TOKEN) })
+      expect(hidden.status).toBe(403)
+      const hiddenText = await hidden.text()
+      expect(hiddenText).not.toContain('p-0007')
+      expect(hiddenText).not.toContain('0.31')
+      expect(hiddenText).not.toContain('probe-touch')
+      expect(hiddenText).not.toContain('mock-pulse')
+
+      // A script cannot flip the switch without the control token.
+      const anonymous = await fetch(`${url}/api/debug`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: true }),
+      })
+      expect(anonymous.status).toBe(401)
+
+      const bad = await fetch(`${url}/api/debug`, {
+        method: 'POST',
+        headers: headers(DEBUG_TOKEN, true),
+        body: JSON.stringify({ enabled: 'yes' }),
+      })
+      expect(bad.status).toBe(400)
+
+      const on = await fetch(`${url}/api/debug`, {
+        method: 'POST',
+        headers: headers(DEBUG_TOKEN, true),
+        body: JSON.stringify({ enabled: true }),
+      })
+      expect(on.status).toBe(200)
+      expect(await on.json()).toEqual({ enabled: true })
+      expect(server.debugMode()).toBe(true)
+
+      const shown = await fetch(`${url}/api/debug/probes`, { headers: headers(DEBUG_TOKEN) })
+      expect(shown.status).toBe(200)
+      // The route is the documented structured surface, not a bespoke shape.
+      expect(await shown.json()).toEqual(JSON.parse(JSON.stringify(probeDirectorJson([DEBUG_PROBE]))))
+
+      // Turning the switch back off closes the tap immediately.
+      const backOff = await fetch(`${url}/api/debug`, {
+        method: 'POST',
+        headers: headers(DEBUG_TOKEN, true),
+        body: JSON.stringify({ enabled: false }),
+      })
+      expect(backOff.status).toBe(200)
+      expect((await fetch(`${url}/api/debug/probes`, { headers: headers(DEBUG_TOKEN) })).status).toBe(403)
+
+      // The console page ships the switch but the default view renders no
+      // number at all; the script only asks for probes behind the switch.
+      const html = await (await fetch(`${url}/`)).text()
+      expect(html).toContain('id="debugToggle"')
+      expect(html).toContain('id="debugPanel" style="display:none"')
+      expect(html).toContain('id="debugProbes"')
+      expect(html).toContain('id="sensors"')
+      expect(html).not.toContain('0.31')
+      expect(html).not.toContain('p-0007')
+      const script = await (await fetch(`${url}/app.js`)).text()
+      expect(script).toContain('/api/debug/probes')
+      expect(script).toContain('debugEnabled')
+      expect(script).toContain('解析')
+    } finally {
+      await server.stop()
+    }
+  })
+
+  it('keeps debug mode out of the model context', async () => {
+    const { server, base: url } = await startDebugServer([DEBUG_PROBE])
+    try {
+      // What the model may see is the digit-free narrative projection; the raw
+      // delta is the debug/audit adapter surface, never a prompt input.
+      const modelBlock = probePromptBlock([DEBUG_PROBE], { for: 'model' })
+      expect(modelBlock).not.toMatch(/\p{Nd}/u)
+      expect(modelBlock).not.toContain('0.31')
+
+      const sessionBefore = await (await fetch(`${url}/api/session`, { headers: headers(DEBUG_TOKEN) })).text()
+      const snapshotBefore = await (await fetch(`${url}/api/snapshot`, { headers: headers(DEBUG_TOKEN) })).text()
+      expect(sessionBefore).not.toContain('0.31')
+      expect(snapshotBefore).not.toContain('p-0007')
+
+      await fetch(`${url}/api/debug`, {
+        method: 'POST',
+        headers: headers(DEBUG_TOKEN, true),
+        body: JSON.stringify({ enabled: true }),
+      })
+      const probes = await (await fetch(`${url}/api/debug/probes`, { headers: headers(DEBUG_TOKEN) })).text()
+      expect(probes).toContain('0.31')
+
+      // Flipping the console switch changes no model-facing payload: the same
+      // bytes before and after, and still no probe detail in either.
+      expect(await (await fetch(`${url}/api/session`, { headers: headers(DEBUG_TOKEN) })).text()).toBe(sessionBefore)
+      expect(await (await fetch(`${url}/api/snapshot`, { headers: headers(DEBUG_TOKEN) })).text()).toBe(snapshotBefore)
+      expect(probePromptBlock([DEBUG_PROBE], { for: 'model' })).toBe(modelBlock)
+
+      // The model's tool surface has no way to read or flip the switch.
+      const toolNames = M2_MODEL_TOOLS.map(tool => tool.name)
+      expect(toolNames.some(name => /debug|probe/iu.test(name))).toBe(false)
+    } finally {
+      await server.stop()
+    }
+  })
+
+  it('answers an empty probe list without a recorder and leaves the audit untouched', async () => {
+    const host = await start()
+    const token = host.dashboardToken
+    const auditBefore = await (await fetch(`${base(host)}/api/audit`, { headers: headers(token) })).text()
+
+    const enable = await fetch(`${base(host)}/api/debug`, {
+      method: 'POST',
+      headers: headers(token, true),
+      body: JSON.stringify({ enabled: true }),
+    })
+    expect(enable.status).toBe(200)
+
+    const probes = await fetch(`${base(host)}/api/debug/probes`, { headers: headers(token) })
+    expect(probes.status).toBe(200)
+    expect(await probes.json()).toEqual([])
+
+    // Toggling the switch is console state, not a session action: the audit
+    // trail is byte-identical (A2-T7: 审计不因调试模式变化).
+    const auditAfter = await (await fetch(`${base(host)}/api/audit`, { headers: headers(token) })).text()
+    expect(auditAfter).toBe(auditBefore)
   })
 })
 

@@ -234,6 +234,65 @@ export function createModelRunner(options: CreateModelRunnerOptions): ModelRunne
   })
 }
 
+/**
+ * The runner set a two-call turn needs (B2-T3).
+ *
+ * `runner` is always the `default` model. A role runner exists **only** when
+ * that role names its own model, so a caller can hand the set to
+ * `TurnPipeline` unchanged: `undefined` means "the pipeline falls back to
+ * `runner`". Splitting is therefore a settings-file change
+ * (`llm.director` / `llm.writer`), not an assembly change.
+ */
+export interface LlmRoleRunners {
+  /** The `default` model; also the fallback for every role. */
+  readonly runner: ModelRunner
+  /** Present only when `llm.director` is a model config. */
+  readonly directorRunner?: ModelRunner
+  /** Present only when `llm.writer` is a model config. */
+  readonly writerRunner?: ModelRunner
+}
+
+/** Options for {@link createRoleRunners}; `llm` replaces the single `model`. */
+export interface CreateRoleRunnersOptions extends Omit<CreateModelRunnerOptions, 'model'> {
+  readonly llm: LlmConfig
+}
+
+/**
+ * Build the provider-neutral runners for the pipeline's two roles.
+ *
+ * Constructor work is pure configuration: no socket is opened and no request is
+ * made. The capability cache, when supplied, is shared by every runner in the
+ * set (the adapter keys it by provider + model, so sharing only avoids duplicate
+ * probes).
+ */
+export function createRoleRunners(options: CreateRoleRunnersOptions): LlmRoleRunners {
+  const director = options.llm.director
+  const writer = options.llm.writer
+  return {
+    runner: createRunnerFor(options.llm.default, options),
+    ...(director === null || director === undefined
+      ? {}
+      : { directorRunner: createRunnerFor(director, options) }),
+    ...(writer === null || writer === undefined
+      ? {}
+      : { writerRunner: createRunnerFor(writer, options) }),
+  }
+}
+
+function createRunnerFor(
+  model: ModelConfig,
+  options: Omit<CreateModelRunnerOptions, 'model'>,
+): ModelRunner {
+  return createModelRunner({
+    model,
+    fetch: options.fetch,
+    clock: options.clock,
+    ...(options.apiKey === undefined ? {} : { apiKey: options.apiKey }),
+    ...(options.env === undefined ? {} : { env: options.env }),
+    ...(options.capabilities === undefined ? {} : { capabilities: options.capabilities }),
+  })
+}
+
 /** Key-free status payload for the console/diagnostics (see `settings.ts`). */
 export function llmSummaryOf(settings: LlmSettings): LlmSummary {
   return summarizeLlm(settings.config, settings.apiKeySource)

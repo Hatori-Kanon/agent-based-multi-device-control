@@ -155,6 +155,25 @@ export async function runTurn(options: TurnLoopOptions): Promise<TurnResult> {
   }
   callerSignal?.addEventListener('abort', forwardAbort, { once: true })
 
+  // Wave-3 review blocker B-4: a runner (or a dispatch) that ignores the abort
+  // signal must not make the turn hang, and an abort after the deadline must
+  // never turn into a success. Every await below races this rejection.
+  let abortReject: () => void = () => {}
+  const abortRace = new Promise<never>((_, reject) => {
+    abortReject = () => reject(timedOut ? timeoutError(timeoutMs) : abortedError())
+    if (controller.signal.aborted) abortReject()
+    else controller.signal.addEventListener('abort', abortReject, { once: true })
+  })
+  // The rejection is observed by whoever awaits it; keep Node from treating a
+  // late duplicate as unhandled when the turn already returned.
+  abortRace.catch(() => {})
+
+  const settleDispatch = async (): Promise<void> => {
+    if (pendingDispatch === undefined) return
+    await Promise.race([pendingDispatch, abortRace])
+    if (dispatchError !== undefined) throw dispatchError
+  }
+
   const lineParts: string[] = []
   const warnings: string[] = []
   const handledToolCallIds = new Set<string>()
@@ -240,7 +259,7 @@ export async function runTurn(options: TurnLoopOptions): Promise<TurnResult> {
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
       let failure: unknown
       try {
-        result = await runner.run(request)
+        result = await Promise.race([runner.run(request), abortRace])
       } catch (error) {
         failure = error
       }
@@ -257,8 +276,7 @@ export async function runTurn(options: TurnLoopOptions): Promise<TurnResult> {
         && !applied
         && isRetryableTurnError(failure)
       if (!retryable) {
-        if (pendingDispatch !== undefined) await pendingDispatch
-        if (dispatchError !== undefined) throw dispatchError
+        await settleDispatch()
         throw failure
       }
       warnings.push(`transport failure retried once (${describeError(failure)})`)
@@ -270,8 +288,11 @@ export async function runTurn(options: TurnLoopOptions): Promise<TurnResult> {
 
     // A runner that only fills `result.toolCalls` (no callback) still works.
     for (const call of result.toolCalls) onToolCall(call)
-    if (pendingDispatch !== undefined) await pendingDispatch
-    if (dispatchError !== undefined) throw dispatchError
+    await settleDispatch()
+    // A late dispatch that resolves after the deadline must not be reported as
+    // a successful turn.
+    if (timedOut) throw timeoutError(timeoutMs)
+    if (isAborted(callerSignal)) throw abortedError()
 
     return {
       turnId: input.turnId,
@@ -284,6 +305,7 @@ export async function runTurn(options: TurnLoopOptions): Promise<TurnResult> {
     }
   } finally {
     timer.cancel()
+    controller.signal.removeEventListener('abort', abortReject)
     callerSignal?.removeEventListener('abort', forwardAbort)
   }
 }

@@ -13,6 +13,19 @@
  *   engine's {@link TurnRequest} to the loop's {@link TurnLoopOptions};
  * - `PlanExecutor` (B1-T7) is the only dispatch path to the `DeviceRegistry`.
  *
+ * ## Session archive and cross-session memory (B2-T7/T8)
+ *
+ * When the host injects a {@link PlayArchive}, `start` first settles anything
+ * the previous process left behind — the archive relabels a still-`active`
+ * snapshot `recovered`, the ledger turns a stale open marker into
+ * `unexpected_exit` — and then opens this session. `TurnEngine.onSettle`
+ * writes one snapshot per settled turn (no replay of an interrupted turn),
+ * `end`/`panic` write the final snapshot and **one** ledger line, and a pack
+ * that declares `history.read` gets its `metaReactions` opening brief folded
+ * into the opening turn's system prompt. The archive/ledger are injected, not
+ * constructed here, so `bootstrap.ts` decides where the files live; absent
+ * ports mean the session runs exactly as B1-T16 did and writes nothing.
+ *
  * ## One process, one session
  *
  * {@link PlayHost} holds at most one {@link PlaySession}. `start` is refused
@@ -57,8 +70,10 @@ import {
   TurnEngine,
   WHOLE_BODY_REGION,
   type AuditLog,
+  type AppendOnlyStore,
   type Clock,
   type DeviceRegistry,
+  type DocumentStore,
   type EndReason,
   type EngineConfig,
   type EngineEvent,
@@ -75,11 +90,25 @@ import {
   type SensorRegistry,
   type TurnExecutor,
   type TurnRequest,
+  type TurnResult,
   type TurnRunner,
   type TurnRunnerResult,
   type WaveformLibrary,
 } from '@embodied/core'
 import type { ContentSource } from '@embodied/core'
+import {
+  matchMetaReactions,
+  ReactionProbeRecorder,
+  SessionLedger,
+  SessionStore,
+  type LedgerEntry,
+  type OpeningBrief,
+  type ProbeRecord,
+  type ProbeRegistrar,
+  type SessionEndReason,
+  type SessionState,
+  type WaveformLookup,
+} from '@embodied/core'
 
 /** Phase id of the synthetic freeform scene. */
 export const FREEFORM_PHASE_ID = 'scene'
@@ -128,6 +157,30 @@ export function isSessionError(value: unknown): value is SessionError {
   return value instanceof SessionError
 }
 
+/**
+ * Persistence seams for B2-T7 (session archive) and B2-T8 (ledger).
+ *
+ * The host owns the ports; `play.ts` only composes the two core modules around
+ * one session. `memory` defaults to `state` when the host keeps both under one
+ * document namespace (in-memory tests do that); production wiring passes
+ * `<dataDir>/memory` so the marker lands at `memory/open.json`.
+ *
+ * `ledgerText` is the read side of the append-only ledger. `AppendOnlyStore`
+ * has no read method by design, so the host supplies a closure over
+ * `memory/ledger.jsonl`; without it the ledger remembers only sessions closed
+ * by this very process.
+ */
+export interface PlayArchive {
+  /** Session snapshots, `<dataDir>/state` (B2-T7). */
+  readonly state: DocumentStore
+  /** `memory/ledger.jsonl` (B2-T8). */
+  readonly ledger: AppendOnlyStore
+  /** Open/cut markers, `<dataDir>/memory`; defaults to `state`. */
+  readonly memory?: DocumentStore
+  /** Whole ledger text for `read()`; omit only in tests/short-lived hosts. */
+  readonly ledgerText?: () => Promise<string | undefined>
+}
+
 /** Everything a session needs from the host; all injected, nothing global. */
 export interface PlaySessionEnvironment {
   readonly clock: Clock
@@ -139,6 +192,12 @@ export interface PlaySessionEnvironment {
   readonly runner: ModelRunner
   /** Persist `state/policy.json` after a human ceiling change (D4/A1-T10). */
   readonly savePolicy: () => Promise<void>
+  /**
+   * Archive + ledger seams. Absent = no persistence: the session behaves
+   * exactly like B1-T16 and nothing is written. The Electron shell passes the
+   * file-backed ports; unit tests pass the in-memory ones.
+   */
+  readonly archive?: PlayArchive
   /** Live line deltas for the play UI / transcript (B2-T11 consumes it later). */
   readonly onLine?: (delta: string) => void
   /** Engine observability, forwarded to the debug panel when present. */
@@ -162,6 +221,8 @@ export interface PlayStartInput {
 
 /** What `GET /api/session` returns: the engine snapshot plus the pack identity. */
 export interface PlaySnapshot extends EngineSnapshot {
+  /** Stable id of this session; also the ledger/archive key (B2-T7/T8). */
+  readonly sessionId: string
   readonly packId: string
   readonly packVersion: string
 }
@@ -190,12 +251,41 @@ export class PlaySession {
   private readonly executor: PlanExecutor
   private engine: TurnEngine | undefined
   private pack: LoadedPack | undefined
+  /**
+   * Waveform ids the model may reference: packed assets (`builtin:x`,
+   * `<packId>:x`, bare `x`) first, then the host library. Without this adapter
+   * a plan that validated against the pack would still degrade to
+   * `unknown-waveform` at dispatch time (wave-3 review Y-1).
+   */
+  private readonly waveformLookup: WaveformLookup = {
+    get: id => this.pack?.resolveWaveform(id) ?? this.env.waveforms.get(id),
+  }
+  /** Passive probe recorder; absent until a session starts (A2-T1). */
+  private probeRecorder: ReactionProbeRecorder | undefined
+  /** Stable registrar handed to the executor before the recorder exists. */
+  private readonly probeRegistrar: ProbeRegistrar = {
+    register: action => this.probeRecorder?.register(action),
+  }
   private scenario: ScenarioDefinition | undefined
   private phases: PhaseMachine | undefined
   private sessionId: string | undefined
   private plannedMinutes = 0
   private started = false
   private readonly recentLines: string[] = []
+  /** B2-T7 archive; undefined when the host injected no `archive` seam. */
+  private store: SessionStore | undefined
+  /** B2-T8 ledger; undefined when the host injected no `archive` seam. */
+  private ledger: SessionLedger | undefined
+  /** Last snapshot written to {@link store}, so each turn patches the same base. */
+  private archived: SessionState | undefined
+  /** Exactly one ledger line per session, even if `end`/`panic` race. */
+  private ledgerClosed = false
+  /** Highest percent dispatched this session (ledger `maxCapUsed`, §4.7.2). */
+  private maxCapUsed = 0
+  /** Intent ids of the last two settled turns (`SessionState.recentBeats`). */
+  private readonly turnBeats: string[][] = []
+  /** `metaReactions` opening brief, consumed by the opening turn only. */
+  private openingBrief: OpeningBrief | undefined
 
   constructor(env: PlaySessionEnvironment) {
     this.env = env
@@ -204,7 +294,8 @@ export class PlaySession {
     this.executor = new PlanExecutor({
       registry: env.registry,
       audit: env.audit,
-      waveforms: env.waveforms,
+      waveforms: this.waveformLookup,
+      probes: this.probeRegistrar,
       clock: env.clock,
     })
   }
@@ -253,12 +344,64 @@ export class PlaySession {
 
     const scenario = scenarioFor(input.pack, plannedMinutes)
     const phases = new PhaseMachine(scenario.phases)
+
+    // ── B2-T7/T8: recover the previous session, then open this one ───────
+    // Recovery happens before the new snapshot is written: a still-active
+    // snapshot from an earlier process is relabelled `recovered`, and a stale
+    // ledger marker becomes exactly one `unexpected_exit` line. Neither path
+    // replays the unfinished turn (its effects may already be on hardware).
+    const sessionId = randomUUID()
+    const archive = this.env.archive
+    let store: SessionStore | undefined
+    let ledger: SessionLedger | undefined
+    let archived: SessionState | undefined
+    let openingBrief: OpeningBrief | undefined
+    if (archive !== undefined) {
+      store = new SessionStore({ documents: archive.state, clock: this.env.clock })
+      const recovered = await store.recover()
+      ledger = new SessionLedger({
+        store: archive.ledger,
+        documents: archive.memory ?? archive.state,
+        clock: this.env.clock,
+        ...(archive.ledgerText === undefined ? {} : { reader: archive.ledgerText }),
+        // The ledger dates a crash from the last settled snapshot (§4.7.2);
+        // `elapsedMin` is the only time fact the archive stores, so this is
+        // the snapshot time rounded down to the minute.
+        ...(recovered === undefined
+          ? {}
+          : {
+              snapshot: async (): Promise<{ at: number; phase: string } | undefined> => ({
+                at: Date.parse(recovered.startedAt) + recovered.elapsedMin * 60_000,
+                phase: recovered.currentPhase,
+              }),
+            }),
+      })
+      await ledger.recover()
+      openingBrief = matchMetaReactions(
+        input.pack.manifest,
+        await ledger.read(),
+        this.env.clock.now(),
+      )
+      archived = await store.open({
+        sessionId,
+        packId: input.pack.manifest.id,
+        phase: phases.current,
+      })
+      await ledger.open(sessionId, { pack: input.pack.manifest.id, plannedMin: plannedMinutes })
+    }
+
     const engine = new TurnEngine({
       clock: this.env.clock,
       audit: this.env.audit,
       runner: this.runnerFor(),
       plannedMinutes,
       phase: () => phases.current,
+      onSettle: async (snapshot): Promise<void> => {
+        // Every settled turn refreshes the archive (B2-T7). The engine has
+        // already left `locked`/terminal states alone, so no snapshot is
+        // written for a panicked or ended session.
+        await this.persistSnapshot(snapshot)
+      },
       onPause: async (): Promise<void> => {
         // Pause is B2-T11's surface, but the safety hook lands here already:
         // entering `paused` must never leave a device running.
@@ -276,10 +419,25 @@ export class PlaySession {
     this.pack = input.pack
     this.scenario = scenario
     this.phases = phases
+    this.store = store
+    this.ledger = ledger
+    this.archived = archived
+    this.openingBrief = openingBrief
+    this.turnBeats.length = 0
+    this.maxCapUsed = 0
+    this.ledgerClosed = false
     this.engine = engine
     this.plannedMinutes = plannedMinutes
-    this.sessionId = randomUUID()
+    this.sessionId = sessionId
     this.started = true
+    // Passive probes only exist while a session does; the recorder settles on
+    // the injected clock and writes one reaction_probe line per action.
+    this.probeRecorder?.dispose()
+    this.probeRecorder = new ReactionProbeRecorder({
+      clock: this.env.clock,
+      sensors: this.env.sensors,
+      audit: this.env.audit,
+    })
 
     await this.env.audit.record({
       actor: 'human',
@@ -297,6 +455,7 @@ export class PlaySession {
     // The scheduler's P2 vocabulary has no `opening` kind (B2-T4 owns it);
     // `resume` is the session-level "begin/continue" trigger and starts
     // immediately because the engine is idle.
+    engine.startSession()
     engine.submit({ priority: 'session', kind: OPENING_TRIGGER_KIND, at: this.env.clock.now() })
     await engine.whenIdle()
     return this.requireSnapshot()
@@ -332,16 +491,28 @@ export class PlaySession {
     const engine = this.engine
     if (engine === undefined) throw new SessionError('NO_SESSION', 'no session is open')
     await engine.end(reason)
+    // The engine may refuse (already ended, or stopped in `locked`); the
+    // archive/ledger guard is what makes this idempotent end-to-end.
+    await this.settleArchive(reason)
+    this.probeRecorder?.dispose()
+    this.probeRecorder = undefined
     return this.requireSnapshot()
+  }
+
+  /** Recent settled probes for the debug panel; empty without a session. */
+  probes(): readonly ProbeRecord[] {
+    return this.probeRecorder?.recent(20) ?? []
   }
 
   /** The current engine snapshot plus the pack identity, or undefined. */
   snapshot(): PlaySnapshot | undefined {
     const engine = this.engine
     const pack = this.pack
-    if (engine === undefined || pack === undefined) return undefined
+    const sessionId = this.sessionId
+    if (engine === undefined || pack === undefined || sessionId === undefined) return undefined
     return {
       ...engine.snapshot(),
+      sessionId,
       packId: pack.manifest.id,
       packVersion: pack.manifest.version,
     }
@@ -352,6 +523,10 @@ export class PlaySession {
     const engine = this.engine
     if (engine !== undefined && engine.state !== 'ended') {
       await engine.panic(source)
+      // A panic is a session end as far as cross-session memory goes (§1).
+      await this.settleArchive('panic')
+      this.probeRecorder?.dispose()
+      this.probeRecorder = undefined
       return
     }
     // No engine yet (or a finished session): the registry is still the stop.
@@ -363,7 +538,13 @@ export class PlaySession {
     this.engine?.unlock(note)
   }
 
-  /** Cancel timers/queued turns; safe to call at host shutdown. */
+  /**
+   * Cancel timers/queued turns; safe to call at host shutdown.
+   *
+   * Deliberately leaves the archive and the open marker in place: quitting
+   * mid-session must become `unexpected_exit` on the next start (§4.7.2).
+   * A paused exit is B2-T11's explicit call, not shutdown's.
+   */
   dispose(): void {
     this.engine?.dispose()
   }
@@ -403,6 +584,11 @@ export class PlaySession {
     }
 
     let wrote = false
+    // Build the prompt (the opening brief, when present, is part of it), then
+    // consume the brief: it belongs to the opening turn only, even if that
+    // request ends in a fallback.
+    const messages = this.messagesFor(request, phases, pack)
+    this.openingBrief = undefined
     const result = await runTurn({
       runner: this.env.runner,
       tools: M2_MODEL_TOOLS,
@@ -410,8 +596,8 @@ export class PlaySession {
       input: {
         turnId: request.turnId,
         phase: phases.current,
-        messages: this.messagesFor(request, phases, pack),
-        resolveContext: resolveContextOf(this.env.registry.snapshot(), scenario, this.env.waveforms),
+        messages,
+        resolveContext: resolveContextOf(this.env.registry.snapshot(), scenario, this.waveformLookup),
       },
       clock: this.env.clock,
       signal: request.signal,
@@ -432,11 +618,95 @@ export class PlaySession {
       this.recentLines.push(line)
       if (this.recentLines.length > RECENT_LINE_LIMIT) this.recentLines.shift()
     }
+    // Ledger/archive facts for this turn: dispatched percentages (B2-T8
+    // `maxCapUsed`, never a cap) and the intent ids of the last two turns.
+    this.recordTurnFacts(result)
     const choices = result.plan?.choices
     return {
       line,
       ...(choices === undefined ? {} : { choices }),
     }
+  }
+
+  /** Persist the snapshot that `TurnEngine.onSettle` hands us (B2-T7). */
+  private async persistSnapshot(engine: EngineSnapshot): Promise<void> {
+    const store = this.store
+    const base = this.archived
+    if (store === undefined || base === undefined) return
+    const next: SessionState = {
+      ...base,
+      currentPhase: engine.phase,
+      turn: engine.turnId,
+      elapsedMin: engine.elapsedMin,
+      ...(engine.lastLine === undefined ? {} : { lastLine: engine.lastLine }),
+      recentBeats: this.recentBeats(),
+      status: 'active',
+    }
+    this.archived = next
+    await store.save(next)
+  }
+
+  /**
+   * Final snapshot + exactly one ledger line.
+   *
+   * `aftercare` is `false`: B2-T5's aftercare runtime is not wired into this
+   * host yet, so claiming it ran would be a lie the ledger would remember.
+   */
+  private async settleArchive(reason: SessionEndReason): Promise<void> {
+    if (this.ledgerClosed) return
+    this.ledgerClosed = true
+    const store = this.store
+    const ledger = this.ledger
+    const base = this.archived
+    const pack = this.pack
+    if (store === undefined || ledger === undefined || base === undefined || pack === undefined) return
+    const engine = this.engine
+    const engineSnapshot = engine?.snapshot()
+    const finalState: SessionState = {
+      ...base,
+      ...(engineSnapshot === undefined
+        ? {}
+        : {
+            currentPhase: engineSnapshot.phase,
+            turn: engineSnapshot.turnId,
+            elapsedMin: engineSnapshot.elapsedMin,
+            ...(engineSnapshot.lastLine === undefined ? {} : { lastLine: engineSnapshot.lastLine }),
+          }),
+      recentBeats: this.recentBeats(),
+      status: 'ended',
+    }
+    this.archived = finalState
+    await store.save(finalState)
+    const entry: LedgerEntry = {
+      sessionId: finalState.sessionId,
+      pack: pack.manifest.id,
+      startedAt: finalState.startedAt,
+      endedAt: new Date(this.env.clock.now()).toISOString(),
+      endReason: reason,
+      plannedMin: this.plannedMinutes,
+      actualMin: finalState.elapsedMin,
+      phaseReached: finalState.currentPhase,
+      aftercare: false,
+      maxCapUsed: this.maxCapUsed,
+    }
+    await ledger.close(entry)
+  }
+
+  /** Intent ids of the last two settled turns, in settlement order. */
+  private recentBeats(): string[] {
+    return this.turnBeats.flat()
+  }
+
+  /** Capture the per-turn ledger/archive facts from one model turn. */
+  private recordTurnFacts(result: TurnResult): void {
+    for (const action of result.dispatch?.actions ?? []) {
+      if (action.percent === undefined) continue
+      this.maxCapUsed = Math.max(this.maxCapUsed, action.percent)
+    }
+    const intents = result.plan?.beats.map(beat => beat.intentId) ?? []
+    if (intents.length === 0) return
+    this.turnBeats.push([...new Set(intents)])
+    if (this.turnBeats.length > 2) this.turnBeats.shift()
   }
 
   /** System prompt for the current turn: boundaries → host → persona → scene → facts. */
@@ -460,7 +730,10 @@ export class PlaySession {
       .filter((part): part is string => part !== undefined && part.trim() !== '')
       .join('\n\n')
     const sensor = sensorPromptBlock(this.env.sensors.statuses())
-    const briefs = sensor === '' ? [] : [sensor]
+    // The cross-session opening brief (B2-T8) is a first-turn brief only: the
+    // pack's `metaReactions.tone/firstIntent`, never a number or a device fact.
+    const opening = this.openingBrief === undefined ? '' : openingBriefText(this.openingBrief)
+    const briefs = [opening, sensor].filter(part => part !== '')
     return buildSystemPrompt({
       ...(pack.manifest.boundaries === undefined ? {} : { boundaries: pack.manifest.boundaries }),
       ...(pack.host === undefined ? {} : { host: pack.host }),
@@ -481,6 +754,8 @@ export class PlaySession {
 export class PlayHost {
   private readonly options: PlayHostOptions
   private session: PlaySession | undefined
+  /** True while a start is resolving the pack; closes the concurrent-start race. */
+  private starting = false
 
   constructor(options: PlayHostOptions) {
     this.options = options
@@ -494,32 +769,37 @@ export class PlayHost {
    * session that actually started.
    */
   async start(request: PlayHostStartRequest): Promise<PlaySnapshot> {
-    if (this.session !== undefined) {
+    if (this.session !== undefined || this.starting) {
       throw new SessionError('SESSION_OPEN', 'a session is already open in this process')
     }
-    const packId = request.packId.trim()
-    if (!PACK_ID_PATTERN.test(packId)) {
-      throw new SessionError('INVALID_INPUT', `"${request.packId}" is not a valid pack id`)
-    }
-    const plannedMinutes = normalizePlannedMinutes(request.plannedMinutes)
-    const ceilingPercent = request.ceilingPercent
-    if (ceilingPercent !== undefined) assertCeiling(ceilingPercent)
-    if (this.options.registry.isLocked) {
-      throw new SessionError('LOCKED', 'the device registry is locked; unlock it before starting a session')
-    }
-    const pack = await this.loadPack(packId)
-    const session = new PlaySession(this.options)
-    this.session = session
+    this.starting = true
     try {
-      return await session.start({
-        pack,
-        plannedMinutes,
-        ...(ceilingPercent === undefined ? {} : { ceilingPercent }),
-      })
-    } catch (error) {
-      this.session = undefined
-      session.dispose()
-      throw error
+      const packId = request.packId.trim()
+      if (!PACK_ID_PATTERN.test(packId)) {
+        throw new SessionError('INVALID_INPUT', `"${request.packId}" is not a valid pack id`)
+      }
+      const plannedMinutes = normalizePlannedMinutes(request.plannedMinutes)
+      const ceilingPercent = request.ceilingPercent
+      if (ceilingPercent !== undefined) assertCeiling(ceilingPercent)
+      if (this.options.registry.isLocked) {
+        throw new SessionError('LOCKED', 'the device registry is locked; unlock it before starting a session')
+      }
+      const pack = await this.loadPack(packId)
+      const session = new PlaySession(this.options)
+      this.session = session
+      try {
+        return await session.start({
+          pack,
+          plannedMinutes,
+          ...(ceilingPercent === undefined ? {} : { ceilingPercent }),
+        })
+      } catch (error) {
+        this.session = undefined
+        session.dispose()
+        throw error
+      }
+    } finally {
+      this.starting = false
     }
   }
 
@@ -550,6 +830,11 @@ export class PlayHost {
       return
     }
     await session.panic(source)
+  }
+
+  /** Recent probes from the open session (debug panel only). */
+  probes(): readonly ProbeRecord[] {
+    return this.session?.probes() ?? []
   }
 
   /** Human unlock for both latches (registry unlock stays the dashboard's job). */
@@ -703,7 +988,7 @@ function scenarioFor(pack: LoadedPack, plannedMinutes: number): ScenarioDefiniti
 function resolveContextOf(
   snapshot: RegistrySnapshot,
   scenario: ScenarioDefinition,
-  waveforms: WaveformLibrary,
+  waveforms: WaveformLookup,
 ): ResolveContext {
   const intents = new Map<string, FeedbackIntent>()
   for (const intent of scenario.feedbackIntents) intents.set(intent.id, intent)
@@ -720,6 +1005,14 @@ function playerTextOf(request: TurnRequest): string | undefined {
   if (request.choiceId !== undefined) return `（选择：${request.choiceId}）`
   const text = request.playerText?.trim()
   return text === undefined || text === '' ? undefined : text
+}
+
+/** Render a `metaReactions` brief as a prompt line; an empty brief renders nothing. */
+function openingBriefText(brief: OpeningBrief): string {
+  const parts: string[] = []
+  if (brief.tone !== undefined) parts.push(`语气「${brief.tone}」`)
+  if (brief.firstIntent !== undefined) parts.push(`首个意图「${brief.firstIntent}」`)
+  return parts.length === 0 ? '' : `开场指引：${parts.join('，')}。`
 }
 
 function normalizePlannedMinutes(value: number): number {

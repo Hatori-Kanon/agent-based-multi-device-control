@@ -8,6 +8,7 @@
  */
 
 import { randomBytes } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   AuditLog,
@@ -423,6 +424,20 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     runner: modelRunner,
     savePolicy,
     packs: new DirectoryPackSource(options.dataDir),
+    // B2-T7/T8: every settled turn writes a snapshot, every session one ledger
+    // line. The ledger is append-only and lives outside `state/` on purpose.
+    archive: {
+      state: documents,
+      memory: new FileDocumentStore(join(options.dataDir, 'memory')),
+      ledger: new FileAppendOnlyStore(join(options.dataDir, 'memory', 'ledger.jsonl')),
+      ledgerText: async (): Promise<string | undefined> => {
+        try {
+          return await readFile(join(options.dataDir, 'memory', 'ledger.jsonl'), 'utf8')
+        } catch {
+          return undefined
+        }
+      },
+    },
   })
 
   // ── Device manifest: which units exist and how to reach them ────────────
@@ -736,6 +751,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     sensorsStatus,
     sensorFrame,
     pushFeatures,
+    probes: () => play.probes(),
     recentLogs,
   }
 

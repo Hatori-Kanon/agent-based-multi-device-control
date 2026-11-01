@@ -250,3 +250,48 @@ describe('P0 wins over the settle tail', () => {
     expect(engine.state).toBe('locked')
   })
 })
+
+describe('P1 turns are serialised and P0 outranks a clean resolve', () => {
+  it('runs a burst of player messages as one turn at a time, in order', async () => {
+    let active = 0
+    let maxActive = 0
+    const lines: string[] = []
+    const runner: TurnRunner = {
+      run: async request => {
+        active += 1
+        maxActive = Math.max(maxActive, active)
+        await Promise.resolve()
+        await Promise.resolve()
+        active -= 1
+        lines.push(request.playerText ?? '')
+        return { line: request.playerText ?? '' }
+      },
+    }
+    const h = createHarness(runner)
+    await Promise.all([h.engine.submitPlayerMessage('一'), h.engine.submitPlayerMessage('二'), h.engine.submitPlayerMessage('三')])
+
+    expect(maxActive).toBe(1)
+    expect(lines).toEqual(['一', '二', '三'])
+    expect(h.engine.state).toBe('idle')
+  })
+
+  it('records cancelled and back-fills no line when a panicked runner resolves cleanly', async () => {
+    const clock = new FakeClock()
+    const audit = new AuditLog(new MemoryAppendOnlyStore(), clock, () => {})
+    let release: (() => void) | undefined
+    const runner: TurnRunner = {
+      run: async () => await new Promise(resolve => { release = () => resolve({ line: '（不该出现）' }) }),
+    }
+    const engine = new TurnEngine({ clock, audit, runner })
+
+    const turn = engine.submitPlayerMessage('慢一点')
+    await Promise.resolve()
+    await engine.panic('hotkey')
+    release?.()
+    await turn
+
+    expect(engine.state).toBe('locked')
+    expect(engine.snapshot().outcome).toBe('cancelled')
+    expect(engine.snapshot().lastLine).toBeUndefined()
+  })
+})

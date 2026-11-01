@@ -22,6 +22,10 @@
     wfFrames: document.getElementById('wfFrames'),
     wfImport: document.getElementById('wfImport'),
     wfGrid: document.getElementById('wfGrid'),
+    sensors: document.getElementById('sensors'),
+    debugToggle: document.getElementById('debugToggle'),
+    debugPanel: document.getElementById('debugPanel'),
+    debugProbes: document.getElementById('debugProbes'),
     audit: document.getElementById('audit'),
     err: document.getElementById('err'),
   }
@@ -30,6 +34,15 @@
   let waveforms = []
   let logsOpen = false
   let auditOpen = false
+  /**
+   * Process-local debug switch mirrored in this page.
+   *
+   * Off is the default and the safe state: while it is false the console does
+   * not fetch (and therefore cannot render) a single probe number or resolved
+   * target. The switch lives on the host (`GET/POST /api/debug`); toggling it
+   * never writes audit and never reaches the model.
+   */
+  let debugEnabled = false
   /** Keys of manifest devices: only these get a 移除 button. */
   let managedKeys = new Set()
   const editing = new Set()
@@ -456,6 +469,113 @@
     }
   }
 
+  /** Availability/quality wording; no measured value ever appears here. */
+  const QUALITY_TEXT = {
+    ok: '可用', dim: '偏暗', bright: '过亮', blocked: '被遮挡', stale: '过旧', unavailable: '不可用',
+  }
+  const QUALITY_CLASS = {
+    ok: 'q-ok', dim: 'q-warn', bright: 'q-warn', blocked: 'q-bad', stale: 'q-warn', unavailable: 'q-bad',
+  }
+
+  function renderSensors(sources) {
+    if (!Array.isArray(sources) || sources.length === 0) {
+      const empty = document.createElement('span')
+      empty.className = 'hint'
+      empty.textContent = '未注册感知源'
+      el.sensors.replaceChildren(empty)
+      return
+    }
+    el.sensors.replaceChildren(...sources.map(source => {
+      const row = document.createElement('span')
+      row.className = 'sensor'
+      const label = document.createElement('span')
+      // Source id/kind plus the quality word only: the default console never
+      // shows a numeric feature, probe delta or resolved command.
+      label.textContent = `${source.id} · ${source.kind}`
+      const quality = document.createElement('span')
+      quality.className = QUALITY_CLASS[source.quality] ?? 'q-warn'
+      quality.textContent = QUALITY_TEXT[source.quality] ?? String(source.quality)
+      row.append(label, quality)
+      return row
+    }))
+  }
+
+  async function refreshSensors() {
+    try {
+      const body = await api('/api/sensors')
+      renderSensors(body.sources ?? [])
+    } catch {
+      // The perception panel must never take the console down with it.
+    }
+  }
+
+  /** One debug row: probe numbers plus the resolved target it was dispatched to. */
+  function probeLine(probe) {
+    const row = document.createElement('div')
+    const delta = probe.delta
+      ? `Δ运动 ${Number(probe.delta.motion).toFixed(3)} · Δ音频 ${Number(probe.delta.audioPct).toFixed(1)}%`
+      : 'Δ 不可比'
+    const resolved = (probe.targets ?? [])
+      .map(target => `${target.deviceId}:${target.channelId}`)
+      .join(', ')
+    row.textContent = `${probe.probeId} · ${probe.beatId}/${probe.intentId} · ${probe.verdict} · 方向 ${probe.direction} · 幅度 ${probe.magnitude} · ${delta} · 解析 ${resolved || '无目标'}`
+    return row
+  }
+
+  function applyDebugState(enabled) {
+    debugEnabled = enabled === true
+    el.debugToggle.classList.toggle('on', debugEnabled)
+    el.debugToggle.setAttribute('aria-pressed', debugEnabled ? 'true' : 'false')
+    el.debugToggle.textContent = debugEnabled ? '调试中' : '调试'
+  }
+
+  async function renderDebugProbes() {
+    if (!debugEnabled) {
+      // Off means off: no request, no DOM nodes above this one, nothing to
+      // screenshot or copy out of the page by accident.
+      el.debugProbes.replaceChildren()
+      el.debugPanel.style.display = 'none'
+      return
+    }
+    el.debugPanel.style.display = ''
+    try {
+      const probes = await api('/api/debug/probes')
+      if (!debugEnabled) return
+      if (!Array.isArray(probes) || probes.length === 0) {
+        const empty = document.createElement('div')
+        empty.className = 'hint'
+        empty.textContent = '（暂无已结算的 probe）'
+        el.debugProbes.replaceChildren(empty)
+        return
+      }
+      el.debugProbes.replaceChildren(...probes.slice().reverse().map(probeLine))
+    } catch (error) {
+      fail(error.message ?? String(error))
+    }
+  }
+
+  async function syncDebug() {
+    try {
+      applyDebugState((await api('/api/debug')).enabled)
+    } catch {
+      applyDebugState(false)
+    }
+    await renderDebugProbes()
+  }
+
+  el.debugToggle.addEventListener('click', async () => {
+    try {
+      const state = await api('/api/debug', {
+        method: 'POST',
+        body: JSON.stringify({ enabled: !debugEnabled }),
+      })
+      applyDebugState(state.enabled)
+      await renderDebugProbes()
+    } catch (error) {
+      fail(error.message ?? String(error))
+    }
+  })
+
   void (async () => {
     if (token.length < 16) {
       el.conn.textContent = '缺少 token'
@@ -465,9 +585,13 @@
     }
     await refresh()
     await renderErrors()
+    await refreshSensors()
+    await syncDebug()
     setInterval(refresh, 500)
     setInterval(renderAudit, 3_000)
     setInterval(renderErrors, 3_000)
     setInterval(renderLogs, 2_000)
+    setInterval(refreshSensors, 3_000)
+    setInterval(renderDebugProbes, 2_000)
   })()
 })()

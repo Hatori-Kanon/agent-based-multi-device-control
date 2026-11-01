@@ -276,7 +276,52 @@ export type {
   ResolveDeviceSnapshot,
   ResolveRegistrySnapshot,
 } from './scenario/intents.ts'
+export type { WaveformLookup } from './scenario/intents.ts'
 export { DEFAULT_INTENTS, ENVELOPE_DEFAULTS, STRENGTH_RATIO } from './scenario/default-intents.ts'
+// ── M2 · two-call pipeline (B2-T3) ──────────────────────────────────────
+export { DEFAULT_SPLIT_DIRECTOR_TIMEOUT_MS, DEFAULT_SPLIT_WRITER_TIMEOUT_MS, TurnPipeline } from './agent/pipeline.ts'
+export type {
+  SplitTimeouts,
+  TurnContextProvider,
+  TurnContextSource,
+  TurnInput,
+  TurnPipelineMode,
+  TurnPipelineOptions,
+  TurnPipelineResult,
+} from './agent/pipeline.ts'
+
+// ── M2 · session archive and cross-session ledger (B2-T7/T8) ────────────
+export {
+  MAX_STATE_PATCH_BYTES,
+  MAX_STATE_PATCH_DEPTH,
+  SessionStore,
+  STATE_PATCH_FIELDS,
+  StateStoreError,
+} from './state/store.ts'
+export type {
+  OpenSessionInput,
+  PatchResult,
+  RejectedPatchPath,
+  SessionState,
+  SessionStoreOptions,
+  StatePatchField,
+} from './state/store.ts'
+export {
+  CLEARED_MARKER_KEY,
+  matchMetaReactions,
+  OPEN_MARKER_KEY,
+  SESSION_END_REASONS,
+  SessionLedger,
+} from './memory/ledger.ts'
+export type {
+  LedgerEntry,
+  LedgerSnapshotFact,
+  LedgerSnapshotSource,
+  LedgerTextReader,
+  OpeningBrief,
+  SessionEndReason,
+  SessionLedgerOptions,
+} from './memory/ledger.ts'
 
 // ── M2 · content packs (B1-T12..T14) ─────────────────────────────────────
 export { ENGINE_VERSION } from './version.ts'
@@ -494,6 +539,7 @@ export type {
   PriorityQueueDecision,
 } from './engine/scheduler.ts'
 export type {
+  CheckpointUpdate,
   EndReason,
   EngineConfig,
   EngineEvent,
@@ -504,3 +550,4 @@ export type {
   TurnRunner,
   TurnRunnerResult,
 } from './engine/turn-engine.ts'
+export { checkpointReminder } from './engine/turn-engine.ts'

@@ -25,6 +25,7 @@
 import type { Envelope, EnvelopePreset } from '../devices/effect.ts'
 import { clampPercentToPolicy, type ChannelPolicy } from '../devices/policy.ts'
 import type { ChannelSnapshot, DeviceSnapshot, RegistrySnapshot } from '../devices/registry.ts'
+import type { Waveform } from '../waveform/types.ts'
 import type { WaveformLibrary } from '../waveform/library.ts'
 import type {
   Beat,
@@ -71,12 +72,21 @@ export interface ResolveRegistrySnapshot extends Omit<RegistrySnapshot, 'devices
 }
 
 /** Everything the resolver may read. Contains no line, clock or audit handle. */
+/**
+ * The resolver only needs `get`; it never freezes the host into a concrete
+ * library. `WaveformLibrary` satisfies this, and so does a per-session adapter
+ * that also resolves packed asset ids (`builtin:x`, `<packId>:x`, bare `x`).
+ */
+export interface WaveformLookup {
+  get(id: string): Waveform | undefined
+}
+
 export interface ResolveContext {
   readonly snapshot: ResolveRegistrySnapshot
   readonly intents: ReadonlyMap<string, FeedbackIntent>
   readonly regions: readonly string[]
   /** Used only to answer "does this waveform id exist". */
-  readonly waveforms: WaveformLibrary
+  readonly waveforms: WaveformLookup
   /** Held by the engine; the resolver never increments it. */
   readonly roundRobinCursor?: number
 }

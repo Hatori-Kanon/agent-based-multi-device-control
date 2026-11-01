@@ -16,8 +16,8 @@ import type { AddressInfo } from 'node:net'
 import { dirname, join, normalize, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ChannelPolicy } from '@embodied/core'
-import { isSensorError } from '@embodied/core'
-import type { FeatureSample, SensorQuality, SensorStatus, Snapshot } from '@embodied/core'
+import { isSensorError, probeDirectorJson } from '@embodied/core'
+import type { FeatureSample, ProbeRecord, SensorQuality, SensorStatus, Snapshot } from '@embodied/core'
 import type { DeviceManagerEntry, DeviceProtocol } from './bootstrap.ts'
 import { isSessionError } from './play.ts'
 import type { PlayHostStartRequest } from './play.ts'
@@ -67,6 +67,15 @@ export interface DashboardDeps {
   recentLogs(): string[]
   /** Perception sources + derived quality + freshness (A1-T6). */
   sensorsStatus(): readonly SensorStatus[]
+  /**
+   * Settled probe records, newest last (A2-T7).
+   *
+   * Optional: the console-only host (and every test double written before
+   * A2) has no recorder, and the debug route must answer an empty list
+   * instead of failing. The default-off path never calls it at all, so a
+   * console with the switch off cannot read probe numbers even by accident.
+   */
+  readonly probes?: () => readonly ProbeRecord[]
   /** Newest JPEG of one image source; undefined when none is available. */
   sensorFrame(sourceId?: string): Promise<Snapshot | undefined>
   /** Store one externally captured feature sample (unknown source → 400). */
@@ -265,9 +274,30 @@ const STATIC_FILES = new Set(['index.html', 'app.js', 'style.css', 'phone.html']
 
 export class DashboardServer {
   private server: Server | undefined
+  /** Console-local debug switch (A2-T7); off by default, never persisted. */
+  private debug = false
 
   constructor(private readonly options: DashboardServerOptions) {
     if (options.token.length < 16) throw new Error('dashboard token must be at least 16 characters')
+  }
+
+  /**
+   * Whether the console's debug switch is on (A2-T7).
+   *
+   * Process-local and `false` by default. Off is the design rule: the UI may
+   * show availability/quality, while probe numbers and the resolved command
+   * targets stay in the audit log and in the model/audit projections. The
+   * switch widens exactly one HTTP surface (`GET /api/debug/probes`); it is
+   * never read by the engine, so the audit trail and every prompt projection
+   * are byte-identical with it on or off (`M2-实施计划.md` §8.7).
+   */
+  debugMode(): boolean {
+    return this.debug
+  }
+
+  /** Flip the debug switch. Routing only — no engine or audit side effect. */
+  setDebugMode(on: boolean): void {
+    this.debug = on
   }
 
   /** One clock for ingested samples, injectable so tests get deterministic ts. */
@@ -459,6 +489,48 @@ export class DashboardServer {
       } catch (error) {
         sendSessionFailure(response, error)
       }
+      return
+    }
+
+    // ── Debug mode (A2-T7) ───────────────────────────────────────────────
+    // The console's one visibility switch. Off (the default) is the design
+    // rule: the UI shows availability/quality, never probe numbers or the
+    // resolved command targets. Turning it on only widens this HTTP surface;
+    // the audit trail and the prompt projections are derived elsewhere and do
+    // not change (§8.7), and the switch is not part of any model context.
+    if (request.method === 'GET' && pathname === '/api/debug') {
+      sendJson(response, 200, { enabled: this.debugMode() })
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/debug') {
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(request)
+      } catch (error) {
+        sendError(response, 400, `invalid JSON body: ${error instanceof Error ? error.message : 'unreadable'}`)
+        return
+      }
+      if (typeof body.enabled !== 'boolean') {
+        sendError(response, 400, 'enabled must be true or false')
+        return
+      }
+      this.setDebugMode(body.enabled)
+      sendJson(response, 200, { enabled: this.debugMode() })
+      return
+    }
+
+    if (request.method === 'GET' && pathname === '/api/debug/probes') {
+      if (!this.debugMode()) {
+        // 403 rather than an empty list: "[]" would be a lie ("nothing settled
+        // yet") and would make "off" indistinguishable from "on with no probe"
+        // in the UI and in every script. The error body carries no numbers.
+        sendError(response, 403, 'debug mode is off; enable it with POST /api/debug')
+        return
+      }
+      // The structured adapter surface (A2-T4): raw deltas + magnitude band.
+      // Deliberately NOT a prompt projection — the model never receives this.
+      sendJson(response, 200, probeDirectorJson(this.options.deps.probes?.() ?? []))
       return
     }
 

@@ -7,6 +7,7 @@ import {
   loadPack,
   MemoryAppendOnlyStore,
   MemoryContentSource,
+  MemoryDocumentStore,
   MockBackend,
   PolicyStore,
   SensorRegistry,
@@ -26,6 +27,7 @@ import {
   PlayHost,
   PlaySession,
   SessionError,
+  type PlayArchive,
   type PlaySessionEnvironment,
 } from '../src/main/play.ts'
 
@@ -370,7 +372,10 @@ describe('session HTTP routes', () => {
         return { ok: true, status: 200, json: async () => fixtureCompletion() }
       },
     })
+    // Both mock devices must be online: the resolver's `primary` distribution
+    // picks by device id, and an offline pick degrades to narrative-only.
     await runtime.registry.connect('mock-pulse', new AbortController().signal)
+    await runtime.registry.connect('mock-hold', new AbortController().signal)
 
     const address = runtime.dashboardAddress!
     const base = `http://${address.host}:${address.port}`
@@ -435,7 +440,12 @@ describe('session HTTP routes', () => {
       && (record.detail as { scope?: string } | undefined)?.scope === 'session')?.detail)
       .toMatchObject({ previous: 100, next: 15 })
     expect(records.some(record => record.action === 'session_start')).toBe(true)
-    expect(records.some(record => record.action === 'plan_resolved')).toBe(true)
+    const resolved = records.find(record => record.action === 'plan_resolved')
+    expect(resolved).toBeDefined()
+    const actions = (resolved?.detail as { actions?: readonly { percent?: number }[] } | undefined)?.actions ?? []
+    expect(actions.length).toBeGreaterThan(0)
+    // D4 reaches execution: every dispatched target is under the human ceiling.
+    expect(actions.every(action => action.percent === undefined || action.percent <= 15)).toBe(true)
 
     const ended = await post('/api/session/end', { reason: 'stop' })
     expect(ended.status).toBe(200)
@@ -554,5 +564,238 @@ describe('session HTTP routes', () => {
     const pack = await source.load('demo')
     expect(pack.manifest.version).toBe('1.2.0')
     await expect(source.load('nope')).rejects.toMatchObject({ code: 'PACK_NOT_FOUND' })
+  })
+})
+
+// ── B2-T7/T8: session archive + ledger wiring ──────────────────────────────
+
+interface ArchiveBacking {
+  readonly state: MemoryDocumentStore
+  readonly ledger: MemoryAppendOnlyStore
+  readonly memory: MemoryDocumentStore
+}
+
+interface ArchivedHarness {
+  readonly host: PlayHost
+  readonly clock: FakeClock
+  readonly runner: ScriptedRunner
+  readonly backing: ArchiveBacking
+}
+
+/**
+ * The real session service over in-memory archive/ledger ports.
+ *
+ * `backing` is reusable across harnesses on purpose: a second harness with the
+ * same backing is exactly what a process restart looks like to `play.ts`.
+ */
+async function createArchivedHarness(input: {
+  readonly turns: readonly ModelTurnResult[]
+  readonly pack?: LoadedPack
+  readonly backing?: ArchiveBacking
+  readonly clock?: FakeClock
+}): Promise<ArchivedHarness> {
+  const clock = input.clock ?? new FakeClock()
+  const audit = new AuditLog(new MemoryAppendOnlyStore(), clock, () => {})
+  const policy = new PolicyStore()
+  const waveforms = new WaveformLibrary()
+  const registry = new DeviceRegistry({ clock, audit, policy, waveforms, onError: () => {} })
+  registry.register(new MockBackend({
+    id: 'mock-pulse',
+    name: 'Mock Pulse Box',
+    clock,
+    keepAliveMs: 400,
+    refreshMs: 100,
+    channels: [
+      { id: 'a', kind: 'level', label: 'A 通道' },
+      { id: 'b', kind: 'level', label: 'B 通道' },
+    ],
+  }))
+  await registry.connect('mock-pulse', new AbortController().signal)
+
+  const backing = input.backing ?? {
+    state: new MemoryDocumentStore(),
+    ledger: new MemoryAppendOnlyStore(),
+    memory: new MemoryDocumentStore(),
+  }
+  const archive: PlayArchive = {
+    state: backing.state,
+    ledger: backing.ledger,
+    memory: backing.memory,
+    ledgerText: async () => backing.ledger.lines.join('\n'),
+  }
+  const runner = new ScriptedRunner(input.turns)
+  const env: PlaySessionEnvironment = {
+    clock,
+    audit,
+    registry,
+    policy,
+    waveforms,
+    sensors: new SensorRegistry({ clock }),
+    runner,
+    savePolicy: async (): Promise<void> => {},
+    archive,
+    onEvent: (): void => {},
+  }
+  const pack = input.pack ?? await freeformPack()
+  const host = new PlayHost({ ...env, packs: { load: async () => pack } })
+  return { host, clock, runner, backing }
+}
+
+/** Read one archived snapshot document and parse it. */
+function archivedState(raw: string | undefined): Record<string, unknown> {
+  expect(raw).toBeDefined()
+  return JSON.parse(raw!) as Record<string, unknown>
+}
+
+/** A pack that opts into the ledger and declares one `left_early` reaction. */
+async function historyPack(): Promise<LoadedPack> {
+  return await loadPack(new MemoryContentSource({
+    'pack.json': JSON.stringify({
+      id: 'demo',
+      name: 'Demo Pack',
+      version: '1.0.0',
+      engine: '>=0.2 <1.0',
+      mode: 'freeform',
+      rating: 'all',
+      history: { read: true, windowHours: 72, lastN: 1 },
+      metaReactions: [
+        {
+          when: { endReason: ['left_early'] },
+          opening: { tone: 'cold', firstIntent: 'soothe' },
+        },
+      ],
+    }),
+    'persona.md': '# 阿岚\n\n## 导演摘要\n\n温柔的试探者。\n',
+  }))
+}
+
+describe('play session archive and ledger (B2-T7/T8)', () => {
+  it('archives one snapshot per turn and one ledger line at the end', async () => {
+    const h = await createArchivedHarness({
+      turns: [
+        scriptedTurn('第一句。', [planCall()]),
+        scriptedTurn('第二句。'),
+      ],
+    })
+
+    const first = await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    expect(first.sessionId).not.toBe('')
+    const afterOpening = archivedState(await h.backing.state.read(`session-${first.sessionId}`))
+    expect(afterOpening).toMatchObject({
+      sessionId: first.sessionId,
+      packId: 'demo',
+      currentPhase: 'scene',
+      turn: 1,
+      elapsedMin: 0,
+      status: 'active',
+      lastLine: '第一句。',
+    })
+    expect(afterOpening['recentBeats']).toEqual(['probe-touch'])
+
+    await h.host.message('嗯。')
+    expect(archivedState(await h.backing.state.read(`session-${first.sessionId}`))).toMatchObject({
+      turn: 2,
+      lastLine: '第二句。',
+      status: 'active',
+    })
+
+    await h.host.end('left_early')
+    expect(archivedState(await h.backing.state.read(`session-${first.sessionId}`))).toMatchObject({
+      turn: 2,
+      status: 'ended',
+    })
+
+    // Exactly one line, facts only, and the highest dispatched percent — never
+    // a cap and never prose.
+    expect(h.backing.ledger.lines).toHaveLength(1)
+    const line = JSON.parse(h.backing.ledger.lines[0]!) as Record<string, unknown>
+    expect(line).toMatchObject({
+      sessionId: first.sessionId,
+      pack: 'demo',
+      endReason: 'left_early',
+      plannedMin: 30,
+      actualMin: 0,
+      phaseReached: 'scene',
+      aftercare: false,
+    })
+    expect(line['maxCapUsed']).toBeGreaterThan(0)
+    expect(Object.keys(line)).toHaveLength(10)
+
+    // A duplicated end must not append a second line for the session.
+    await h.host.end('left_early')
+    expect(h.backing.ledger.lines).toHaveLength(1)
+  })
+
+  it('marks the interrupted snapshot recovered and records unexpected_exit on the next start', async () => {
+    const backing: ArchiveBacking = {
+      state: new MemoryDocumentStore(),
+      ledger: new MemoryAppendOnlyStore(),
+      memory: new MemoryDocumentStore(),
+    }
+    const clock = new FakeClock()
+    const crashed = await createArchivedHarness({
+      turns: [scriptedTurn('第一局。', [planCall()]), scriptedTurn('第二回合。')],
+      backing,
+      clock,
+    })
+    const first = await crashed.host.start({ packId: 'demo', plannedMinutes: 30 })
+    clock.advance(18 * 60_000)
+    await crashed.host.message('我还在。')
+    // Quit without end(): the open marker and the active snapshot survive.
+    crashed.host.dispose()
+
+    const restarted = await createArchivedHarness({
+      turns: [scriptedTurn('重新开始。')],
+      backing,
+      clock,
+    })
+    const next = await restarted.host.start({ packId: 'demo', plannedMinutes: 20 })
+    expect(next.sessionId).not.toBe(first.sessionId)
+    // The unfinished turn is not replayed: the new session ran its own one turn.
+    expect(restarted.runner.requests).toHaveLength(1)
+
+    const previous = archivedState(await backing.state.read(`session-${first.sessionId}`))
+    expect(previous).toMatchObject({ status: 'recovered', turn: 2 })
+
+    const lines = backing.ledger.lines.map(line => JSON.parse(line) as Record<string, unknown>)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatchObject({
+      sessionId: first.sessionId,
+      endReason: 'unexpected_exit',
+      plannedMin: 30,
+      actualMin: 18,
+      phaseReached: 'scene',
+      aftercare: false,
+      maxCapUsed: 0,
+    })
+  })
+
+  it('injects the matched metaReactions brief into the opening system prompt', async () => {
+    const pack = await historyPack()
+    const backing: ArchiveBacking = {
+      state: new MemoryDocumentStore(),
+      ledger: new MemoryAppendOnlyStore(),
+      memory: new MemoryDocumentStore(),
+    }
+
+    // A first session ends `left_early`; the opening had no ledger to read.
+    const firstRun = await createArchivedHarness({ turns: [scriptedTurn('冷。')], pack, backing })
+    await firstRun.host.start({ packId: 'demo', plannedMinutes: 45 })
+    expect(firstRun.runner.requests[0]!.messages[0]!.content).not.toContain('开场指引')
+    await firstRun.host.end('left_early')
+
+    // The next session reads the ledger and receives the brief.
+    const secondRun = await createArchivedHarness({ turns: [scriptedTurn('你回来了。')], pack, backing })
+    await secondRun.host.start({ packId: 'demo', plannedMinutes: 45 })
+    const system = secondRun.runner.requests[0]!.messages[0]!.content
+    expect(system).toContain('开场指引')
+    expect(system).toContain('cold')
+    expect(system).toContain('soothe')
+    await secondRun.host.end('stop')
+
+    // A pack that does not read the ledger stays neutral even with entries.
+    const silentRun = await createArchivedHarness({ turns: [scriptedTurn('嗯。')], backing })
+    await silentRun.host.start({ packId: 'demo', plannedMinutes: 45 })
+    expect(silentRun.runner.requests[0]!.messages[0]!.content).not.toContain('开场指引')
   })
 })

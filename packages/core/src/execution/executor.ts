@@ -28,7 +28,7 @@ import type { DispatchEvent } from '../devices/events.ts'
 import { DeviceRegistry } from '../devices/registry.ts'
 import type { Clock } from '../ports/clock.ts'
 import type { BeatPlan, PlanDrop, PlanValidation } from '../scenario/beat-plan.ts'
-import { resolvePlan, type ResolveContext, type ResolvedCommand } from '../scenario/intents.ts'
+import { resolvePlan, type ResolveContext, type ResolvedCommand, type WaveformLookup } from '../scenario/intents.ts'
 import type { WaveformLibrary } from '../waveform/library.ts'
 
 // The probe shape is owned by the recorder (A2-T1); duplicating it here made
@@ -57,7 +57,7 @@ export interface PlanExecutorOptions {
    * resolution and dispatch (a session-scope clear), and a stale id would
    * otherwise turn a working beat into a rejected command.
    */
-  readonly waveforms: WaveformLibrary
+  readonly waveforms: WaveformLookup
   /** Optional: no recorder means narrative-only probing. */
   readonly probes?: ProbeRegistrar
   readonly clock: Clock

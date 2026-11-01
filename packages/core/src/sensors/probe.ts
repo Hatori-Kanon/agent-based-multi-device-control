@@ -85,7 +85,11 @@ export interface ProbeRecord {
   readonly baseline: FeatureWindowStats | undefined
   readonly window: FeatureWindowStats | undefined
   /** `window.motionPeak - baseline.motionEnergyMean`, and the audio equivalent. */
-  readonly delta: { readonly motion: number; readonly audioPct: number } | undefined
+  /**
+   * Deltas that could actually be compared; a modality absent from either
+   * window is omitted instead of being reported as a measured zero.
+   */
+  readonly delta: { readonly motion?: number; readonly audioPct?: number } | undefined
   readonly verdict: ProbeVerdict
   /** Present only when the verdict degraded. */
   readonly reason?: ProbeDegradeReason
@@ -254,12 +258,24 @@ export class ReactionProbeRecorder {
     return { imageId, audioId }
   }
 
-  /** Merge the image and audio rings over one interval into a single window. */
-  private collectWindow(probe: PendingProbe, fromTs: number, toTs: number): FeatureWindowStats | undefined {
+  /**
+   * Merge the image and audio rings over one interval into a single window.
+   *
+   * Per-modality presence is reported alongside the merged shape: a source that
+   * only started sampling after the action has no baseline, so its delta must
+   * not be computed (wave-3 review blocker B-1).
+   */
+  private collectWindow(probe: PendingProbe, fromTs: number, toTs: number): WindowedStats | undefined {
     if (toTs < fromTs) return undefined
     const image = probe.imageId === undefined ? undefined : this.sensors.series(probe.imageId)?.stats(fromTs, toTs)
     const audio = probe.audioId === undefined ? undefined : this.sensors.series(probe.audioId)?.stats(fromTs, toTs)
-    return mergeWindowStats(image, audio)
+    const stats = mergeWindowStats(image, audio)
+    if (stats === undefined) return undefined
+    return {
+      stats,
+      imageSamples: image?.samples ?? 0,
+      audioSamples: audio?.samples ?? 0,
+    }
   }
 
   private hasWatchedSource(probe: PendingProbe): boolean {
@@ -271,13 +287,21 @@ export class ReactionProbeRecorder {
     const thresholds = this.thresholds
     // `Clock.now()` is integer milliseconds, so `actionAt - 1` excludes the
     // action sample itself from the half-open baseline window.
-    const baseline = this.collectWindow(probe, probe.action.at - thresholds.baselineLeadMs, probe.action.at - 1)
+    const baselineWindow = this.collectWindow(probe, probe.action.at - thresholds.baselineLeadMs, probe.action.at - 1)
     const windowTo = Math.min(this.clock.now(), probe.action.at + thresholds.windowMs)
-    const window = this.collectWindow(probe, probe.action.at, windowTo)
+    const windowWindow = this.collectWindow(probe, probe.action.at, windowTo)
+    const baseline = baselineWindow?.stats
+    const window = windowWindow?.stats
 
-    const comparable = baseline !== undefined && window !== undefined && baseline.samples > 0 && window.samples > 0
-    const delta = comparable
-      ? { motion: window.motionPeak - baseline.motionEnergyMean, audioPct: window.audioPeakPct - baseline.audioLevelMeanPct }
+    // A modality counts only when BOTH windows observed it; otherwise the
+    // "delta" would compare a real reading against an invented zero.
+    const motionComparable = (baselineWindow?.imageSamples ?? 0) > 0 && (windowWindow?.imageSamples ?? 0) > 0
+    const audioComparable = (baselineWindow?.audioSamples ?? 0) > 0 && (windowWindow?.audioSamples ?? 0) > 0
+    const delta = motionComparable || audioComparable
+      ? {
+          ...(motionComparable ? { motion: window!.motionPeak - baseline!.motionEnergyMean } : {}),
+          ...(audioComparable ? { audioPct: window!.audioPeakPct - baseline!.audioLevelMeanPct } : {}),
+        }
       : undefined
 
     let verdict: ProbeVerdict
@@ -289,12 +313,20 @@ export class ReactionProbeRecorder {
       verdict = 'ambiguous'
       reason = 'degenerate'
     } else if (
-      baseline.motionEnergyMean > thresholds.baselineMotionMax
-      || baseline.audioLevelMeanPct > thresholds.baselineAudioMaxPct
+      (motionComparable && baseline.motionEnergyMean > thresholds.baselineMotionMax)
+      || (audioComparable && baseline.audioLevelMeanPct > thresholds.baselineAudioMaxPct)
     ) {
       verdict = 'ambiguous'
       reason = 'baseline-high'
-    } else if (delta !== undefined && (delta.motion >= thresholds.motionDeltaMin || delta.audioPct >= thresholds.audioDeltaMinPct)) {
+    } else if (delta === undefined) {
+      // No modality was visible on both sides of the action: report doubt
+      // rather than a calm "none".
+      verdict = 'ambiguous'
+      reason = 'degenerate'
+    } else if (
+      (delta.motion ?? Number.NEGATIVE_INFINITY) >= thresholds.motionDeltaMin
+      || (delta.audioPct ?? Number.NEGATIVE_INFINITY) >= thresholds.audioDeltaMinPct
+    ) {
       verdict = 'responded'
     } else {
       verdict = 'none'
@@ -349,6 +381,12 @@ function auditDetail(record: ProbeRecord): Readonly<Record<string, unknown>> {
     verdict: record.verdict,
     ...(record.reason === undefined ? {} : { reason: record.reason }),
   }
+}
+
+interface WindowedStats {
+  readonly stats: FeatureWindowStats
+  readonly imageSamples: number
+  readonly audioSamples: number
 }
 
 /** The id of the `ok` source of `kind` that sampled most recently. */

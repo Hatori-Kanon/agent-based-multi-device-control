@@ -9,15 +9,16 @@
  *
  * Scope of this module (M2-B1/B2): the state machine, single-call
  * timeout/abort, P1 preemption with the §4.8 grace window, pause/resume/end,
- * panic/unlock, and the P2/P3 queue rules. The ladder and the queue itself
- * live in `scheduler.ts` (B2-T4). Autopilot *timing* (B2-T5), choices timeouts
- * (B2-T6) and session persistence hooks (B2-T7) plug in through the optional
- * hooks below.
+ * panic/unlock, the P2/P3 queue rules, autopilot pacing plus the session time
+ * budget (B2-T5), and choice timeouts/audit (B2-T6). The ladder and the queue
+ * itself live in `scheduler.ts` (B2-T4); session persistence hooks (B2-T7)
+ * plug in through the optional hooks below.
  */
 
 import type { AuditLog } from '../devices/audit.ts'
 import type { Clock, Timer } from '../ports/clock.ts'
 import type { PlayerChoice } from '../scenario/beat-plan.ts'
+import { MUST_RESOLVE_RATIO } from '../scenario/phases.ts'
 import {
   planPreemption,
   PriorityQueue,
@@ -59,6 +60,12 @@ export interface TurnRequest {
   readonly playerText?: string
   readonly choiceId?: string
   readonly checkpoint?: number
+  /**
+   * True when this turn must produce a closing plan (B2-T5): from the 90%
+   * checkpoint on, and for the forced resolve turn at
+   * `plannedMinutes + endGraceMin`.
+   */
+  readonly mustResolve?: boolean
   /** Called by the runner as the request advances; must be cheap and sync. */
   readonly onStage?: (stage: 'executing' | 'writing') => void
 }
@@ -67,6 +74,12 @@ export interface TurnRequest {
 export interface TurnRunnerResult {
   readonly line?: string
   readonly choices?: readonly PlayerChoice[]
+  /**
+   * The plan's `BeatPlan.nextTurnAfterSec` suggestion (B2-T5). The engine
+   * clamps it into `[autopilot.minSec, autopilot.maxSec]` and adopts it for
+   * the next autopilot tick; `undefined` keeps the current interval.
+   */
+  readonly nextTurnAfterSec?: number
   /** Defaults to `completed`. A runner may report `fallback` for a degraded turn. */
   readonly outcome?: TurnOutcome
 }
@@ -101,6 +114,15 @@ export interface EngineConfig {
   }
   readonly checkpoints: readonly number[]
   readonly endGraceMin: number
+  /**
+   * Minimum aftercare duration in minutes (B2-T5, `session.aftercareMin`, S12).
+   *
+   * Optional on purpose: absent means "no minimum" (an immediate `ended`),
+   * because the guard waits on the injected clock and a default would stall
+   * every caller that ends a session. Hosts pass the pack value here
+   * (`scenario.session.aftercareMin`, whose own default is 5).
+   */
+  readonly aftercareMin?: number
   readonly maxConsecutiveFailures: number
   readonly snapshotEveryTurn: boolean
 }
@@ -133,6 +155,33 @@ export interface EngineSnapshot {
   readonly lastLine: string | undefined
   readonly choices: readonly PlayerChoice[] | undefined
   readonly outcome: TurnOutcome | undefined
+  /** Highest time checkpoint reached (B2-T5); `undefined` before 50%. */
+  readonly checkpoint: number | undefined
+  /** True from the 90% checkpoint on: the next turn must produce a closing plan. */
+  readonly mustResolve: boolean
+}
+
+/**
+ * One time-checkpoint notification (B2-T5).
+ *
+ * 50% and 80% only inject a reminder; from 90% on `mustResolve` flips so the
+ * next turn may only produce a closing plan (§7 of the design draft).
+ */
+export interface CheckpointUpdate {
+  /** Fraction of the planned budget that was reached, e.g. `0.5`. */
+  readonly checkpoint: number
+  readonly mustResolve: boolean
+  /** One-sentence reminder to inject into the next director prompt. */
+  readonly reminder: string
+}
+
+/** Reminder sentence for a time checkpoint; the engine never blocks on it. */
+export function checkpointReminder(ratio: number, mustResolve: boolean): string {
+  const percent = Math.round(ratio * 100)
+  if (mustResolve) {
+    return `预计时长已过 ${percent}%，下一回合必须收束：只产出收尾/aftercare 意图，并停止升级。`
+  }
+  return `预计时长已过 ${percent}%，放慢升级节奏，把剩余时间留给收束。`
 }
 
 /** Hooks the host fills in as later tasks land. All optional for B1-T11. */
@@ -150,6 +199,15 @@ export interface TurnEngineHooks {
   readonly onPanic?: (source: string) => Promise<void> | void
   /** aftercare / forced resolve (B2-T5). */
   readonly onEnd?: (reason: EndReason) => Promise<void> | void
+  /**
+   * The adopted autopilot interval after clamping (B2-T5), in seconds.
+   *
+   * Observability only: the engine already adopted the value, so a host that
+   * ignores this hook still gets the right pacing.
+   */
+  readonly onPlanPacing?: (seconds: number) => void
+  /** A time checkpoint was reached; inject `reminder` into the next prompt. */
+  readonly onCheckpoint?: (update: CheckpointUpdate) => void
   readonly onEvent?: (event: EngineEvent) => void
 }
 
@@ -210,7 +268,30 @@ export class TurnEngine {
   private pauseRequested = false
   /** P0 landed during the active turn; its outcome is `cancelled`, not a model fallback. */
   private panicked = false
+  /** Tail of the P1 queue: two messages must never start two turns at once. */
+  private playerQueueTail: Promise<void> = Promise.resolve()
+  private playerQueueDepth = 0
   private disposed = false
+
+  // B2-T5: autopilot pacing and the session time budget.
+  private autopilotOn = false
+  private autopilotTimer: Timer | undefined
+  private intervalSec: number
+  private sessionStarted = false
+  private checkpointTimers: Timer[] = []
+  private deadlineTimer: Timer | undefined
+  private lastCheckpoint: number | undefined
+  private mustResolveFlag = false
+  /** A forced resolve arrived while paused; it fires on resume. */
+  private forcedResolvePending = false
+
+  // B2-T6: the choice menu and its passive fallback.
+  private choiceTimer: Timer | undefined
+  private currentChoicesTurnId: number | undefined
+
+  // B2-T5: the aftercare minimum guard.
+  private aftercareTimer: Timer | undefined
+  private aftercareResolve: (() => void) | undefined
 
   constructor(options: TurnEngineOptions) {
     this.clock = options.clock
@@ -219,6 +300,7 @@ export class TurnEngine {
     this.config = mergeConfig(options.config)
     this.hooks = options
     this.startedAt = this.clock.now()
+    this.intervalSec = this.clampAutopilotSec(this.config.autopilot.defaultSec)
   }
 
   get state(): TurnState {
@@ -235,6 +317,92 @@ export class TurnEngine {
     return this.queue.size
   }
 
+  /** True while the P3 autopilot timer is enabled (B2-T5). */
+  get autopilotEnabled(): boolean {
+    return this.autopilotOn
+  }
+
+  /** Adopted gap between autopilot turns, already clamped to `[minSec,maxSec]`. */
+  get autopilotIntervalSec(): number {
+    return this.intervalSec
+  }
+
+  /** Highest time checkpoint reached so far (`0.5` / `0.8` / `0.9`), if any. */
+  get checkpoint(): number | undefined {
+    return this.lastCheckpoint
+  }
+
+  /** True from the 90% checkpoint on: the next turn must produce a closing plan. */
+  get mustResolve(): boolean {
+    return this.mustResolveFlag
+  }
+
+  /**
+   * Turn the P3 autopilot timer on or off (B2-T5).
+   *
+   * Idempotent. A tick only *offers* a turn: it is dropped while another turn
+   * runs or while a choice menu waits for the player, and never starts in
+   * `paused` / `locked` / `ending` / `ended`. The adopted interval starts as
+   * `autopilot.defaultSec` and changes only through a clamped
+   * `BeatPlan.nextTurnAfterSec`.
+   */
+  setAutopilot(enabled: boolean): void {
+    if (this.disposed || this.autopilotOn === enabled) return
+    this.autopilotOn = enabled
+    if (enabled) {
+      this.scheduleAutopilotTick()
+      this.maybeArmChoiceTimeout()
+    } else {
+      this.cancelAutopilotTick()
+      this.cancelChoiceTimer()
+    }
+    this.emit('turn', { autopilot: enabled })
+  }
+
+  /** Convenience alias for `setAutopilot(true)`. */
+  startAutopilot(): void {
+    this.setAutopilot(true)
+  }
+
+  /** Convenience alias for `setAutopilot(false)`. */
+  stopAutopilot(): void {
+    this.setAutopilot(false)
+  }
+
+  /**
+   * Arm the session time budget (B2-T5): checkpoint reminders plus the hard
+   * `plannedMinutes + endGraceMin` forced-resolve turn.
+   *
+   * Hosts call it once when the session opens (the engine deliberately does
+   * not arm long-lived timers at construction, so turn-only hosts and tests
+   * stay timer-free). It is a no-op without a positive `plannedMinutes` and
+   * idempotent on repeated calls.
+   */
+  startSession(): void {
+    if (this.disposed || this.sessionStarted) return
+    this.sessionStarted = true
+    const planned = this.hooks.plannedMinutes
+    if (planned === undefined || !Number.isFinite(planned) || planned <= 0) return
+    const plannedMs = planned * 60_000
+    const elapsedMs = this.clock.now() - this.startedAt
+    const ratios = new Set<number>()
+    for (const ratio of this.config.checkpoints) {
+      if (Number.isFinite(ratio) && ratio > 0 && ratio <= 1) ratios.add(ratio)
+    }
+    // From 90% on the next turn must resolve (C-7); keep that regardless of
+    // how a pack configures the reminder list.
+    ratios.add(MUST_RESOLVE_RATIO)
+    for (const ratio of [...ratios].sort((left, right) => left - right)) {
+      const delayMs = Math.round(plannedMs * ratio - elapsedMs)
+      if (delayMs <= 0) this.applyCheckpoint(ratio)
+      else this.checkpointTimers.push(this.clock.timeout(delayMs, () => this.applyCheckpoint(ratio)))
+    }
+    const graceMin = Number.isFinite(this.config.endGraceMin) ? Math.max(0, this.config.endGraceMin) : 0
+    const deadlineMs = Math.round(plannedMs + graceMin * 60_000 - elapsedMs)
+    if (deadlineMs <= 0) this.forceResolve()
+    else this.deadlineTimer = this.clock.timeout(deadlineMs, () => this.forceResolve())
+  }
+
   snapshot(): EngineSnapshot {
     const elapsedMs = this.clock.now() - this.startedAt
     const planned = this.hooks.plannedMinutes
@@ -247,6 +415,8 @@ export class TurnEngine {
       lastLine: this.lastLine,
       choices: this.currentChoices,
       outcome: this.lastOutcome,
+      checkpoint: this.lastCheckpoint,
+      mustResolve: this.mustResolveFlag,
     }
   }
 
@@ -315,6 +485,10 @@ export class TurnEngine {
     this.pauseRequested = false
     // A panic or an end may have won the race while we waited.
     if (this.turnState !== 'idle') return
+    // A pause is a full stop (decision 4): a waiting choice menu and the
+    // autopilot cadence stop with it; resume re-arms both.
+    this.cancelChoiceTimer()
+    this.cancelAutopilotTick()
     this.setState('paused')
     await this.hooks.onPause?.()
     await this.audit.record({ actor: 'human', action: 'session_paused', result: 'ok' })
@@ -333,12 +507,24 @@ export class TurnEngine {
     this.hooks.onResume?.()
     await this.audit.record({ actor: 'human', action: 'session_resumed', result: 'ok' })
     this.emit('state', { state: this.turnState })
+    if (this.forcedResolvePending) {
+      // The session budget deadline landed while paused; honor it now.
+      this.forcedResolvePending = false
+      this.submit({ priority: 'session', kind: 'checkpoint', at: this.clock.now(), payload: { checkpoint: 1 } })
+      return
+    }
+    this.scheduleAutopilotTick()
+    this.maybeArmChoiceTimeout()
     this.drainQueue()
   }
 
   /** P0: out-of-band stop. Never queued, never blocked by a busy turn. */
   async panic(source: string): Promise<void> {
     this.queue.clear()
+    this.setAutopilot(false)
+    this.cancelTimeBudget()
+    this.cancelChoiceWait()
+    this.releaseAftercare()
     this.panicked = true
     this.abortActive()
     await this.hooks.onPanic?.(source)
@@ -354,12 +540,22 @@ export class TurnEngine {
     this.drainQueue()
   }
 
-  /** End the session: wait for the active turn, then run the end hooks. */
+  /**
+   * End the session: wait for the active turn, then run the end hooks.
+   *
+   * B2-T5 adds the aftercare guard: when `aftercareMin` is configured, the
+   * engine stays in `ending` for at least that many minutes of injected-clock
+   * time after `onEnd` started, then audits `session_end` and enters `ended`.
+   */
   async end(reason: EndReason): Promise<void> {
     if (isTerminalState(this.turnState) || this.turnState === 'ending') return
     this.queue.clear()
+    this.setAutopilot(false)
+    this.cancelTimeBudget()
+    this.cancelChoiceWait()
     await this.currentRun
     if (isTerminalState(this.turnState)) return
+    const endingStartedAt = this.clock.now()
     if (this.turnState === 'locked') {
       // A panicked session ends from `locked` too; ending is allowed from it.
       this.setState('ending')
@@ -367,6 +563,11 @@ export class TurnEngine {
       this.setState('ending')
     }
     await this.hooks.onEnd?.(reason)
+    const aftercareMin = this.config.aftercareMin
+    const aftercareMs = aftercareMin === undefined || !Number.isFinite(aftercareMin)
+      ? 0
+      : Math.max(0, aftercareMin) * 60_000
+    await this.waitForAftercare(endingStartedAt, aftercareMs)
     await this.audit.record({ actor: 'human', action: 'session_end', result: 'ok', detail: { reason } })
     if (this.liveState() !== 'ending') return
     this.setState('ended')
@@ -377,6 +578,11 @@ export class TurnEngine {
   dispose(): void {
     this.disposed = true
     this.queue.clear()
+    this.autopilotOn = false
+    this.cancelAutopilotTick()
+    this.cancelTimeBudget()
+    this.cancelChoiceWait()
+    this.releaseAftercare()
     this.abortActive()
   }
 
@@ -419,7 +625,26 @@ export class TurnEngine {
   }
 
   /** P1 path shared by messages and choices. */
-  private async submitPlayerInput(input: { kind: 'player' | 'choice'; text?: string; choiceId?: string }): Promise<void> {
+  private submitPlayerInput(input: { kind: 'player' | 'choice'; text?: string; choiceId?: string }): Promise<void> {
+    // B-1: a burst of player lines becomes one turn per line, in order — never
+    // two overlapping turns.
+    // B-3: the preemption is announced NOW, at submit time, so a queued turn
+    // does not wait for a turn it was supposed to interrupt. The runner gets
+    // the cooperative signal and, past the grace window, the hard abort.
+    const active = this.active
+    if (active !== undefined && this.currentRun !== undefined && !active.preempted) {
+      void this.preempt(active)
+    }
+    const run = (): Promise<void> => this.runPlayerInput(input)
+    this.playerQueueDepth += 1
+    const next = this.playerQueueDepth === 1 ? run() : this.playerQueueTail.then(run, run)
+    this.playerQueueTail = next.catch(() => {})
+    return next.finally(() => {
+      this.playerQueueDepth -= 1
+    })
+  }
+
+  private async runPlayerInput(input: { kind: 'player' | 'choice'; text?: string; choiceId?: string }): Promise<void> {
     if (this.disposed || isTerminalState(this.turnState)) return
     if (this.turnState === 'locked') {
       await this.audit.record({ actor: 'human', action: 'preempted', result: 'rejected', reason: 'locked' })
@@ -432,6 +657,15 @@ export class TurnEngine {
       return
     }
     if (this.turnState === 'paused') await this.resume()
+    const resumed = this.liveState()
+    if (resumed === 'locked' || resumed === 'ending' || isTerminalState(resumed)) return
+
+    if (input.kind === 'choice' && input.choiceId !== undefined) {
+      if (!(await this.acceptChoice(input.choiceId))) return
+    } else {
+      // Typing is also a player move: the offered menu becomes stale.
+      this.cancelChoiceWait()
+    }
 
     const trigger: TurnTrigger = {
       priority: 'player',
@@ -459,7 +693,41 @@ export class TurnEngine {
     } finally {
       this.playerInputsPending -= 1
     }
+    // A player input restarts the autopilot cadence (draft §7).
+    this.scheduleAutopilotTick()
     await this.start(trigger)
+  }
+
+  /**
+   * Validate and audit a picked option, then drop the menu (B2-T6).
+   *
+   * Selecting is a human action and is recorded as `choice_selected` before
+   * the new turn's `turn_started`, so an audit replay sees the pick first.
+   * An id that was not offered while a menu is open is refused instead of
+   * being turned into a phantom player message; `false` means "no turn".
+   */
+  private async acceptChoice(choiceId: string): Promise<boolean> {
+    const offered = this.currentChoices?.find(choice => choice.id === choiceId)
+    const menuOpen = (this.currentChoices?.length ?? 0) > 0
+    if (menuOpen && offered === undefined) {
+      this.emit('error', { reason: 'unknown_choice', choiceId })
+      return false
+    }
+    const turnId = this.currentChoicesTurnId ?? this.currentTurnId
+    // Audit first: while it is in flight the menu is still "open", so an
+    // autopilot tick cannot slip a P3 turn in before this P1 input.
+    await this.audit.record({
+      actor: 'human',
+      action: 'choice_selected',
+      result: 'ok',
+      detail: {
+        turnId,
+        choiceId,
+        ...(offered === undefined ? {} : { tag: offered.tag }),
+      },
+    })
+    this.cancelChoiceWait()
+    return true
   }
 
   /** Apply the §4.8 preemption matrix to the in-flight turn, then audit it. */
@@ -515,6 +783,7 @@ export class TurnEngine {
     // A panic may have landed between queueing this turn and starting it.
     if (this.liveState() === 'locked' || isTerminalState(this.liveState())) return
     if (this.pauseRequested) {
+      this.cancelAutopilotTick()
       this.setState('paused')
       await this.hooks.onPause?.()
       await this.audit.record({ actor: 'human', action: 'session_paused', result: 'ok' })
@@ -537,7 +806,8 @@ export class TurnEngine {
     this.timedOut = false
     this.panicked = false
     this.lastOutcome = undefined
-    this.currentChoices = undefined
+    // A new turn invalidates the previous menu; its timeout goes with it.
+    this.cancelChoiceWait()
 
     const timeout: Timer = this.clock.timeout(this.config.turnTimeoutMs, () => {
       if (this.active?.turnId !== turnId) return
@@ -558,6 +828,8 @@ export class TurnEngine {
     })
 
     let outcome: TurnOutcome = 'completed'
+    /** Clamped `BeatPlan.nextTurnAfterSec`; adopted only after a clean turn. */
+    let pacedSec: number | undefined
     try {
       const result = await this.runner.run({
         turnId,
@@ -567,6 +839,7 @@ export class TurnEngine {
         ...(trigger.payload?.text === undefined ? {} : { playerText: trigger.payload.text }),
         ...(trigger.payload?.choiceId === undefined ? {} : { choiceId: trigger.payload.choiceId }),
         ...(trigger.payload?.checkpoint === undefined ? {} : { checkpoint: trigger.payload.checkpoint }),
+        ...(this.mustResolveFlag ? { mustResolve: true } : {}),
         onStage: stage => {
           if (this.active?.turnId !== turnId) return
           active.stage = stage
@@ -574,20 +847,27 @@ export class TurnEngine {
         },
       })
       if (this.active?.turnId !== turnId) return
-      if (!active.preempted) {
+      if (!active.preempted && !this.panicked) {
         if (result.line !== undefined) {
           this.lastLine = result.line
           this.emit('line', { turnId, text: result.line })
         }
+        if (result.nextTurnAfterSec !== undefined) {
+          pacedSec = this.clampAutopilotSec(result.nextTurnAfterSec)
+        }
         if (result.choices !== undefined) {
-          this.currentChoices = result.choices
-          this.emit('choices', { turnId, choices: result.choices })
+          await this.offerChoices(turnId, result.choices)
         }
       }
-      // A preempted turn stays preempted even when the runner resolves cleanly
-      // inside its grace window; its partial line is never back-filled.
-      outcome = active.preempted ? 'preempted' : result.outcome ?? 'completed'
-      this.consecutiveFailures = outcome === 'completed' ? 0 : this.consecutiveFailures + 1
+      // P0 wins even when the runner resolves cleanly: a cancelled turn must
+      // not back-fill a line or count as completed (wave-4 review B-4). A
+      // preempted turn likewise stays preempted inside its grace window.
+      outcome = this.panicked
+        ? 'cancelled'
+        : active.preempted
+          ? 'preempted'
+          : result.outcome ?? 'completed'
+      this.noteOutcome(outcome)
     } catch (failure) {
       if (this.active?.turnId !== turnId) return
       if (this.panicked) {
@@ -611,6 +891,7 @@ export class TurnEngine {
           detail: { turnId, message: failure instanceof Error ? failure.message : String(failure) },
         })
         this.emit('error', { turnId, outcome })
+        this.enforceFailurePolicy()
       }
     } finally {
       timeout.cancel()
@@ -644,6 +925,8 @@ export class TurnEngine {
     })
     if (this.turnState === 'locked' || isTerminalState(this.turnState)) return
     if (this.pauseRequested) {
+      this.cancelChoiceTimer()
+      this.cancelAutopilotTick()
       this.setState('paused')
       await this.hooks.onPause?.()
       await this.audit.record({ actor: 'human', action: 'session_paused', result: 'ok' })
@@ -652,7 +935,15 @@ export class TurnEngine {
     }
     this.setState('idle')
     this.emit('turn', { turnId, outcome })
+    // B2-T5: adopt the plan's clamped pacing before rescheduling the timer.
+    if (pacedSec !== undefined) {
+      this.intervalSec = pacedSec
+      this.publishPacing()
+    }
     this.drainQueue()
+    this.scheduleAutopilotTick()
+    // B2-T6: a menu only starts its passive timeout once the engine is idle.
+    if (this.turnState === 'idle') this.maybeArmChoiceTimeout()
   }
 
   /** Start the next queued P2 trigger, if the engine is free. */
@@ -663,6 +954,264 @@ export class TurnEngine {
     const [next] = this.queue.drain(1)
     if (next === undefined) return
     this.guardRun(this.start(next))
+  }
+
+  // ── B2-T5: autopilot pacing ───────────────────────────────────────────
+
+  /** Clamp a plan suggestion (or the config default) into the autopilot range. */
+  private clampAutopilotSec(seconds: number): number {
+    const { minSec, maxSec } = this.config.autopilot
+    const low = Number.isFinite(minSec) && minSec > 0 ? minSec : 10
+    const high = Number.isFinite(maxSec) && maxSec >= low ? maxSec : Math.max(low, 60)
+    const candidate = Number.isFinite(seconds) ? seconds : this.config.autopilot.defaultSec
+    return Math.min(high, Math.max(low, candidate))
+  }
+
+  /** Arm (or re-arm) the single pending autopilot tick. */
+  private scheduleAutopilotTick(): void {
+    this.cancelAutopilotTick()
+    if (this.disposed || !this.autopilotOn) return
+    const delayMs = Math.max(1, Math.trunc(this.intervalSec * 1000))
+    this.autopilotTimer = this.clock.timeout(delayMs, () => {
+      this.autopilotTimer = undefined
+      this.onAutopilotTick()
+    })
+  }
+
+  private cancelAutopilotTick(): void {
+    this.autopilotTimer?.cancel()
+    this.autopilotTimer = undefined
+  }
+
+  /** One P3 tick: offer a turn when idle, otherwise drop it and reschedule. */
+  private onAutopilotTick(): void {
+    if (this.disposed || !this.autopilotOn) return
+    if (this.canAutopilotStart()) {
+      this.submit({ priority: 'autopilot', kind: 'autopilot', at: this.clock.now() })
+    } else {
+      this.emit('turn', {
+        skipped: true,
+        priority: 'autopilot',
+        reason: this.awaitingChoice() ? 'choices' : 'busy',
+      })
+    }
+    // Always reschedule: a skipped slot is never queued and never replayed.
+    this.scheduleAutopilotTick()
+  }
+
+  private canAutopilotStart(): boolean {
+    return this.turnState === 'idle'
+      && this.currentRun === undefined
+      && this.active === undefined
+      && !this.pauseRequested
+      && !this.awaitingChoice()
+  }
+
+  /** A menu with at least one option is waiting for a human decision. */
+  private awaitingChoice(): boolean {
+    return this.currentChoices !== undefined && this.currentChoices.length > 0
+  }
+
+  private publishPacing(): void {
+    try {
+      this.hooks.onPlanPacing?.(this.intervalSec)
+    } catch (error) {
+      this.emit('error', {
+        phase: 'pacing',
+        message: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  /** Failure streaks pause autopilot only; manual play keeps working. */
+  private noteOutcome(outcome: TurnOutcome): void {
+    if (outcome === 'completed') {
+      this.consecutiveFailures = 0
+      return
+    }
+    // A preempt is a player decision, not a model failure.
+    if (outcome === 'preempted' || outcome === 'cancelled') return
+    this.consecutiveFailures += 1
+    this.enforceFailurePolicy()
+  }
+
+  private enforceFailurePolicy(): void {
+    if (this.consecutiveFailures < this.config.maxConsecutiveFailures) return
+    if (!this.autopilotOn) return
+    this.setAutopilot(false)
+    this.emit('error', { reason: 'autopilot_paused', failures: this.consecutiveFailures })
+  }
+
+  // ── B2-T5: session time budget ────────────────────────────────────────
+
+  /** 50/80/90% checkpoint: reminder only, never a turn (draft §7). */
+  private applyCheckpoint(ratio: number): void {
+    if (this.disposed) return
+    const state = this.liveState()
+    if (state === 'ending' || state === 'ended' || state === 'locked') return
+    if (this.lastCheckpoint !== undefined && ratio <= this.lastCheckpoint) return
+    this.lastCheckpoint = ratio
+    const mustResolve = this.mustResolveFlag || ratio >= MUST_RESOLVE_RATIO
+    this.mustResolveFlag = mustResolve
+    const update: CheckpointUpdate = {
+      checkpoint: ratio,
+      mustResolve,
+      reminder: checkpointReminder(ratio, mustResolve),
+    }
+    try {
+      this.hooks.onCheckpoint?.(update)
+    } catch (error) {
+      this.emit('error', {
+        phase: 'checkpoint',
+        message: error instanceof Error ? error.message : String(error),
+      })
+    }
+    this.emit('turn', { checkpoint: ratio, mustResolve, reminder: update.reminder })
+  }
+
+  /**
+   * Planned time plus `endGraceMin` elapsed: queue a resolve turn (P2).
+   *
+   * The turn is a checkpoint trigger with `payload.checkpoint = 1`; it queues
+   * behind a busy turn, waits out a pause, and never bypasses `locked`.
+   */
+  private forceResolve(): void {
+    this.deadlineTimer = undefined
+    if (this.disposed) return
+    const state = this.liveState()
+    if (state === 'ending' || state === 'ended' || state === 'locked') return
+    this.mustResolveFlag = true
+    this.emit('turn', { forcedResolve: true })
+    if (state === 'paused') {
+      // No turn may start while paused; resume replays this one deadline only.
+      this.forcedResolvePending = true
+      return
+    }
+    this.submit({
+      priority: 'session',
+      kind: 'checkpoint',
+      at: this.clock.now(),
+      payload: { checkpoint: 1 },
+    })
+  }
+
+  private cancelTimeBudget(): void {
+    for (const timer of this.checkpointTimers) timer.cancel()
+    this.checkpointTimers = []
+    this.deadlineTimer?.cancel()
+    this.deadlineTimer = undefined
+  }
+
+  // ── B2-T5: aftercare minimum ──────────────────────────────────────────
+
+  /** Wait until `minimumMs` of clock time passed since `ending` was entered. */
+  private waitForAftercare(endingStartedAt: number, minimumMs: number): Promise<void> {
+    if (minimumMs <= 0 || this.turnState !== 'ending') return Promise.resolve()
+    const remainingMs = minimumMs - (this.clock.now() - endingStartedAt)
+    if (remainingMs <= 0) return Promise.resolve()
+    return new Promise<void>(resolve => {
+      this.aftercareResolve = resolve
+      this.aftercareTimer = this.clock.timeout(remainingMs, () => {
+        this.aftercareTimer = undefined
+        const done = this.aftercareResolve
+        this.aftercareResolve = undefined
+        done?.()
+      })
+    })
+  }
+
+  /** Release a pending aftercare wait (panic / dispose / second end). */
+  private releaseAftercare(): void {
+    this.aftercareTimer?.cancel()
+    this.aftercareTimer = undefined
+    const done = this.aftercareResolve
+    this.aftercareResolve = undefined
+    done?.()
+  }
+
+  // ── B2-T6: choices ────────────────────────────────────────────────────
+
+  /** Cap to 0–3, dedupe, publish and audit an offered menu. */
+  private async offerChoices(turnId: number, choices: readonly PlayerChoice[]): Promise<void> {
+    if (!this.config.choices.enabled) return
+    const limit = this.choiceLimit()
+    const seen = new Set<string>()
+    const offered: PlayerChoice[] = []
+    for (const choice of choices) {
+      if (offered.length >= limit) break
+      if (seen.has(choice.id)) continue
+      seen.add(choice.id)
+      offered.push(choice)
+    }
+    this.currentChoices = offered
+    this.currentChoicesTurnId = turnId
+    this.emit('choices', { turnId, choices: offered })
+    await this.audit.record({
+      actor: 'system',
+      action: 'choices_offered',
+      result: 'ok',
+      detail: { turnId, ids: offered.map(choice => choice.id) },
+    })
+  }
+
+  private choiceLimit(): number {
+    const configured = this.config.choices.max
+    if (!Number.isFinite(configured)) return 3
+    return Math.max(0, Math.min(3, Math.trunc(configured)))
+  }
+
+  /**
+   * Arm the passive fallback timer.
+   *
+   * Only while autopilot is on (draft §4.1): with autopilot off the engine
+   * waits for the player indefinitely instead of deciding for them.
+   */
+  private maybeArmChoiceTimeout(): void {
+    if (this.disposed || !this.autopilotOn) {
+      this.cancelChoiceTimer()
+      return
+    }
+    if (this.turnState !== 'idle' || this.active !== undefined) return
+    if (!this.awaitingChoice()) return
+    const configured = this.config.choices.timeoutSec
+    const seconds = Number.isFinite(configured) ? Math.max(0, configured) : 60
+    this.cancelChoiceTimer()
+    this.choiceTimer = this.clock.timeout(Math.max(0, Math.trunc(seconds * 1000)), () => {
+      this.choiceTimer = undefined
+      this.handleChoiceTimeout()
+    })
+  }
+
+  private cancelChoiceTimer(): void {
+    this.choiceTimer?.cancel()
+    this.choiceTimer = undefined
+  }
+
+  /** Drop the menu and its timer without auditing (new turn / pause). */
+  private cancelChoiceWait(): void {
+    this.cancelChoiceTimer()
+    this.currentChoices = undefined
+    this.currentChoicesTurnId = undefined
+  }
+
+  /** Autopilot-on timeout: `passive` (no action) and the director continues. */
+  private handleChoiceTimeout(): void {
+    if (this.disposed) return
+    const turnId = this.currentChoicesTurnId
+    this.currentChoices = undefined
+    this.currentChoicesTurnId = undefined
+    this.emit('choices', { turnId, timedOut: true })
+    // Start the audit before the next turn so replay ordering stays readable.
+    void this.audit.record({
+      actor: 'system',
+      action: 'choice_timeout',
+      result: 'ok',
+      ...(turnId === undefined ? {} : { detail: { turnId } }),
+    })
+    if (!this.autopilotOn) return
+    if (this.turnState !== 'idle' || this.currentRun !== undefined || this.pauseRequested) return
+    this.submit({ priority: 'autopilot', kind: 'autopilot', at: this.clock.now() })
+    this.scheduleAutopilotTick()
   }
 
   /** Exposed for tests and the failure-streak policy in B2-T5. */

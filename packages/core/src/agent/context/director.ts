@@ -465,7 +465,7 @@ function directionOf(probe: DirectorProbeFact): DirectorProbeDirection {
   // `ambiguous`: a positive delta is still a detected rise; otherwise unknown.
   const delta = probe.delta
   if (delta === undefined) return 'unknown'
-  return delta.motion > 0 || delta.audioPct > 0 ? 'up' : 'flat'
+  return (delta.motion ?? 0) > 0 || (delta.audioPct ?? 0) > 0 ? 'up' : 'flat'
 }
 
 /** Last written percent → band, relative to the channel's effective cap. */

@@ -121,7 +121,8 @@ describe('reaction probe thresholds and quality gates', () => {
     expect(record.verdict).toBe('none')
     expect(record.reason).toBeUndefined()
     expect(record.delta?.motion).toBeCloseTo(0.03, 10)
-    expect(record.delta?.audioPct).toBe(0)
+    // Audio was not comparable (motion-only case): it is omitted, not 0-filled.
+    expect(record.delta?.audioPct).toBeUndefined()
   })
 
   it('returns responded on a 0.08 motion delta or a 15% audio delta', () => {
@@ -191,5 +192,42 @@ describe('reaction probe thresholds and quality gates', () => {
     expect(record.reason).toBe('degenerate')
     expect(record.baseline?.samples).toBe(1)
     expect(record.window).toBeUndefined()
+  })
+})
+
+describe('probe comparability (review blocker B-1)', () => {
+  it('never compares a window against a baseline the modality never saw', () => {
+    // The camera only starts sampling after the action, so the baseline window
+    // is empty. A rising window must not be scored as a reaction against an
+    // invented zero baseline.
+    const { clock, registry, recorder } = harness()
+    clock.advance(1_500)
+    registry.push(sample('usb-cam-1', { ts: 1_500, motionEnergy: 0, motionPeak: 0.9 }))
+    expect(recorder.register(action(1_500))).toBe('p-0001')
+    clock.advance(2_500)
+
+    const record = newestRecord(recorder)
+    expect(record.verdict).toBe('ambiguous')
+    expect(record.reason).toBe('degenerate')
+    // No fabricated motion delta.
+    expect(record.delta?.motion).toBeUndefined()
+  })
+
+  it('keeps a comparable modality usable when the other one appeared late', () => {
+    // Audio observed both windows; the camera appeared only in the window.
+    const { clock, registry, recorder } = harness({ sources: [source('mic-1', 'audio'), source('usb-cam-1', 'image')] })
+    registry.push(sample('mic-1', { ts: 0, audioLevelPct: 10 }))
+    clock.advance(1_000)
+    registry.push(sample('mic-1', { ts: 1_000, audioLevelPct: 10 }))
+    clock.advance(500)
+    registry.push(sample('mic-1', { ts: 1_500, audioLevelPct: 40 }))
+    registry.push(sample('usb-cam-1', { ts: 1_500, motionEnergy: 0, motionPeak: 0.9 }))
+    expect(recorder.register(action(1_500))).toBe('p-0001')
+    clock.advance(2_500)
+
+    const record = newestRecord(recorder)
+    expect(record.verdict).toBe('responded')
+    expect(record.delta?.audioPct).toBeGreaterThanOrEqual(15)
+    expect(record.delta?.motion).toBeUndefined()
   })
 })

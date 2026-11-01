@@ -418,3 +418,48 @@ describe('runTurn (single-call turn)', () => {
     expect(calls).toHaveLength(1)
   })
 })
+
+describe('the turn deadline covers uncooperative work (review blocker B-4)', () => {
+  it('rejects at the deadline even when the runner ignores the abort signal', async () => {
+    const clock = new FakeClock()
+    const runner: ModelRunner = {
+      // Deliberately ignores `request.signal`: a hung transport must not hang
+      // the turn forever.
+      run: () => new Promise<never>(() => {}),
+    }
+    const { executor } = recordingExecutor()
+    const pending = runTurn({ runner, tools: M2_MODEL_TOOLS, executor, input: inputFixture(), clock })
+    const assertion = expect(pending).rejects.toMatchObject({ code: 'timeout' })
+
+    clock.advance(DEFAULT_TURN_TIMEOUT_MS)
+    await assertion
+    expect(clock.pendingCount).toBe(0)
+  })
+
+  it('does not report success when the dispatch only settles after the deadline', async () => {
+    const clock = new FakeClock()
+    const runner: ModelRunner = {
+      run: async () => ({ text: '好的。', toolCalls: [APPLY_PLAN_CALL], finishReason: 'tool-calls' }),
+    }
+    let release: (() => void) | undefined
+    const executor: TurnExecutor = {
+      dispatch: () => new Promise(resolve => {
+        release = () => resolve({ planId: 'p-late', turnId: 7, actions: [], blocked: false })
+      }),
+    }
+
+    const pending = runTurn({ runner, tools: M2_MODEL_TOOLS, executor, input: inputFixture(), clock })
+    const assertion = expect(pending).rejects.toMatchObject({ code: 'timeout' })
+
+    // Let the tool call reach the hanging dispatch, then blow the deadline.
+    await Promise.resolve()
+    await Promise.resolve()
+    clock.advance(DEFAULT_TURN_TIMEOUT_MS)
+    await assertion
+
+    // The late settle must not surface as an unhandled rejection.
+    release?.()
+    await Promise.resolve()
+    await Promise.resolve()
+  })
+})

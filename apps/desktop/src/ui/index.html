@@ -113,6 +113,15 @@
   .a-human { color: #6fb4ef; }
   #err { color: #ef8095; min-height: 18px; margin-top: 8px; font-size: 12px; }
 
+  #sensors { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: #9a9aa6; }
+  #sensors .sensor { display: flex; align-items: center; gap: 6px; }
+  #sensors .q-ok { color: #5fd08a; }
+  #sensors .q-bad { color: #ef8095; }
+  #sensors .q-warn { color: #e6c267; }
+  #debugProbes { max-height: 240px; overflow-y: auto; font: 11px/1.7 ui-monospace, Consolas, monospace; }
+  #debugProbes div { white-space: pre-wrap; word-break: break-all; color: #b6b6c4; }
+  #debugToggle.on { color: #e6c267; border-color: #6b5a24; }
+
   .modal {
     position: fixed; inset: 0; z-index: 20;
     background: rgba(0,0,0,.55);
@@ -140,6 +149,7 @@
     <span class="spacer"></span>
     <button id="logsToggle">日志</button>
     <button id="auditToggle">审计</button>
+    <button id="debugToggle" aria-pressed="false" title="显示 probe 数值与解析结果（默认关闭；不影响审计与模型上下文）">调试</button>
     <button id="panic">紧急停止</button>
   </header>
 
@@ -174,6 +184,16 @@
   <div class="panel" id="logPanel" style="display:none">
     <h3>运行日志<small>后台环形缓冲（BLE 扫描、选择器决策、设备诊断）；终端只显示关键启动信息</small></h3>
     <div id="logs" style="font: 11px/1.6 ui-monospace, Consolas, monospace; white-space: pre-wrap; word-break: break-all; background:#0b0b10; border-radius:8px; padding:8px 10px; max-height:220px; overflow-y:auto; color:#9a9aa6"></div>
+  </div>
+
+  <div class="panel" id="sensorsPanel">
+    <h3>感知<small>默认只显示可用性与质量；probe 数值属于调试信息，关闭调试时不渲染</small></h3>
+    <div id="sensors"><span class="hint">加载中…</span></div>
+  </div>
+
+  <div class="panel" id="debugPanel" style="display:none">
+    <h3>调试<small>probe 数值与解析结果只在本机控制台显示；不写审计、不进模型上下文</small></h3>
+    <div id="debugProbes"></div>
   </div>
 
   <div class="panel">

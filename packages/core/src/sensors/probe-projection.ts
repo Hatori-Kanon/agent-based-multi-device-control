@@ -48,8 +48,11 @@ export interface ProbeDirectorEntry {
   /** Magnitude band only; see {@link ProbeMagnitude} for the bands. */
   readonly magnitude: ProbeMagnitude
   readonly targets: readonly ProbeTarget[]
-  /** Raw facts; `undefined` when the windows were not comparable. */
-  readonly delta: { readonly motion: number; readonly audioPct: number } | undefined
+  /**
+   * Raw facts; `undefined` when the windows were not comparable. A modality
+   * that only one side observed is omitted rather than reported as zero.
+   */
+  readonly delta: { readonly motion?: number; readonly audioPct?: number } | undefined
   /** Present only when the verdict degraded; never projected to the writer. */
   readonly reason?: ProbeDegradeReason
 }
@@ -82,7 +85,10 @@ export function probeDirectorJson(records: readonly ProbeRecord[]): readonly Pro
     targets: record.targets.map(target => ({ deviceId: target.deviceId, channelId: target.channelId })),
     delta: record.delta === undefined
       ? undefined
-      : { motion: record.delta.motion, audioPct: record.delta.audioPct },
+      : {
+          ...(record.delta.motion === undefined ? {} : { motion: record.delta.motion }),
+          ...(record.delta.audioPct === undefined ? {} : { audioPct: record.delta.audioPct }),
+        },
     ...(record.reason === undefined ? {} : { reason: record.reason }),
   }))
 }
@@ -112,7 +118,7 @@ function directionOf(record: ProbeRecord): ProbeDirection {
   if (record.verdict === 'responded') return 'up'
   if (record.verdict === 'none') return 'flat'
   if (record.verdict === 'ambiguous' && record.delta !== undefined) {
-    return record.delta.motion > 0 || record.delta.audioPct > 0 ? 'up' : 'flat'
+    return (record.delta.motion ?? 0) > 0 || (record.delta.audioPct ?? 0) > 0 ? 'up' : 'flat'
   }
   return 'unknown'
 }
@@ -122,8 +128,8 @@ function magnitudeOf(record: ProbeRecord): ProbeMagnitude {
   if (record.verdict === 'ambiguous' || record.verdict === 'unavailable' || record.delta === undefined) {
     return 'unknown'
   }
-  const motionRatio = record.delta.motion / DEFAULT_PROBE_THRESHOLDS.motionDeltaMin
-  const audioRatio = record.delta.audioPct / DEFAULT_PROBE_THRESHOLDS.audioDeltaMinPct
+  const motionRatio = (record.delta.motion ?? 0) / DEFAULT_PROBE_THRESHOLDS.motionDeltaMin
+  const audioRatio = (record.delta.audioPct ?? 0) / DEFAULT_PROBE_THRESHOLDS.audioDeltaMinPct
   const ratio = Math.max(0, motionRatio, audioRatio)
   if (ratio >= MAGNITUDE_LARGE_RATIO) return 'large'
   if (ratio >= MAGNITUDE_MEDIUM_RATIO) return 'medium'
