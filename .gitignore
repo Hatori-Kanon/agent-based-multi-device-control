@@ -127,3 +127,16 @@ venv/
 
 # ── Third-party reference clones (analysis only, not part of the build) ────
 _reference/
+# AI-for-Coyote (GPL-3.0) and coyote-hub, fetched 2026-11-01 for the
+# architecture teardown. The upstream clone carries its own .git, so tracking
+# it would silently degrade into a gitlink.
+ai-for-coyote/
+coyote-hub/
+
+# ── Capture artifacts: local radio/health data, never commit ──────────────
+# btsnoop (Bluetooth HCI snoop) captures fingerprint the paired devices.
+*.cfa
+# HW9 capture runs: local health data, never commit (plan §4)
+analysis/hw9-capture/[0-9]*/
+analysis/hw9-capture/_tools/pylibs/
+analysis/hw9-capture/_tools/_pkgs/
