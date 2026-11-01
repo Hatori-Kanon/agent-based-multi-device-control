@@ -2,7 +2,12 @@
 
 Agent 主持的具身角色扮演系统：摄像头/麦克风感知 + 多设备并行物理反馈，安全边界由硬件与人类共同持有。
 
-**当前状态：M0、M1 已交付；M2 设计已冻结（2026-11-01），代码未开工。** 安全底座、波形子系统，以及**五个真实后端**：郊狼 V3（BLE）、谜姬 XHTKJ（BLE 直连）、安可尼 JH1（ankni 流式）、MonsterParty（云中继）、Buttplug/Intiface（集线器）。M2 = 感知源 + 回合引擎 + 内容包 —— 设计见 [`设计文档.md`](设计文档.md) 的 §0.5 / §10，任务分解见 [`M2-实施计划.md`](M2-实施计划.md)，冻结前审计见 [`analysis/m2-design-audit.md`](analysis/m2-design-audit.md)。
+**当前状态：M0、M1、M2 已交付（M2 = 第一个可玩版本）。** 安全底座、波形子系统、**五个真实后端**（郊狼 V3 / 谜姬 XHTKJ / 安可尼 JH1 / MonsterParty / Buttplug），以及 M2 的感知源、被动 probe、回合引擎、导演-写作-执行、内容包与跨会话账本。
+
+- 第一次上手：`pnpm install && pnpm run check`；起控制台用 `start.bat`，纯 Node 演示用 `start-dev.bat`。
+- 游玩页 `http://<host>:<port>/play?token=…`（控制台顶部「游玩」或 `Ctrl+Alt+P`）；无硬件时可 `node scripts/demo-m2.mjs` 跑离线四步演示。
+- M2 设计与执行：总纲 [`设计文档.md`](设计文档.md) §0.5/§10；任务与偏差记录 [`M2-实施计划.md`](M2-实施计划.md)；冻结前设计审计 [`analysis/m2-design-audit.md`](analysis/m2-design-audit.md)；48 项独立验收 [`analysis/m2-acceptance.md`](analysis/m2-acceptance.md)；各波次只读审查 [`analysis/m2-wave3-review-control.md`](analysis/m2-wave3-review-control.md)、[`-perception`](analysis/m2-wave3-review-perception.md)、[`analysis/m2-wave4-review.md`](analysis/m2-wave4-review.md)。
+- **仍需操作者在真机上人工验收的**：摄像头 Demo A1/A2、真 Chromium 下的游玩页/控制台、真实郊狼 `BF` 重写、真实 LLM key、真 kill-重启、手机急停——步骤见计划 §5.4 与验收报告 §6。
 
 ## 文档
 
@@ -165,8 +170,8 @@ Electron 窗口加载的就是控制台网页，它由运行时内置的 HTTP �
 ## 测试
 
 ```
-packages/core    263 passed (13 files)
-apps/desktop      84 passed (7 files)
+packages/core    635 passed (50 files)
+apps/desktop     162 passed (14 files)
 ```
 
 两份套件要在**各自包目录**下跑（从仓库根跑会跨包解析依赖，`ws` 之类会加载不到）。命令见下节。
