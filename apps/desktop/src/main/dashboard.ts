@@ -110,6 +110,8 @@ export interface DashboardDeps {
   readonly setRegion?: (deviceId: string, channelId: string, region: string | undefined) => Promise<void>
   /** Region labels in force, keyed `device:channel` (B2-T10). */
   readonly regions?: () => Readonly<Record<string, string>>
+  /** Cross-session ledger entries, newest last (B2-T8/B2-T11). */
+  readonly ledger?: (limit?: number) => Promise<readonly unknown[]>
 }
 
 /** The one-session API the play routes drive (implemented by `PlayHost`). */
@@ -118,6 +120,14 @@ export interface DashboardSession {
   message(text: string): Promise<unknown>
   end(reason: string): Promise<unknown>
   snapshot(): unknown | undefined
+  /** B2-T11: pause/resume queue behind the current turn; a choice is a P1 input. */
+  pause?(): Promise<unknown>
+  resume?(): Promise<unknown>
+  choose?(choiceId: string): Promise<unknown>
+  /** Recent spoken lines, newest last. */
+  transcript?(): readonly unknown[]
+  /** Cross-session ledger entries, newest last (B2-T8). */
+  ledger?(limit?: number): Promise<readonly unknown[]>
 }
 
 export interface DashboardServerOptions {
@@ -589,6 +599,82 @@ export class DashboardServer {
       } catch (error) {
         sendSessionFailure(response, error)
       }
+      return
+    }
+
+    // ── Session controls (B2-T11) ────────────────────────────────────────
+    if (request.method === 'POST' && pathname === '/api/session/pause') {
+      const session = this.options.deps.session
+      if (session?.pause === undefined) {
+        sendError(response, 404, 'the session service is not available')
+        return
+      }
+      try {
+        sendJson(response, 200, await session.pause())
+      } catch (error) {
+        sendSessionFailure(response, error)
+      }
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/session/resume') {
+      const session = this.options.deps.session
+      if (session?.resume === undefined) {
+        sendError(response, 404, 'the session service is not available')
+        return
+      }
+      try {
+        sendJson(response, 200, await session.resume())
+      } catch (error) {
+        sendSessionFailure(response, error)
+      }
+      return
+    }
+
+    if (request.method === 'POST' && pathname === '/api/session/choice') {
+      const session = this.options.deps.session
+      if (session?.choose === undefined) {
+        sendError(response, 404, 'the session service is not available')
+        return
+      }
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(request)
+      } catch (error) {
+        sendError(response, 400, `invalid JSON body: ${error instanceof Error ? error.message : 'unreadable'}`)
+        return
+      }
+      const choiceId = asOptionalString(body.choiceId)
+      if (choiceId === undefined) {
+        sendError(response, 400, 'choiceId is required')
+        return
+      }
+      try {
+        sendJson(response, 200, await session.choose(choiceId))
+      } catch (error) {
+        sendSessionFailure(response, error)
+      }
+      return
+    }
+
+    if (request.method === 'GET' && pathname === '/api/session/transcript') {
+      sendJson(response, 200, { transcript: this.options.deps.session?.transcript?.() ?? [] })
+      return
+    }
+
+    if (request.method === 'GET' && pathname === '/api/ledger') {
+      const ledger = this.options.deps.ledger
+      if (ledger === undefined) {
+        sendJson(response, 200, { entries: [] })
+        return
+      }
+      const limitParam = url.searchParams.get('limit')
+      const limit = limitParam === null ? undefined : Number(limitParam)
+      if (limit !== undefined && (!Number.isInteger(limit) || limit <= 0)) {
+        sendError(response, 400, 'limit must be a positive whole number')
+        return
+      }
+      sendJson(response, 200, { entries: await ledger(limit) })
       return
     }
 

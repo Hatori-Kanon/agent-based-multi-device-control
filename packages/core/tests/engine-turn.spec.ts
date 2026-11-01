@@ -295,3 +295,60 @@ describe('P1 turns are serialised and P0 outranks a clean resolve', () => {
     expect(engine.snapshot().lastLine).toBeUndefined()
   })
 })
+
+describe('panic sets the latch before awaiting the host hook (wave-4 review S-6)', () => {
+  it('is already locked inside onPanic', async () => {
+    const clock = new FakeClock()
+    const audit = new AuditLog(new MemoryAppendOnlyStore(), clock, () => {})
+    let stateInHook: TurnState | undefined
+    const engine = new TurnEngine({
+      clock,
+      audit,
+      runner: stagedRunner(),
+      onPanic: () => {
+        stateInHook = engine.state
+      },
+    })
+
+    await engine.panic('hotkey')
+
+    expect(stateInHook).toBe('locked')
+    expect(engine.state).toBe('locked')
+    expect(clock.pendingCount).toBe(0)
+  })
+
+  it('stays locked when onPanic throws, and reports the failure as an event', async () => {
+    const clock = new FakeClock()
+    const audit = new AuditLog(new MemoryAppendOnlyStore(), clock, () => {})
+    const errors: unknown[] = []
+    const engine = new TurnEngine({
+      clock,
+      audit,
+      runner: hangingRunner(),
+      onPanic: () => {
+        throw new Error('device stop failed')
+      },
+      onEvent: event => {
+        if (event.type === 'error') errors.push(event.detail)
+      },
+    })
+
+    const turn = engine.submitPlayerMessage('慢一点')
+    await Promise.resolve()
+    // A failing stop hook must not reject panic() and must not unlock.
+    let thrown: unknown
+    try {
+      await engine.panic('hotkey')
+    } catch (error) {
+      thrown = error
+    }
+    await turn
+
+    expect(thrown).toBeUndefined()
+    expect(engine.state).toBe('locked')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toMatchObject({ phase: 'panic', source: 'hotkey', message: 'device stop failed' })
+    expect(engine.snapshot().outcome).toBe('cancelled')
+    expect(clock.pendingCount).toBe(0)
+  })
+})

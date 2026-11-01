@@ -857,3 +857,106 @@ describe('content pack API (B2-T14)', () => {
     expect(response.status).toBe(400)
   })
 })
+
+describe('session controls (B2-T11)', () => {
+  /** Minimal deps: only the session-control routes are exercised. */
+  function controlDeps(calls: string[]): DashboardDeps {
+    const unused = (): never => { throw new Error('not used by the session-control routes') }
+    return {
+      snapshot: () => ({ locked: false, devices: [] }),
+      session: {
+        start: async () => unused(),
+        message: async () => unused(),
+        end: async () => unused(),
+        snapshot: () => ({ phase: 'scene' }),
+        pause: async () => { calls.push('pause'); return { state: 'paused' } },
+        resume: async () => { calls.push('resume'); return { state: 'idle' } },
+        choose: async (choiceId: string) => { calls.push(`choice:${choiceId}`); return { chosen: choiceId } },
+        transcript: () => [{ turnId: 1, at: 0, text: '（低笑）' }],
+      },
+      ledger: async (limit?: number) => [{ sessionId: 's-1', limit }],
+      listPacks: async () => unused(),
+      importPack: async () => unused(),
+      activatePack: async () => unused(),
+      panic: async () => unused(),
+      unlock: async () => unused(),
+      setCap: async () => unused(),
+      demo: async () => unused(),
+      pattern: async () => unused(),
+      stop: async () => unused(),
+      connect: async () => unused(),
+      scan: async () => unused(),
+      listDevices: () => unused(),
+      addDevice: async () => unused(),
+      removeDevice: async () => unused(),
+      rawWrite: async () => unused(),
+      listWaveforms: () => unused(),
+      importWaveform: async () => unused(),
+      promoteWaveform: async () => unused(),
+      setWaveform: async () => unused(),
+      auditTail: async () => unused(),
+      recentErrors: () => unused(),
+      recentLogs: () => unused(),
+      sensorsStatus: () => [],
+      sensorFrame: async () => unused(),
+      pushFeatures: () => unused(),
+    }
+  }
+
+  async function startControlServer(calls: string[]): Promise<{ server: DashboardServer; base: string }> {
+    const server = new DashboardServer({ deps: controlDeps(calls), token: 'control-token-0123456789abcdef' })
+    const address = await server.start()
+    return { server, base: `http://${address.host}:${address.port}` }
+  }
+
+  it('drives pause, resume and a choice through the session routes', async () => {
+    const calls: string[] = []
+    const { server, base: url } = await startControlServer(calls)
+    try {
+      const headers = { 'x-control-token': 'control-token-0123456789abcdef', 'Content-Type': 'application/json' }
+      const pause = await fetch(`${url}/api/session/pause`, { method: 'POST', headers })
+      expect(pause.status).toBe(200)
+      expect(await pause.json()).toEqual({ state: 'paused' })
+
+      const resume = await fetch(`${url}/api/session/resume`, { method: 'POST', headers })
+      expect(resume.status).toBe(200)
+
+      const choice = await fetch(`${url}/api/session/choice`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ choiceId: 'c1' }),
+      })
+      expect(choice.status).toBe(200)
+      expect(calls).toEqual(['pause', 'resume', 'choice:c1'])
+
+      // A missing choice id is a caller error, not a turn.
+      const missing = await fetch(`${url}/api/session/choice`, { method: 'POST', headers, body: JSON.stringify({}) })
+      expect(missing.status).toBe(400)
+    } finally {
+      await server.stop()
+    }
+  })
+
+  it('serves the transcript and the ledger behind the token', async () => {
+    const calls: string[] = []
+    const { server, base: url } = await startControlServer(calls)
+    try {
+      expect((await fetch(`${url}/api/session/pause`)).status).toBe(401)
+
+      const transcript = await fetch(`${url}/api/session/transcript`, { headers: { 'x-control-token': 'control-token-0123456789abcdef' } })
+      expect(transcript.status).toBe(200)
+      expect((await transcript.json()) as { transcript: unknown[] }).toMatchObject({
+        transcript: [{ turnId: 1, text: '（低笑）' }],
+      })
+
+      const ledger = await fetch(`${url}/api/ledger?limit=5`, { headers: { 'x-control-token': 'control-token-0123456789abcdef' } })
+      expect(ledger.status).toBe(200)
+      expect((await ledger.json()) as { entries: Array<{ limit?: number }> }).toMatchObject({ entries: [{ limit: 5 }] })
+
+      const badLimit = await fetch(`${url}/api/ledger?limit=zero`, { headers: { 'x-control-token': 'control-token-0123456789abcdef' } })
+      expect(badLimit.status).toBe(400)
+    } finally {
+      await server.stop()
+    }
+  })
+})

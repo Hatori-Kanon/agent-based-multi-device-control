@@ -343,3 +343,94 @@ describe('dispatch', () => {
     expect(planResolvedRecords(harness)).toHaveLength(1)
   })
 })
+
+describe('dispatch preemption (wave-4 review B-3)', () => {
+  /** Explicit single-channel targets keep one command per beat. */
+  function toyBeat(id: string): Beat {
+    return levelBeat(id, { targets: [{ deviceId: 'toy', channelId: 'a' }] })
+  }
+
+  it('dispatches nothing when the signal is already aborted', async () => {
+    const harness = createHarness()
+    await connect(harness)
+    const controller = new AbortController()
+    controller.abort()
+
+    const result = await harness.executor.dispatch(
+      makePlan([toyBeat('b1'), toyBeat('b2')]),
+      context(harness),
+      undefined,
+      { signal: controller.signal },
+    )
+
+    expect(result.blocked).toBe(false)
+    expect(result.preempted).toBe(true)
+    expect(result.actions).toEqual([])
+    expect(result.remainingBeats).toEqual(['b1', 'b2'])
+    expect(harness.toy.writes).toEqual([])
+    expect(harness.probes.calls).toEqual([])
+
+    const record = planResolvedRecords(harness)[0]
+    expect(record?.detail).toMatchObject({
+      blocked: false,
+      preempted: true,
+      remainingBeats: ['b1', 'b2'],
+      actions: [],
+    })
+    expect(harness.clock.pendingCount).toBe(0)
+  })
+
+  it('stops after the in-flight beat and lists the remaining beat ids', async () => {
+    const harness = createHarness()
+    await connect(harness)
+    const controller = new AbortController()
+    // Abort on the first accepted dispatch: the command already handed to the
+    // registry must finish, every later command must be dropped.
+    const stopListening = harness.registry.subscribe(event => {
+      if (event.kind === 'level') controller.abort()
+    })
+    try {
+      const result = await harness.executor.dispatch(
+        makePlan([toyBeat('b1'), toyBeat('b2'), toyBeat('b3')]),
+        context(harness),
+        undefined,
+        { signal: controller.signal },
+      )
+
+      expect(result.preempted).toBe(true)
+      expect(result.actions.map(action => action.beatId)).toEqual(['b1'])
+      expect(result.remainingBeats).toEqual(['b2', 'b3'])
+      // Effects already dispatched are not rolled back; only b1 ever reached
+      // the backend.
+      expect(harness.toy.writes).toHaveLength(1)
+      expect(harness.probes.calls.map(call => call.beatId)).toEqual(['b1'])
+
+      const record = planResolvedRecords(harness)[0]
+      expect(record?.detail).toMatchObject({
+        blocked: false,
+        preempted: true,
+        remainingBeats: ['b2', 'b3'],
+        actions: result.actions,
+      })
+    } finally {
+      stopListening()
+      await harness.registry.stop('system')
+    }
+    expect(harness.clock.pendingCount).toBe(0)
+  })
+
+  it('leaves the preemption fields absent on a normal dispatch', async () => {
+    const harness = createHarness()
+    await connect(harness)
+
+    const result = await harness.executor.dispatch(makePlan([toyBeat('b1')]), context(harness))
+
+    expect(result.preempted).toBeUndefined()
+    expect(result.remainingBeats).toBeUndefined()
+    const record = planResolvedRecords(harness)[0]
+    expect(record?.detail).not.toHaveProperty('preempted')
+    expect(record?.detail).not.toHaveProperty('remainingBeats')
+    await harness.registry.stop('system')
+    expect(harness.clock.pendingCount).toBe(0)
+  })
+})

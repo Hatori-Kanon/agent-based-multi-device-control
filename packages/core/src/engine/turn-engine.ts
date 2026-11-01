@@ -29,6 +29,7 @@ import {
 } from './scheduler.ts'
 import {
   assertTransition,
+  canTransition,
   isTerminalState,
   refusesNewTurns,
   type TurnOutcome,
@@ -527,8 +528,19 @@ export class TurnEngine {
     this.releaseAftercare()
     this.panicked = true
     this.abortActive()
-    await this.hooks.onPanic?.(source)
-    if (this.turnState !== 'locked' && !isTerminalState(this.turnState)) this.setState('locked')
+    // S-6 (wave-4 review): the latch goes in *before* the host hook. A slow
+    // `onPanic` must not leave a window where a trigger can start a turn, and
+    // a throwing hook must not roll the lock back either.
+    this.lockForPanic()
+    try {
+      await this.hooks.onPanic?.(source)
+    } catch (error) {
+      this.emit('error', {
+        phase: 'panic',
+        source,
+        message: error instanceof Error ? error.message : String(error),
+      })
+    }
     this.emit('state', { state: this.turnState, reason: 'panic' })
   }
 
@@ -622,6 +634,24 @@ export class TurnEngine {
     assertTransition(this.turnState, next)
     this.turnState = next
     this.emit('state', { state: next })
+  }
+
+  /**
+   * Force the emergency latch, even from a state whose table lacks the edge.
+   *
+   * Every live state already allows `locked`; the fallback exists so a state
+   * added later cannot make panic throw. `ended` stays terminal: a panic after
+   * the session closed must not resurrect the engine.
+   */
+  private lockForPanic(): void {
+    const current = this.turnState
+    if (current === 'locked' || isTerminalState(current)) return
+    if (canTransition(current, 'locked')) {
+      this.setState('locked')
+      return
+    }
+    this.turnState = 'locked'
+    this.emit('state', { state: 'locked' })
   }
 
   /** P1 path shared by messages and choices. */

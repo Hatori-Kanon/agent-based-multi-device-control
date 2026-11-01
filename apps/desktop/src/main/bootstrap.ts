@@ -743,7 +743,12 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       message: async text => await play.message(text),
       end: async reason => await play.end(reason),
       snapshot: () => play.snapshot(),
+      pause: async () => await play.pause(),
+      resume: async () => await play.resume(),
+      choose: async (choiceId: string) => await play.choice(choiceId),
+      transcript: () => play.transcript(),
     },
+    ledger: async (limit?: number) => await play.ledger(limit),
     // 内容包管理（B2-T14）：导入即激活，版本切换走 activatePack。每次调用都
     // 经过 `runPackOp`，避免并发的 read-modify-write 覆盖 registry.json。
     listPacks: async () => await runPackOp(async () => await packRegistry.list()),

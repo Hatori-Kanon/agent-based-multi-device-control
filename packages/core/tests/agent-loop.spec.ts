@@ -463,3 +463,81 @@ describe('the turn deadline covers uncooperative work (review blocker B-4)', () 
     await Promise.resolve()
   })
 })
+
+describe('the dispatch receives the turn signal (wave-4 review B-3)', () => {
+  it('passes the one controller signal used for the model request', async () => {
+    const clock = new FakeClock()
+    let requestSignal: AbortSignal | undefined
+    let dispatchSignal: AbortSignal | undefined
+    let dispatchCalls = 0
+    const executor: TurnExecutor = {
+      dispatch(_plan, _ctx, _diagnostics, options) {
+        dispatchCalls += 1
+        dispatchSignal = options?.signal
+        return Promise.resolve({ planId: 'p-signal', turnId: 7, actions: [], blocked: false })
+      },
+    }
+    const runner: ModelRunner = {
+      async run(request) {
+        requestSignal = request.signal
+        request.onToolCall?.(APPLY_PLAN_CALL)
+        return { text: '好。', toolCalls: [APPLY_PLAN_CALL], finishReason: 'tool-calls' }
+      },
+    }
+
+    const result = await runTurn({ runner, tools: M2_MODEL_TOOLS, executor, input: inputFixture(), clock })
+
+    expect(dispatchCalls).toBe(1)
+    // Same object: the turn still owns exactly one cancellation handle.
+    expect(dispatchSignal).toBe(requestSignal)
+    expect(dispatchSignal?.aborted).toBe(false)
+    expect(result.dispatch?.planId).toBe('p-signal')
+    expect(clock.pendingCount).toBe(0)
+  })
+
+  it('hands an already-aborted signal when the caller aborts before the tool call', async () => {
+    const clock = new FakeClock()
+    const caller = new AbortController()
+    let dispatchCalls = 0
+    let dispatchAborted: boolean | undefined
+    const executor: TurnExecutor = {
+      dispatch(_plan, _ctx, _diagnostics, options) {
+        dispatchCalls += 1
+        dispatchAborted = options?.signal?.aborted
+        // The real PlanExecutor returns this shape without touching a device.
+        return Promise.resolve({
+          planId: 'p-preempted',
+          turnId: 7,
+          actions: [],
+          blocked: false,
+          preempted: true,
+          remainingBeats: ['b1'],
+        })
+      },
+    }
+    const runner: ModelRunner = {
+      async run(request) {
+        // The player message lands after the request started, before the
+        // model's plan tool call is delivered.
+        caller.abort()
+        request.onToolCall?.(APPLY_PLAN_CALL)
+        emitText(request, ['……'])
+        return { text: '……', toolCalls: [APPLY_PLAN_CALL], finishReason: 'tool-calls' }
+      },
+    }
+
+    const error = await failure(runTurn({
+      runner,
+      tools: M2_MODEL_TOOLS,
+      executor,
+      input: inputFixture(),
+      clock,
+      signal: caller.signal,
+    }))
+
+    expect((error as ModelError).code).toBe('aborted')
+    expect(dispatchCalls).toBe(1)
+    expect(dispatchAborted).toBe(true)
+    expect(clock.pendingCount).toBe(0)
+  })
+})

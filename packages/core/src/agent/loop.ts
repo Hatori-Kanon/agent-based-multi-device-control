@@ -32,7 +32,7 @@
  */
 
 import type { Clock } from '../ports/clock.ts'
-import type { DispatchDiagnostics, DispatchResult } from '../execution/executor.ts'
+import type { DispatchDiagnostics, DispatchOptions, DispatchResult } from '../execution/executor.ts'
 import { parseBeatPlan } from '../scenario/beat-plan.ts'
 import type { BeatPlan, PlanContext, PlanDrop, PlanValidation } from '../scenario/beat-plan.ts'
 import type { ResolveContext } from '../scenario/intents.ts'
@@ -92,7 +92,17 @@ export interface TurnLoopInput {
  * executor and tests pass a stub without constructing a `DeviceRegistry`.
  */
 export interface TurnExecutor {
-  dispatch(plan: BeatPlan, ctx: ResolveContext, diagnostics?: DispatchDiagnostics): Promise<DispatchResult>
+  /**
+   * The optional fourth argument carries the turn's one abort signal into the
+   * executor, so a preempt/timeout stops the remaining beats instead of
+   * driving a plan that was already cancelled (`M2-实施计划.md` §4.8).
+   */
+  dispatch(
+    plan: BeatPlan,
+    ctx: ResolveContext,
+    diagnostics?: DispatchDiagnostics,
+    options?: DispatchOptions,
+  ): Promise<DispatchResult>
 }
 
 /** Options for {@link runTurn}. */
@@ -210,10 +220,17 @@ export async function runTurn(options: TurnLoopOptions): Promise<TurnResult> {
     // before the text stream ends. The promise is awaited before returning.
     pendingDispatch = (async () => {
       try {
-        dispatched = await executor.dispatch(validation.plan, input.resolveContext, {
-          dropped: validation.dropped,
-          warnings: validation.warnings,
-        })
+        dispatched = await executor.dispatch(
+          validation.plan,
+          input.resolveContext,
+          {
+            dropped: validation.dropped,
+            warnings: validation.warnings,
+          },
+          // The turn's one controller: caller abort, timeout and preempt all
+          // land here, so the executor can drop the beats that never ran.
+          { signal: controller.signal },
+        )
       } catch (error) {
         dispatchError = error
       }

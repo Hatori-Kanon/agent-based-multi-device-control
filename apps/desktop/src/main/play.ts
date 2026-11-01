@@ -129,6 +129,7 @@ const PACK_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/u
 export type SessionErrorCode =
   | 'NO_SESSION'
   | 'SESSION_OPEN'
+  | 'SESSION_ENDING'
   | 'SESSION_ENDED'
   | 'LOCKED'
   | 'INVALID_INPUT'
@@ -227,6 +228,20 @@ export interface PlaySnapshot extends EngineSnapshot {
   readonly packVersion: string
 }
 
+/**
+ * One settled line of the play transcript (`GET /api/session/transcript`).
+ *
+ * Derived from the same line record the writer's prompt uses — no separate
+ * persistence, no player messages, no streamed deltas. `at` is injected-clock
+ * epoch milliseconds, matching `TurnTrigger.at` and the audit `ts`; the UI
+ * passes the newest `at` back as `?since=` and the host filters in memory.
+ */
+export interface PlayTranscriptEntry {
+  readonly turnId: number
+  readonly at: number
+  readonly text: string
+}
+
 /** One loaded pack, as seen by the session service. */
 export interface PlayPackSource {
   load(packId: string): Promise<LoadedPack>
@@ -271,7 +286,17 @@ export class PlaySession {
   private sessionId: string | undefined
   private plannedMinutes = 0
   private started = false
-  private readonly recentLines: string[] = []
+  /**
+   * True from the first synchronous step of `start` until it settles.
+   *
+   * `start` awaits pack recovery and the opening turn, so `started` alone
+   * cannot close the race: two callers in the same tick would both pass the
+   * check and build two engines. The latch makes "at most one engine ever"
+   * true for every interleaving; a failed start releases it for a retry.
+   */
+  private starting = false
+  /** Settled assistant lines, newest last; the transcript and prompt memory. */
+  private readonly recentEntries: PlayTranscriptEntry[] = []
   /** B2-T7 archive; undefined when the host injected no `archive` seam. */
   private store: SessionStore | undefined
   /** B2-T8 ledger; undefined when the host injected no `archive` seam. */
@@ -317,11 +342,25 @@ export class PlaySession {
    * acceptance test's "answers the first turn". The ceiling write (and its
    * audit/persist) happens before the model is called, so a turn can never
    * observe a widened ceiling.
+   *
+   * The `starting` latch is held across the pack-recovery awaits, so a second
+   * start in the same tick sees an open session instead of building a second
+   * engine (B-5). A rejection releases the latch: a caller may retry.
    */
   async start(input: PlayStartInput): Promise<PlaySnapshot> {
-    if (this.started) {
+    if (this.started || this.starting) {
       throw new SessionError('SESSION_OPEN', 'a session is already open in this process')
     }
+    this.starting = true
+    try {
+      return await this.openSession(input)
+    } finally {
+      this.starting = false
+    }
+  }
+
+  /** Body of {@link start}; the latch is held by the caller. */
+  private async openSession(input: PlayStartInput): Promise<PlaySnapshot> {
     const plannedMinutes = normalizePlannedMinutes(input.plannedMinutes)
     if (this.env.registry.isLocked) {
       throw new SessionError('LOCKED', 'the device registry is locked; unlock it before starting a session')
@@ -464,13 +503,16 @@ export class PlaySession {
   /**
    * Send a player line (P1: always preempts).
    *
-   * Rejects when there is no session, after `end`, or while the runtime is
-   * locked — the engine would silently ignore the last case, which an HTTP
-   * caller must not read as success.
+   * Rejects when there is no session, after `end`, while the session is
+   * ending, or while the runtime is locked — the engine would silently ignore
+   * the last two cases, which an HTTP caller must not read as success (S-5).
    */
   async message(text: string): Promise<PlaySnapshot> {
     const engine = this.engine
     if (engine === undefined) throw new SessionError('NO_SESSION', 'no session is open')
+    if (engine.state === 'ending') {
+      throw new SessionError('SESSION_ENDING', 'the session is ending; no new turn can start')
+    }
     if (engine.state === 'ended') throw new SessionError('SESSION_ENDED', 'the session has ended')
     if (text.trim() === '') throw new SessionError('INVALID_INPUT', 'message text is required')
     if (engine.state === 'locked' || this.env.registry.isLocked) {
@@ -484,6 +526,77 @@ export class PlaySession {
     }
     await engine.submitPlayerMessage(text)
     return this.requireSnapshot()
+  }
+
+  /**
+   * Pause the session (B2-T11 / §5).
+   *
+   * The engine queues the pause behind the in-flight turn, then enters
+   * `paused`, runs the host's full-stop hook (`registry.stop`) and audits
+   * `session_paused`. Effects are **not** replayed on resume; the next turn
+   * re-issues whatever is still wanted from the state it sees then.
+   */
+  async pause(): Promise<PlaySnapshot> {
+    const engine = this.liveEngine()
+    await engine.pause()
+    return this.requireSnapshot()
+  }
+
+  /** Resume from `paused`; no effect is re-issued (B2-T11 / §5). */
+  async resume(): Promise<PlaySnapshot> {
+    const engine = this.liveEngine()
+    await engine.resume()
+    return this.requireSnapshot()
+  }
+
+  /**
+   * Pick one of the currently offered options (P1: opens a new turn).
+   *
+   * The engine itself tolerates a missing menu (a stray id would become a
+   * phantom player message), so the host validates first: an empty id, a
+   * missing menu and an id that was never offered are all caller errors
+   * (`INVALID_INPUT`, HTTP 400), not silent 200s.
+   */
+  async submitChoice(choiceId: string): Promise<PlaySnapshot> {
+    const engine = this.liveEngine()
+    const id = choiceId.trim()
+    if (id === '') throw new SessionError('INVALID_INPUT', 'choiceId is required')
+    const offered = engine.snapshot().choices ?? []
+    if (offered.length === 0) {
+      throw new SessionError('INVALID_INPUT', 'no choice menu is open')
+    }
+    if (!offered.some(choice => choice.id === id)) {
+      throw new SessionError('INVALID_INPUT', `choice "${id}" was not offered in this turn`)
+    }
+    await engine.submitChoice(id)
+    return this.requireSnapshot()
+  }
+
+  /**
+   * Settled assistant lines, newest last (B2-T11).
+   *
+   * Served from the same in-memory entries the writer's prompt is built from;
+   * no extra persistence. Before `start` it is empty, and after `end` the last
+   * lines remain readable for the UI.
+   */
+  transcript(): readonly PlayTranscriptEntry[] {
+    return [...this.recentEntries]
+  }
+
+  /**
+   * Recent ledger lines, newest last (B2-T11).
+   *
+   * Without an injected archive there is nothing to read and the answer is an
+   * empty list; `limit` bounds the tail for the UI. The ledger is append-only,
+   * so this is a read of the archive seam, never a mutation.
+   */
+  async ledgerEntries(limit?: number): Promise<readonly LedgerEntry[]> {
+    const ledger = this.ledger
+    if (ledger === undefined) return []
+    if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) {
+      throw new SessionError('INVALID_INPUT', 'limit must be a positive integer')
+    }
+    return await ledger.read(limit === undefined ? {} : { lastN: limit })
   }
 
   /** End the session and stop every effect (idempotent once ended). */
@@ -598,6 +711,26 @@ export class PlaySession {
     return snapshot
   }
 
+  /**
+   * The engine for a control request that must not be silently ignored.
+   *
+   * `TurnEngine.pause()`/`resume()`/`submitChoice()` are host-facing no-ops in
+   * `ending`/`ended`/`locked`; an HTTP caller needs the typed refusal instead
+   * of a 200 with an unchanged snapshot.
+   */
+  private liveEngine(): TurnEngine {
+    const engine = this.engine
+    if (engine === undefined) throw new SessionError('NO_SESSION', 'no session is open')
+    if (engine.state === 'ending') {
+      throw new SessionError('SESSION_ENDING', 'the session is ending; wait for it to settle')
+    }
+    if (engine.state === 'ended') throw new SessionError('SESSION_ENDED', 'the session has ended')
+    if (engine.state === 'locked' || this.env.registry.isLocked) {
+      throw new SessionError('LOCKED', 'the session is locked; unlock before continuing')
+    }
+    return engine
+  }
+
   /** The adapter that makes `runTurn` satisfy the engine's {@link TurnRunner}. */
   private runnerFor(): TurnRunner {
     return { run: async (request: TurnRequest): Promise<TurnRunnerResult> => this.runOneTurn(request) }
@@ -658,8 +791,10 @@ export class PlaySession {
 
     const line = result.line
     if (line.trim() !== '') {
-      this.recentLines.push(line)
-      if (this.recentLines.length > RECENT_LINE_LIMIT) this.recentLines.shift()
+      // One entry serves both the writer's recent memory and the transcript:
+      // no second write path, and `at` is the injected-clock settlement time.
+      this.recentEntries.push({ turnId: request.turnId, at: this.env.clock.now(), text: line })
+      if (this.recentEntries.length > RECENT_LINE_LIMIT) this.recentEntries.shift()
     }
     // Ledger/archive facts for this turn: dispatched percentages (B2-T8
     // `maxCapUsed`, never a cap) and the intent ids of the last two turns.
@@ -762,7 +897,7 @@ export class PlaySession {
     const playerText = playerTextOf(request)
     return buildTurnMessages({
       ...(system === '' ? {} : { system }),
-      recentLines: this.recentLines,
+      recentLines: this.recentEntries.map(entry => entry.text),
       ...(playerText === undefined ? {} : { playerText }),
     })
   }
@@ -851,6 +986,49 @@ export class PlayHost {
     const session = this.session
     if (session === undefined) throw new SessionError('NO_SESSION', 'no session is open')
     return await session.message(text)
+  }
+
+  /** Pause the open session; `SESSION_OPEN`-scoped like every session call. */
+  async pause(): Promise<PlaySnapshot> {
+    const session = this.session
+    if (session === undefined) throw new SessionError('NO_SESSION', 'no session is open')
+    return await session.pause()
+  }
+
+  /** Resume the open session without replaying effects. */
+  async resume(): Promise<PlaySnapshot> {
+    const session = this.session
+    if (session === undefined) throw new SessionError('NO_SESSION', 'no session is open')
+    return await session.resume()
+  }
+
+  /** Pick an offered option; the session validates the id against its menu. */
+  async submitChoice(choiceId: string): Promise<PlaySnapshot> {
+    const session = this.session
+    if (session === undefined) throw new SessionError('NO_SESSION', 'no session is open')
+    return await session.submitChoice(choiceId)
+  }
+
+  /** Route-name alias of {@link submitChoice} (`POST /api/session/choice`). */
+  async choice(choiceId: string): Promise<PlaySnapshot> {
+    return await this.submitChoice(choiceId)
+  }
+
+  /** Settled transcript lines for the poller; empty before the first start. */
+  transcript(): readonly PlayTranscriptEntry[] {
+    return this.session?.transcript() ?? []
+  }
+
+  /** Recent ledger lines; empty without an archive or before a session. */
+  async ledgerEntries(limit?: number): Promise<readonly LedgerEntry[]> {
+    const session = this.session
+    if (session === undefined) return []
+    return await session.ledgerEntries(limit)
+  }
+
+  /** Route-name alias of {@link ledgerEntries} (`GET /api/ledger`). */
+  async ledger(limit?: number): Promise<readonly LedgerEntry[]> {
+    return await this.ledgerEntries(limit)
   }
 
   /** End the open session; the reason is validated against the M2 vocabulary. */

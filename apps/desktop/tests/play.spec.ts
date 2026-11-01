@@ -45,6 +45,19 @@ function planCall(id = 'call_1'): ToolCall {
   }
 }
 
+/** The same plan, plus one offered player option (B2-T6/T11). */
+function choicePlanCall(id = 'call_1'): ToolCall {
+  return {
+    id,
+    name: 'apply_plan',
+    arguments: {
+      pacing: 'probe',
+      beats: [{ id: 'b1', intentId: 'probe-touch', regions: ['whole-body'], strength: 'low' }],
+      choices: [{ id: 'c1', label: '退开', tag: 'resist' }],
+    },
+  }
+}
+
 /** A scripted, offline {@link ModelRunner}; records every request. */
 class ScriptedRunner implements ModelRunner {
   readonly requests: ModelTurnRequest[] = []
@@ -840,3 +853,176 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
     expect(h.host.regions()['mock-pulse:a']).toBeUndefined()
   })
 })
+
+// ── B2-T11: pause / resume / choice / transcript / ledger ──────────────────
+
+describe('session controls (B2-T11)', () => {
+  it('pauses only after the current turn settles and stops every effect', async () => {
+    const h = await createHarness([
+      scriptedTurn('第一句。', [planCall()]),
+      scriptedTurn('第二句。'),
+    ])
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    expect(h.runner.requests).toHaveLength(1)
+    const stop = vi.spyOn(h.registry, 'stop')
+
+    const paused = await h.host.pause()
+
+    // The pause landed after the opening turn settled and ran the full-stop
+    // hook; the engine is parked, not merely idle.
+    expect(paused.state).toBe('paused')
+    expect(paused.turnId).toBe(1)
+    expect(stop).toHaveBeenCalledTimes(1)
+    expect(stop.mock.calls[0]?.[0]).toBe('system')
+    expect(h.states).toContain('paused')
+    expect(h.records().some(record =>
+      record.action === 'session_paused' && record.actor === 'human')).toBe(true)
+    expect(h.runner.requests).toHaveLength(1)
+
+    // Product semantics fixed here: P1 input is still accepted while paused
+    // (the engine resumes explicitly), so the UI does not have to unlock a
+    // dead input box. It opens a new turn, not a replay.
+    const next = await h.host.message('我还在')
+    expect(next.state).toBe('idle')
+    expect(next.turnId).toBe(2)
+    expect(h.runner.requests).toHaveLength(2)
+  })
+
+  it('resumes without replaying the last effect', async () => {
+    const h = await createHarness([
+      scriptedTurn('第一句。', [planCall()]),
+      scriptedTurn('第二句。', [planCall('call_2')]),
+    ])
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    const planDispatches = h.records().filter(record => record.action === 'plan_resolved')
+    expect(planDispatches).toHaveLength(1)
+
+    await h.host.pause()
+    const resumed = await h.host.resume()
+
+    expect(resumed.state).toBe('idle')
+    expect(h.states.at(-1)).toBe('idle')
+    // No model call and no plan dispatch while resuming: the stopped effects
+    // are not re-issued, the next turn re-plans from the current state.
+    expect(h.runner.requests).toHaveLength(1)
+    expect(h.records().filter(record => record.action === 'plan_resolved')).toHaveLength(1)
+    expect(h.records().some(record =>
+      record.action === 'session_resumed' && record.actor === 'human')).toBe(true)
+
+    const next = await h.host.message('继续')
+    expect(next.turnId).toBe(2)
+    expect(h.records().filter(record => record.action === 'plan_resolved')).toHaveLength(2)
+  })
+
+  it('rejects a choice when no menu is open', async () => {
+    const h = await createHarness([
+      scriptedTurn('第一句。', [planCall()]),
+      scriptedTurn('不该出现的回合。'),
+    ])
+    const started = await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    expect(started.choices).toBeUndefined()
+
+    await expect(h.host.submitChoice('')).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    await expect(h.host.submitChoice('c1')).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    await expect(h.host.choice('c1')).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    // A stray id must not become a phantom player message/turn.
+    expect(h.runner.requests).toHaveLength(1)
+    expect(h.records().some(record => record.action === 'choice_selected')).toBe(false)
+  })
+
+  it('opens a new turn when an offered choice is picked', async () => {
+    const h = await createHarness([
+      scriptedTurn('第一句。', [choicePlanCall()]),
+      scriptedTurn('第二句。'),
+    ])
+    const started = await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    expect(started.choices).toEqual([{ id: 'c1', label: '退开', tag: 'resist' }])
+
+    const picked = await h.host.submitChoice('c1')
+
+    expect(picked.turnId).toBe(2)
+    expect(picked.lastLine).toBe('第二句。')
+    expect(picked.choices).toBeUndefined()
+    const selected = h.records().find(record => record.action === 'choice_selected')
+    expect(selected?.actor).toBe('human')
+    expect(selected?.detail).toMatchObject({ turnId: 1, choiceId: 'c1' })
+  })
+
+  it('keeps the opening and later lines in the transcript', async () => {
+    const h = await createHarness([
+      scriptedTurn('第一句。', [planCall()]),
+      scriptedTurn('第二句。'),
+    ])
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+
+    expect(h.host.transcript()).toEqual([
+      { turnId: 1, at: h.clock.now(), text: '第一句。' },
+    ])
+
+    h.clock.advance(1_234)
+    await h.host.message('嗯。')
+    const entries = h.host.transcript()
+    expect(entries.map(entry => entry.text)).toEqual(['第一句。', '第二句。'])
+    expect(entries[1]).toMatchObject({ turnId: 2, at: h.clock.now() })
+  })
+
+  it('rejects a second session start while the first is still starting', async () => {
+    const h = await createHarness([scriptedTurn('第一句。')])
+
+    const results = await Promise.allSettled([
+      h.host.start({ packId: 'demo', plannedMinutes: 30 }),
+      h.host.start({ packId: 'demo', plannedMinutes: 30 }),
+    ])
+
+    const rejected = results.filter((result): result is PromiseRejectedResult =>
+      result.status === 'rejected')
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+    expect(rejected).toHaveLength(1)
+    expect(rejected[0]?.reason).toBeInstanceOf(SessionError)
+    expect((rejected[0]?.reason as SessionError).code).toBe('SESSION_OPEN')
+    // Exactly one engine: one opening turn reached the model.
+    expect(h.runner.requests).toHaveLength(1)
+    expect(h.states.filter(state => state === 'planning')).toHaveLength(1)
+  })
+
+  it('rejects a concurrent PlaySession.start before the opening turn settles', async () => {
+    const h = await createHarness([scriptedTurn('第一句。')])
+    const pack = await freeformPack()
+
+    const results = await Promise.allSettled([
+      h.session.start({ pack, plannedMinutes: 30 }),
+      h.session.start({ pack, plannedMinutes: 30 }),
+    ])
+
+    const rejected = results.filter((result): result is PromiseRejectedResult =>
+      result.status === 'rejected')
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+    expect(rejected).toHaveLength(1)
+    expect((rejected[0]?.reason as SessionError).code).toBe('SESSION_OPEN')
+    expect(h.runner.requests).toHaveLength(1)
+    expect(h.session.state).toBe('idle')
+  })
+
+  it('returns no ledger entries without an archive and one line after the session ends', async () => {
+    const plain = await createHarness([])
+    expect(await plain.host.ledgerEntries()).toEqual([])
+    expect(await plain.host.ledger()).toEqual([])
+
+    const h = await createArchivedHarness({ turns: [scriptedTurn('第一句。')] })
+    // No session yet, so nothing to read through the session seam.
+    expect(await h.host.ledgerEntries()).toEqual([])
+
+    const started = await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    await h.host.end('completed')
+
+    const entries = await h.host.ledgerEntries()
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({
+      sessionId: started.sessionId,
+      pack: 'demo',
+      endReason: 'completed',
+    })
+    expect(await h.host.ledgerEntries(1)).toHaveLength(1)
+  })
+})
+

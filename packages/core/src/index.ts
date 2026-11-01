@@ -486,6 +486,7 @@ export type {
 export { PlanExecutor } from './execution/executor.ts'
 export type {
   DispatchDiagnostics,
+  DispatchOptions,
   DispatchResult,
   DispatchStatus,
   PlanExecutorOptions,

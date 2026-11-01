@@ -597,9 +597,11 @@ export class TurnPipeline implements TurnRunner {
   /** Wrap the shared executor so `planning → executing` is reported once. */
   private stagedExecutor(stages: StageReporter): TurnExecutor {
     return {
-      dispatch: async (plan, ctx, diagnostics) => {
+      dispatch: async (plan, ctx, diagnostics, options) => {
         stages.report('executing')
-        return this.executor.dispatch(plan, ctx, diagnostics)
+        // Forward the abort signal: without it a preempted single-call turn
+        // would still dispatch the remaining beats (wave-4 review B-3).
+        return this.executor.dispatch(plan, ctx, diagnostics, options)
       },
     }
   }

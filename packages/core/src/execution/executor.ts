@@ -21,6 +21,10 @@
  * 3. **Probe registration follows dispatch events, not time.** The registry
  *    emits exactly one event per accepted command and never per 50 ms tick,
  *    so a pattern that runs for a minute produces one probe, not a thousand.
+ * 4. **Preemption stops between commands, never inside one.** The optional
+ *    abort signal is checked before every command (and therefore between
+ *    beats): the rest of the plan is dropped, while effects already handed to
+ *    the registry are never rolled back (`M2-实施计划.md` §4.8).
  */
 
 import type { AuditLog } from '../devices/audit.ts'
@@ -81,6 +85,30 @@ export interface DispatchResult {
   readonly actions: readonly DispatchStatus[]
   /** True when the registry is locked; no device was touched. */
   readonly blocked: boolean
+  /**
+   * True when dispatch stopped early because `options.signal` aborted.
+   *
+   * Additive and optional: a normal dispatch leaves it `undefined`, so every
+   * pre-existing `DispatchResult` literal keeps compiling and comparing.
+   */
+  readonly preempted?: boolean
+  /**
+   * Beat ids whose commands were not dispatched because of the abort, in
+   * command order and deduplicated. Only present when {@link preempted} is
+   * true; effects already dispatched are never rolled back.
+   */
+  readonly remainingBeats?: readonly string[]
+}
+
+/**
+ * Optional cancellation for {@link PlanExecutor.dispatch}.
+ *
+ * `signal` is the turn's single abort controller (hard abort / timeout,
+ * `M2-实施计划.md` §4.8). The executor checks it before each command, so an
+ * abort drops the remaining beats without touching the in-flight one.
+ */
+export interface DispatchOptions {
+  readonly signal?: AbortSignal
 }
 
 /**
@@ -116,6 +144,10 @@ interface AuditInput {
   readonly actions: readonly DispatchStatus[]
   readonly narrativeOnly: readonly string[]
   readonly warnings: readonly string[]
+  /** True when the signal stopped the batch before every beat ran. */
+  readonly preempted: boolean
+  /** Beats whose commands were never attempted; empty unless preempted. */
+  readonly remainingBeats: readonly string[]
 }
 
 export class PlanExecutor {
@@ -135,15 +167,21 @@ export class PlanExecutor {
    *
    * Locked ⇒ no device is touched, `blocked: true` is returned, and the audit
    * still records the attempt so the UI can explain why nothing happened.
+   *
+   * Preempted ⇒ `options.signal` aborted before or during the batch: the
+   * remaining commands are skipped, the result carries `preempted` and the
+   * beats that never ran, and effects already dispatched stay untouched.
    */
   async dispatch(
     plan: BeatPlan,
     ctx: ResolveContext,
     diagnostics?: DispatchDiagnostics,
+    options?: DispatchOptions,
   ): Promise<DispatchResult> {
     const resolved = resolvePlan(plan, ctx)
     const dropped = diagnostics?.dropped ?? []
     const warnings = [...(diagnostics?.warnings ?? []), ...resolved.warnings]
+    const signal = options?.signal
 
     // `ctx.snapshot.locked` is the resolver's view; the live latch closes the
     // gap between snapshotting and dispatching. Neither reads a device.
@@ -158,8 +196,36 @@ export class PlanExecutor {
         actions: [],
         narrativeOnly: resolved.narrativeOnlyBeats,
         warnings,
+        preempted: false,
+        remainingBeats: [],
       })
       return { planId: resolved.planId, turnId: plan.turnId, actions: [], blocked: true }
+    }
+
+    // Aborted before the first command: never touch hardware. The audit still
+    // records which beats the preemption dropped.
+    if (isAborted(signal)) {
+      const remainingBeats = remainingBeatIds(resolved.commands)
+      await this.recordResolved({
+        plan,
+        planId: resolved.planId,
+        blocked: false,
+        blockedReason: undefined,
+        dropped,
+        actions: [],
+        narrativeOnly: resolved.narrativeOnlyBeats,
+        warnings,
+        preempted: true,
+        remainingBeats,
+      })
+      return {
+        planId: resolved.planId,
+        turnId: plan.turnId,
+        actions: [],
+        blocked: false,
+        preempted: true,
+        remainingBeats,
+      }
     }
 
     const events: DispatchEvent[] = []
@@ -171,9 +237,16 @@ export class PlanExecutor {
     const intentByBeat = new Map<string, string>(
       plan.beats.map((beat): [string, string] => [beat.id, beat.intentId]),
     )
+    let preempted = false
 
     try {
       for (const command of resolved.commands) {
+        // Checked before every command, so a beat that already started keeps
+        // its effect while the rest of the plan is dropped (§4.8).
+        if (isAborted(signal)) {
+          preempted = true
+          break
+        }
         const seen = events.length
         const result = await this.dispatchCommand(command, warnings)
         actions.push(result.status)
@@ -183,6 +256,12 @@ export class PlanExecutor {
     } finally {
       unsubscribe()
     }
+
+    // One action per command, so the suffix that never ran starts at
+    // `actions.length`. Deduplicated in command order: a beat with several
+    // channels appears once, and a partially dispatched beat appears when some
+    // of its commands were still pending.
+    const remainingBeats = preempted ? remainingBeatIds(resolved.commands.slice(actions.length)) : []
 
     if (this.options.probes !== undefined) {
       for (const beat of plan.beats) {
@@ -212,9 +291,17 @@ export class PlanExecutor {
       actions,
       narrativeOnly: resolved.narrativeOnlyBeats,
       warnings,
+      preempted,
+      remainingBeats,
     })
 
-    return { planId: resolved.planId, turnId: plan.turnId, actions, blocked: false }
+    return {
+      planId: resolved.planId,
+      turnId: plan.turnId,
+      actions,
+      blocked: false,
+      ...(preempted ? { preempted: true, remainingBeats } : {}),
+    }
   }
 
   /**
@@ -317,9 +404,32 @@ export class PlanExecutor {
       narrativeOnly: input.narrativeOnly,
       warnings: input.warnings,
       ...(input.blockedReason === undefined ? {} : { blockedReason: input.blockedReason }),
+      // Additive keys: existing records are unchanged for a normal dispatch.
+      ...(input.preempted ? { preempted: true, remainingBeats: input.remainingBeats } : {}),
     }
     await this.options.audit.record({ actor: PLAN_ACTOR, action: PLAN_RESOLVED, result: 'ok', detail })
   }
+}
+
+/**
+ * Unique beat ids of the commands that were never attempted, in command order.
+ *
+ * Commands are sorted by `(beatId, deviceId, channelId)`, so this keeps the
+ * plan's beat order for the audit and the returned result.
+ */
+function remainingBeatIds(commands: readonly ResolvedCommand[]): string[] {
+  const remaining: string[] = []
+  const seen = new Set<string>()
+  for (const command of commands) {
+    if (seen.has(command.beatId)) continue
+    seen.add(command.beatId)
+    remaining.push(command.beatId)
+  }
+  return remaining
+}
+
+function isAborted(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true
 }
 
 /**
