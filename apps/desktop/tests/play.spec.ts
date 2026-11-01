@@ -1026,3 +1026,38 @@ describe('session controls (B2-T11)', () => {
   })
 })
 
+
+describe('narrative-only session with no sensors and no devices (F-6)', () => {
+  it('runs a whole session without any sensor source or connected device', async () => {
+    const clock = new FakeClock()
+    const store = new MemoryAppendOnlyStore()
+    const audit = new AuditLog(store, clock, () => {})
+    const policy = new PolicyStore()
+    const waveforms = new WaveformLibrary()
+    // No backends registered and no sensors pushed: the whole world is empty.
+    const registry = new DeviceRegistry({ clock, audit, policy, waveforms, onError: () => {} })
+    const env: PlaySessionEnvironment = {
+      clock,
+      audit,
+      registry,
+      policy,
+      waveforms,
+      sensors: new SensorRegistry({ clock }),
+      runner: new ScriptedRunner([
+        { text: '（风声）', toolCalls: [planCall()], finishReason: 'tool-calls' },
+        { text: '……', toolCalls: [], finishReason: 'stop' },
+      ]),
+      savePolicy: async (): Promise<void> => {},
+    }
+    const host = new PlayHost({ ...env, packs: { load: async () => await freeformPack() } })
+
+    const started = await host.start({ packId: 'tentacle', plannedMinutes: 30 })
+    expect(started.state).toBe('idle')
+    const answered = await host.message('继续')
+    expect(answered.state).toBe('idle')
+    const ended = await host.end('completed')
+    expect(ended.state).toBe('ended')
+    // Nothing was dispatched, and the session still produced a ledger line.
+    expect(registry.snapshot().devices.filter(device => device.lifecycle === 'ready')).toHaveLength(0)
+  })
+})

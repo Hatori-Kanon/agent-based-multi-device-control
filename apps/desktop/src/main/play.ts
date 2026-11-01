@@ -222,6 +222,8 @@ export interface PlayStartInput {
 
 /** What `GET /api/session` returns: the engine snapshot plus the pack identity. */
 export interface PlaySnapshot extends EngineSnapshot {
+  /** Package-declared hard boundaries; empty means "global boundaries apply". */
+  readonly boundaries: readonly string[]
   /** Stable id of this session; also the ledger/archive key (B2-T7/T8). */
   readonly sessionId: string
   readonly packId: string
@@ -285,6 +287,8 @@ export class PlaySession {
   private phases: PhaseMachine | undefined
   private sessionId: string | undefined
   private plannedMinutes = 0
+  /** Minimum aftercare hold from the scenario (0 = none declared). */
+  private aftercareMin = 0
   private started = false
   /**
    * True from the first synchronous step of `start` until it settles.
@@ -382,6 +386,14 @@ export class PlaySession {
     }
 
     const scenario = scenarioFor(input.pack, plannedMinutes)
+    // B2-T5's aftercare runtime: only an explicit author opt-in makes `end()`
+    // hold in `ending` for the wind-down. The freeform default (5 min) is a
+    // content default, not a host stall every caller has to clock past.
+    // Only a `scenario` pack has a real aftercare phase to hold for; a freeform
+    // pack keeps the documented content default without stalling its end().
+    const aftercareMin = input.pack.manifest.mode === 'scenario'
+      ? scenario.session?.aftercareMin ?? 0
+      : 0
     const phases = new PhaseMachine(scenario.phases)
 
     // ── B2-T7/T8: recover the previous session, then open this one ───────
@@ -453,7 +465,10 @@ export class PlaySession {
         await this.env.registry.stop('system')
       },
       ...(this.env.onEvent === undefined ? {} : { onEvent: this.env.onEvent }),
-      ...(this.env.engineConfig === undefined ? {} : { config: this.env.engineConfig }),
+      config: {
+        ...(this.env.engineConfig ?? {}),
+        ...(aftercareMin > 0 ? { aftercareMin } : {}),
+      },
     })
     this.pack = input.pack
     this.scenario = scenario
@@ -467,6 +482,7 @@ export class PlaySession {
     this.ledgerClosed = false
     this.engine = engine
     this.plannedMinutes = plannedMinutes
+    this.aftercareMin = aftercareMin
     this.sessionId = sessionId
     this.started = true
     // Passive probes only exist while a session does; the recorder settles on
@@ -668,6 +684,7 @@ export class PlaySession {
     if (engine === undefined || pack === undefined || sessionId === undefined) return undefined
     return {
       ...engine.snapshot(),
+      boundaries: pack.manifest.boundaries ?? [],
       sessionId,
       packId: pack.manifest.id,
       packVersion: pack.manifest.version,
@@ -827,8 +844,9 @@ export class PlaySession {
   /**
    * Final snapshot + exactly one ledger line.
    *
-   * `aftercare` is `false`: B2-T5's aftercare runtime is not wired into this
-   * host yet, so claiming it ran would be a lie the ledger would remember.
+   * `aftercare` reports whether the scenario's minimum wind-down actually ran:
+   * `end()` waits for it inside the engine, so reaching this point with a
+   * completed session means it did.
    */
   private async settleArchive(reason: SessionEndReason): Promise<void> {
     if (this.ledgerClosed) return
@@ -864,7 +882,7 @@ export class PlaySession {
       plannedMin: this.plannedMinutes,
       actualMin: finalState.elapsedMin,
       phaseReached: finalState.currentPhase,
-      aftercare: false,
+      aftercare: this.aftercareMin > 0 && reason === 'completed',
       maxCapUsed: this.maxCapUsed,
     }
     await ledger.close(entry)

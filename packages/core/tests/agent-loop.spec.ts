@@ -541,3 +541,35 @@ describe('the dispatch receives the turn signal (wave-4 review B-3)', () => {
     expect(clock.pendingCount).toBe(0)
   })
 })
+
+describe('invalid beats are dropped without silencing the turn (B-5)', () => {
+  it('dispatches only the valid beat, still streams the line and records the drop', async () => {
+    const clock = new FakeClock()
+    const { calls, executor } = recordingExecutor()
+    const args = {
+      pacing: 'build',
+      beats: [
+        { id: 'b1', intentId: 'probe-touch', regions: ['chest'], strength: 'med' },
+        { id: 'b2', intentId: 'no-such-intent', regions: ['chest'], strength: 'med' },
+      ],
+    }
+    const runner: ModelRunner = {
+      run: async () => ({
+        text: '（低声）……',
+        toolCalls: [{ id: 'call_bad', name: 'apply_plan', arguments: args }],
+        finishReason: 'tool-calls',
+      }),
+    }
+
+    const result = await runTurn({ runner, tools: M2_MODEL_TOOLS, executor, input: inputFixture(), clock })
+
+    // Only the valid beat reaches the executor...
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.plan.beats.map(beat => beat.id)).toEqual(['b1'])
+    // ...the drop is visible to the audit...
+    expect(result.dropped.length).toBeGreaterThan(0)
+    expect(result.dropped.some(drop => drop.beatId === 'b2')).toBe(true)
+    // ...and the turn still speaks instead of going silent.
+    expect(result.line.length).toBeGreaterThan(0)
+  })
+})

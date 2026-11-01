@@ -300,6 +300,9 @@ export async function runTurn(options: TurnLoopOptions): Promise<TurnResult> {
       lineParts.length = 0 // discard a partially streamed line from the failed attempt
     }
     if (result === undefined) throw new ModelError('the model produced no result', { code: 'invalid-response' })
+    // A non-streaming runner fills `result.text` instead of emitting deltas;
+    // dropping it would silently mute the turn (wave-4 review S-7).
+    if (lineParts.length === 0 && result.text !== '') lineParts.push(result.text)
     if (timedOut) throw timeoutError(timeoutMs)
     if (isAborted(callerSignal)) throw abortedError()
 

@@ -265,13 +265,18 @@
 
   function statusNodes(current) {
     const pairs = current === null
-      ? [['状态', '未开局'], ['阶段', '—'], ['时间', '—'], ['内容包', '—']]
+      ? [['状态', '未开局'], ['阶段', '—'], ['时间', '—'], ['内容包', '—'], ['边界', '—']]
       : [
           ['状态', `${stateText(current.state)}${current.mustResolve === true ? '（下一回合收束）' : ''}`],
           ['阶段', phaseText(current.phase)],
           ['时间', typeof current.remainingMin === 'number'
             ? `已过 ${current.elapsedMin ?? 0} 分 · 剩余 ${current.remainingMin} 分`
             : `已过 ${current.elapsedMin ?? 0} 分`],
+          // D-6: a pack may declare no boundaries; say so instead of leaving
+          // the player to assume the pack has none in force.
+          ['边界', Array.isArray(current.boundaries) && current.boundaries.length > 0
+            ? current.boundaries.join('、')
+            : '使用全局边界'],
           ['内容包', typeof current.packId === 'string' && current.packId !== ''
             ? `${current.packId} @ ${current.packVersion ?? '?'}`
             : '—'],
