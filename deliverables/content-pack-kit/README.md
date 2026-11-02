@@ -64,8 +64,8 @@ node tools/install-pack.mjs --list
 node tools/install-pack.mjs my-pack --zip my-pack.zip
 ```
 
-> 当前控制台 UI **没有导入按钮**（这是 v4 产品化时裁掉的运维面），导入走上面的脚本或 HTTP API；
-> 装好之后，游玩页的内容包下拉会立刻出现它。
+> 控制台 **游玩 → 开局** 卡里有「导入内容包」按钮，直接选 zip 即可安装并激活（等价于上面的脚本）；
+> 也可以继续用脚本或 HTTP API。装好之后，游玩页的内容包下拉会立刻出现它。
 
 ---
 

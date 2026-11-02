@@ -60,6 +60,11 @@
                 <option value="" disabled>（读取中…）</option>
               </select>
             </div>
+            <div class="pack-import-row">
+              <button class="mini" id="packImport" type="button">导入内容包</button>
+              <input id="packFile" type="file" accept=".zip,application/zip" hidden>
+              <span class="pack-import-status" id="packImportStatus" aria-live="polite"></span>
+            </div>
             <div class="field-row">
               <label class="field-label" for="plannedMinutes">计划时长</label>
               <input id="plannedMinutes" type="number" min="1" max="240" step="5" value="30">

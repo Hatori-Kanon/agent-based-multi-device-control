@@ -72,6 +72,16 @@
 - 词表版本/缓存/失败重试（`packId@version`、15s 重试、404 空表、force 立即重试）保持 v5 修复。
 - 请求仍走 `/api/region`；per-channel 序号防乱序；失败回滚到提交前值。
 
+### 3.4 内容包导入（同批）
+
+- 「开局」卡内容包行下新增 `#packImport`（按钮）+ 隐藏 `#packFile`（`.zip`）+ `#packImportStatus`
+  （`aria-live`）。产品 UI 仍只有这一个导入入口；没有卸载/版本切换按钮。
+- 客户端校验 `.zip` 与 `<= 64 MB`；用 `fetch('/api/packs/import', { body: file.arrayBuffer(),
+  headers: {'x-control-token', 'Content-Type':'application/zip'} })`，与安装脚本同一路由、同一
+  加载器/校验（导入即激活）。
+- 成功后 `refreshPacks()`、选中 `body.pack.id`、强制刷新推荐词表；失败把后端错误
+  （`already-installed`/`PACK_INVALID` 等）显示在状态行；导入期间 `busy` 禁用开局/导入。
+
 ## 4. 行为矩阵
 
 | 玩家输入 | 提交 | 模型看到 | 解析 |
@@ -98,6 +108,13 @@
   - 两个通道同名「左胸」→ 两个 device/channel 均映射到同一 key；
   - 清空 → key 删除、API 返回无该键；
   - 无 console/page error。截图 `.ui-shots/v6/01-lobby-region-input.png`、`02-lobby-custom-parts.png`。
+- 真实浏览器 · 内容包导入 UI（空 dataDir 的 dev-server + `tentacle-shadow.zip`）：
+  - 空列表时内容包下拉为「（没有已安装的内容包）」；
+  - 点「导入内容包」→ 选 zip（CDP `DOM.setFileInputFiles`）→ 下拉自动变为
+    `tentacle-shadow · 0.2.0`，状态行「已导入 tentacle-shadow @ 0.2.0」；
+  - `GET /api/packs` 返回 active 0.2.0；`GET /api/packs/regions?packId=tentacle-shadow` 返回
+    `whole-body/全身、inner-thigh、anal、waist、chest`；三个通道的 datalist 已刷新；
+  - 无 console error；截图 `.ui-shots/v6import/01-after-import.png`。
 
 ## 6. 已知限制
 
@@ -114,7 +131,8 @@
   通常在页面 boot 阶段很快到达。
 - `;`/`；`/`=` 不能出现在玩家自定义 key 中（会破坏 `id=label；…` 菜单行）；包内 label 出现这些
   字符时，facts 会用空格替代（id 不变）。
-- 内容包导入/卸载/版本切换仍无 UI；设备页仍保留独立软上限滑杆（与游玩卡同一 policy）。
+- 内容包**导入**已有 UI（开局卡「导入内容包」）；**卸载/版本切换**仍无 UI（脚本/API），
+  设备页仍保留独立软上限滑杆（与游玩卡同一 policy）。
 
 ## 7. 复核
 

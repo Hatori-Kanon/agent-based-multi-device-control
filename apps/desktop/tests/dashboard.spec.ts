@@ -1324,6 +1324,10 @@ describe('play page (B2-T12)', () => {
     expect(html).toContain('id="softCapsLobby"')
     expect(html).toContain('id="devices"')
     expect(html).not.toContain('id="softCapsRail"')
+    // The lobby owns the one content-pack import entry point (zip upload).
+    expect(html).toContain('id="packImport"')
+    expect(html).toContain('id="packFile"')
+    expect(html).toContain('id="packImportStatus"')
     // The product console shows no telemetry surface at all: no log/audit/debug
     // panels and no probe field name or probe number on the default page.
     expect(html).not.toContain('id="debugToggle"')
@@ -1356,6 +1360,8 @@ describe('play page (B2-T12)', () => {
     // recommended labels as a datalist; the old select/warning classes are gone.
     expect(js).toContain('/api/region')
     expect(js).toContain('/api/packs/regions')
+    // The lobby imports zip packs through the same host route the installer uses.
+    expect(js).toContain('/api/packs/import')
     expect(js).toContain('region-input')
     expect(js).toContain('datalist')
     expect(js).not.toContain('region-pick')

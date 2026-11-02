@@ -32,6 +32,9 @@
     unlock: document.getElementById('unlock'),
     err: document.getElementById('err'),
     packSelect: document.getElementById('packSelect'),
+    packImport: document.getElementById('packImport'),
+    packFile: document.getElementById('packFile'),
+    packImportStatus: document.getElementById('packImportStatus'),
     plannedMinutes: document.getElementById('plannedMinutes'),
     start: document.getElementById('start'),
     pause: document.getElementById('pause'),
@@ -388,6 +391,8 @@
     el.end.disabled = busy || !running || state === 'ended'
     el.packSelect.disabled = busy || running
     el.plannedMinutes.disabled = busy || running
+    // Import only exists in the lobby and only while nothing is uploading/playing.
+    el.packImport.disabled = busy || running
 
     const sendable = canSend()
     el.message.disabled = !sendable
@@ -1197,11 +1202,68 @@
   }
 
   // ── 人类动作 ────────────────────────────────────────────────────────────
+  /** The host reads zip uploads up to 64 MB; reject earlier with a clear message. */
+  const MAX_PACK_ZIP_BYTES = 64 * 1024 * 1024
+
+  function setPackImportStatus(text, bad = false) {
+    if (el.packImportStatus === null) return
+    el.packImportStatus.textContent = text
+    el.packImportStatus.classList.toggle('bad', bad)
+  }
+
+  /**
+   * Import one zip through the host API, then select the newly active pack.
+   *
+   * The host route is the same one the installer uses (`POST /api/packs/import`,
+   * raw zip bytes, auto-activates); the UI adds no second install path. The
+   * response's pack list is re-read so the dropdown and the region vocabulary
+   * follow the install without a reload.
+   */
+  async function importPack(file) {
+    if (busy || file === undefined) return
+    if (!/\.zip$/iu.test(file.name)) {
+      setPackImportStatus('请选择 .zip 内容包', true)
+      return
+    }
+    if (file.size > MAX_PACK_ZIP_BYTES) {
+      setPackImportStatus('内容包超过 64 MB', true)
+      return
+    }
+    busy = true
+    setPackImportStatus('导入中…')
+    renderControls()
+    try {
+      const body = await api('/api/packs/import', {
+        method: 'POST',
+        body: await file.arrayBuffer(),
+        headers: { 'Content-Type': 'application/zip' },
+        timeoutMs: 120_000,
+      })
+      const imported = body !== null && typeof body === 'object' && body.pack !== null
+        && typeof body.pack === 'object' ? body.pack : undefined
+      const packId = imported !== undefined && typeof imported.id === 'string' ? imported.id : ''
+      const version = imported !== undefined && typeof imported.version === 'string' ? imported.version : ''
+      setPackImportStatus(packId === '' ? '已导入' : `已导入 ${packId}${version === '' ? '' : ` @ ${version}`}`)
+      await refreshPacks()
+      if (packId !== '') {
+        el.packSelect.value = packId
+        renderControls()
+        await refreshVocabulary(currentSetupPack(), true)
+      }
+    } catch (error) {
+      setPackImportStatus(`导入失败：${describe(error)}`, true)
+    } finally {
+      busy = false
+      el.packFile.value = ''
+      renderControls()
+    }
+  }
+
   async function startSession() {
     if (busy) return
     const packId = el.packSelect.value
     if (packId === '') {
-      showError('没有可用的内容包：请先在设备视图导入并激活一个包')
+      showError('没有可用的内容包：请先导入一个 zip 内容包')
       return
     }
     const plannedMinutes = Number(el.plannedMinutes.value)
@@ -1396,6 +1458,13 @@
   el.panic.addEventListener('click', () => { void panic() })
   el.unlock.addEventListener('click', () => { void unlock() })
   el.start.addEventListener('click', () => { void startSession() })
+  el.packImport.addEventListener('click', () => {
+    if (!el.packImport.disabled) el.packFile.click()
+  })
+  el.packFile.addEventListener('change', () => {
+    const file = el.packFile.files === null ? undefined : el.packFile.files[0]
+    if (file !== undefined) void importPack(file)
+  })
   el.pause.addEventListener('click', () => { void control('/api/session/pause', '暂停') })
   el.resume.addEventListener('click', () => { void control('/api/session/resume', '继续') })
   el.end.addEventListener('click', () => { void endSession() })
