@@ -1001,9 +1001,9 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
       autopilot: { enabled: true, intervalSec: 10 },
     })
     expect(h.host.snapshot()?.choices).toHaveLength(1)
-    // The choice timeout is passive: no player decision is fabricated, the
-    // menu expires and the autopilot opens the next turn.
-    h.clock.advance(60_000)
+    // The choice timeout follows the auto interval (10s here). It is passive:
+    // no player decision is fabricated, the menu expires and the next turn opens.
+    h.clock.advance(10_000)
     for (let i = 0; i < 20 && h.runner.requests.length < 2; i += 1) {
       await Promise.resolve()
       await new Promise(resolve => setTimeout(resolve, 0))
@@ -1168,6 +1168,10 @@ describe('session controls (B2-T11)', () => {
     expect(picked.turnId).toBe(2)
     expect(picked.lastLine).toBe('第二句。')
     expect(picked.choices).toBeUndefined()
+    const choiceRequest = h.runner.requests[1]
+    expect(choiceRequest?.messages.at(-1)).toMatchObject({ role: 'user' })
+    expect(choiceRequest?.messages.at(-1)?.content).toContain('玩家选择：退开')
+    expect(choiceRequest?.messages.at(-1)?.content).toContain('resist')
     const selected = h.records().find(record => record.action === 'choice_selected')
     expect(selected?.actor).toBe('human')
     expect(selected?.detail).toMatchObject({ turnId: 1, choiceId: 'c1' })

@@ -348,7 +348,12 @@ export class TurnEngine {
     const next = this.clampAutopilotSec(seconds)
     if (next === this.intervalSec) return next
     this.intervalSec = next
-    if (this.autopilotOn) this.scheduleAutopilotTick()
+    if (this.autopilotOn) {
+      this.scheduleAutopilotTick()
+      // The auto choice timeout follows the autopilot interval: a player who
+      // does not pick should not stall auto mode for a separate 60s budget.
+      this.maybeArmChoiceTimeout()
+    }
     this.publishPacing()
     return next
   }
@@ -1225,7 +1230,9 @@ export class TurnEngine {
    * Arm the passive fallback timer.
    *
    * Only while autopilot is on (draft §4.1): with autopilot off the engine
-   * waits for the player indefinitely instead of deciding for them.
+   * waits for the player indefinitely instead of deciding for them. In auto
+   * mode the timeout follows the adopted autopilot interval (10–60s), so a
+   * menu never stalls auto mode longer than the configured cadence.
    */
   private maybeArmChoiceTimeout(): void {
     if (this.disposed || !this.autopilotOn) {
@@ -1234,7 +1241,7 @@ export class TurnEngine {
     }
     if (this.turnState !== 'idle' || this.active !== undefined) return
     if (!this.awaitingChoice()) return
-    const configured = this.config.choices.timeoutSec
+    const configured = this.autopilotOn ? this.intervalSec : this.config.choices.timeoutSec
     const seconds = Number.isFinite(configured) ? Math.max(0, configured) : 60
     this.cancelChoiceTimer()
     this.choiceTimer = this.clock.timeout(Math.max(0, Math.trunc(seconds * 1000)), () => {

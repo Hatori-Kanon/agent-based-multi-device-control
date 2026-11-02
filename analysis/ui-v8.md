@@ -54,7 +54,7 @@
     `旁白` 标签不存在，无 console error；
   - 截图 `.ui-shots/v8/v8-two-turns.png`、`.ui-shots/v8/v8-opening.png`。
 - 静态：`#lines role="log"`、`#currentLine`/`#nowCard` 不存在；play.js 含 `is-latest`。
-- core **682 tests** / desktop **216 tests**；tsc、esbuild、`node --check` 通过。
+- core **683 tests** / desktop **216 tests**；tsc、esbuild、`node --check` 通过。
 
 ## 4. 限制
 

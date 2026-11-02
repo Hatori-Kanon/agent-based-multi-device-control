@@ -107,7 +107,8 @@ describe('turn choices (B2-T6)', () => {
     expect(manual.records().some(record => record.action === 'choice_timeout')).toBe(false)
     manual.engine.dispose()
 
-    // 2) Autopilot on: the 60s timeout is passive and the director continues.
+    // 2) Autopilot on: the timeout follows the adopted autopilot interval
+    //    (default 20s), is passive, and the director continues.
     let autoCalls = 0
     const autoRunner: TurnRunner = {
       async run() {
@@ -121,12 +122,8 @@ describe('turn choices (B2-T6)', () => {
     h.engine.setAutopilot(true)
     await h.engine.submitPlayerMessage('开始')
     expect(h.engine.snapshot().choices).toHaveLength(1)
-    // A pending menu suppresses the autopilot tick: no turn replaces the menu.
+    // At the auto interval the menu expires as passive and a turn opens.
     h.clock.advance(20_000)
-    await Promise.resolve()
-    expect(autoCalls).toBe(1)
-    // At choices.timeoutSec the menu expires as passive and a turn opens.
-    h.clock.advance(40_000)
     await h.engine.whenIdle()
     expect(autoCalls).toBe(2)
     expect(h.engine.snapshot().choices).toBeUndefined()

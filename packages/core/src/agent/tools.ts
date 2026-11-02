@@ -432,6 +432,7 @@ export function withPlayableEnums(
   tools: readonly ToolDefinition[],
   intentIds: readonly string[],
   regionIds: readonly string[],
+  waveformIds: readonly string[] = [],
 ): readonly ToolDefinition[] {
   const index = tools.findIndex(tool => tool.name === 'apply_plan')
   if (index < 0) return tools
@@ -443,6 +444,20 @@ export function withPlayableEnums(
   const beatItems = beats === undefined ? undefined : asSchemaObject(beats['items'])
   const beatProperties = beatItems === undefined ? undefined : asSchemaObject(beatItems['properties'])
   if (beatItems === undefined || beatProperties === undefined) return tools
+
+  const waveformEnum = uniqueNonEmpty(waveformIds)
+  const applyWaveformEnum = (change: unknown): void => {
+    const record = asSchemaObject(change)
+    const oneOf = record === undefined ? undefined : record['oneOf']
+    if (!Array.isArray(oneOf)) return
+    for (const branch of oneOf) {
+      const branchRecord = asSchemaObject(branch)
+      if (branchRecord === undefined || branchRecord['properties'] === undefined) continue
+      const branchProperties = asSchemaObject(branchRecord['properties'])
+      const waveformId = branchProperties === undefined ? undefined : asSchemaObject(branchProperties['waveformId'])
+      if (waveformId !== undefined && waveformEnum.length > 0) waveformId['enum'] = waveformEnum
+    }
+  }
 
   const intentEnum = uniqueNonEmpty(intentIds)
   if (intentEnum.length > 0) {
@@ -457,6 +472,16 @@ export function withPlayableEnums(
     const declared = uniqueNonEmpty(regionIds).filter(id => id !== WHOLE_BODY_REGION)
     // `whole-body` is the wildcard every pack may use, so it is always legal.
     regionItems['enum'] = [WHOLE_BODY_REGION, ...declared]
+  }
+
+  // Waveform ids are pack-namespaced (`<packId>:<localId>`); without the enum
+  // the model invents short names and every plan degrades to unknown-waveform.
+  applyWaveformEnum(beatProperties['change'])
+  const targets = asSchemaObject(beatProperties['targets'])
+  if (targets !== undefined) {
+    const targetRecord = asSchemaObject(targets['items'])
+    const targetProperties = targetRecord === undefined ? undefined : asSchemaObject(targetRecord['properties'])
+    if (targetProperties !== undefined) applyWaveformEnum(targetProperties['change'])
   }
 
   const decorated: ToolDefinition = {

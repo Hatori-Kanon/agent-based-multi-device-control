@@ -78,7 +78,7 @@ turn_completed turnId=2 outcome=completed durationMs=1072
   thinking-mode 400 降级 tools；`protocol` mandatory 且排在 world 之后；tool schema 含
   `narration`。宿主测试：开场 prompt 含协议与开场指令；自动回合末尾补系统续行 user 消息，
   并保留 choices。
-- 全量：core 52 files / **682 tests**、desktop 17 files / **216 tests**。
+- 全量：core 52 files / **683 tests**、desktop 17 files / **216 tests**。
 
 ## 影响
 

@@ -302,6 +302,17 @@ function beatPropertiesOf(tools: readonly ToolDefinition[]): Record<string, unkn
   return asRecord(beatItems['properties'])
 }
 
+/** The waveformId enum inside a beat's `change` oneOf (waveform branch). */
+function waveformEnumOf(change: unknown): unknown {
+  const branches = asRecord(change)['oneOf']
+  if (!Array.isArray(branches)) return undefined
+  for (const branch of branches) {
+    const waveformId = asRecord(asRecord(asRecord(branch)['properties'])['waveformId'])
+    if (waveformId['enum'] !== undefined) return waveformId['enum']
+  }
+  return undefined
+}
+
 describe('withPlayableEnums', () => {
   it('injects the pack intent and region enums into apply_plan', () => {
     const decorated = withPlayableEnums(M2_MODEL_TOOLS, ['probe-touch', 'soothe'], ['chest'])
@@ -325,6 +336,26 @@ describe('withPlayableEnums', () => {
     // The decorated apply_plan is a new object with a cloned parameters tree.
     expect(applyPlanOf(decorated)).not.toBe(applyPlanOf(M2_MODEL_TOOLS))
     expect(applyPlanOf(decorated).parameters).not.toBe(applyPlanOf(M2_MODEL_TOOLS).parameters)
+  })
+
+  it('injects the pack waveform ids into beat and target changes', () => {
+    const decorated = withPlayableEnums(
+      M2_MODEL_TOOLS,
+      ['probe-touch'],
+      ['chest'],
+      ['tentacle-shadow:saw-spin', 'tentacle-shadow:spiral-squeeze'],
+    )
+    const properties = beatPropertiesOf(decorated)
+    expect(waveformEnumOf(properties['change'])).toEqual([
+      'tentacle-shadow:saw-spin',
+      'tentacle-shadow:spiral-squeeze',
+    ])
+    const targets = asRecord(properties['targets'])
+    const targetChange = asRecord(asRecord(asRecord(targets['items'])['properties'])['change'])
+    expect(waveformEnumOf(targetChange)).toEqual([
+      'tentacle-shadow:saw-spin',
+      'tentacle-shadow:spiral-squeeze',
+    ])
   })
 
   it('deduplicates and trims ids, and always keeps whole-body first', () => {

@@ -12,10 +12,10 @@
   **自动运行回合给 1–3 条 choices**（只有急停/收束等确实不适合选择的回合才可省略）。
 - 宿主不再从 `TurnResult` 里丢弃 choices；引擎仍按原语义在 `awaitingChoice()` 时暂停 P3
   自动拍，等玩家点选项后 resume。**自动运行遇到选项会停住是玩家决策点，不是静默/故障。**
-- 自动运行下选项有 60s（`EngineConfig.choices.timeoutSec`）被动超时：玩家不选时菜单过期、
+- 自动运行下选项按**当前自动运行间隔**（10–60s）被动超时：玩家不选时菜单过期、
   **默认行为 = passive（不补动作）**，然后 autopilot 立刻开下一回合；审计
   `choice_timeout`，不会伪造玩家选择。手动模式不启用该超时（和引擎既有语义一致）。
-- 测试：自动开局带 `choices`；自动运行 60s 后菜单消失并联 runner 进入下一回合；
+- 测试：自动开局带 `choices`；到自动运行间隔后菜单消失并进入下一回合；
   prompt 不再包含“不要生成 choices”。
 
 ## 2. 每条消息的效果小框
@@ -28,8 +28,26 @@
 - `recentEntries` 仍只保留 8 条给提示词；新增 **`transcriptEntries` 保存整局**，
   `GET /api/session/transcript` 返回全量（UI DOM 自己限 300 条）。否则长会话只有最近 8 条。
 - UI 在每条 assistant 旁白下渲染 `.line-effects` 小框（无标签、11.5px）：
-  `部位 · 强度% · 波形名`；`rejected` 标「未下发」、`degraded` 标「降级」；
-  同一组合去重。玩家消息/系统消息不带效果框。
+  `部位 · 强度% · 波形名`；同一组合去重。**只显示该 beat 实际针对、且成功下发/降级的部位；
+  `rejected` 与未匹配 plan regions 的 fallback action 直接不显示**，避免“没有涉及的部位”和
+  “未下发”噪音。degraded 仍是真实输出（波形不支持时退回普通 pattern），因此不额外标注。
+- 玩家消息/系统消息不带效果框。
+
+### 2.1 选项回送给模型
+
+- 之前 `playerTextOf` 对选项只发 `（选择：c1）`，模型不知道选项文字。现在宿主在
+  `submitChoice` 时保存引擎提供的 `{id,label,tag}`，下一回合发送
+  `（玩家选择：<label>（<tag>））`；protocol 明确要求根据玩家选择改变动作与叙事。
+- prompt 增加：`narration` 必须体现 beats 的 regions/动作，不能与部位脱节。
+
+### 2.2 波形 id 与右轨柱状图
+
+- 审计显示模型反复使用 `saw-spin`/`tentacle-crawl`/`cilia-tickle` 等未命名空间 id，执行器报
+  `UNKNOWN_WAVEFORM`，所以右轨没有选中波形、柱状图不出现。现在：
+  - `withPlayableEnums` 额外注入 `change.waveformId` 的 enum（pack 的 namespaced id）；
+  - prompt 的 mandatory protocol 列出 `可用波形：<packId>:<id>=<name>…`；
+  - 模型只能在这些 id 中选择，装包自带波形能真正选中，右轨 canvas 才有波形可画。
+- 未选择波形/通道不支持波形时 canvas 仍是基线；这是合法状态。
 
 ## 3. 右轨通道实时预览
 
@@ -51,17 +69,17 @@
 
 - 真实浏览器（dev-server + 真实模型 + mock 设备连上并设置部位）：
   - 自动运行开启时开局给出 3 个 choices；
-  - 消息下方出现效果小框：`腰腹 · 8%…胸部/乳房 · 8%…`（mock 波形不支持时显示「降级」）；
+  - 消息下方出现效果小框：`腰腹 · 8%…胸部/乳房 · 8%…`（只保留 plan 针对且非 rejected 的部位）；
   - 右轨每个通道出现小强度条与 `0%` 百分比；mock 通道没有波形能力，所以无 canvas；
   - 无原生弹窗、无 console error。截图 `.ui-shots/v9/v9-effect-live.png`。
 - 后端单测：transcript 带 effects；`GET /api/waveforms/preview` 200 + freq/intensity 数组；
   自动运行保留 choices、系统续行 user。
-- 全量：core 52 files / **682 tests**、desktop 17 files / **216 tests**。
+- 全量：core 52 files / **683 tests**、desktop 17 files / **216 tests**。
 
 ## 5. 限制
 
 - 波形 canvas 只对 `supportsWaveform` 的通道出现；未选择波形时只有基线。
 - 预览按波形定义绘制纹理，叠加当前通道强度；不是设备实际输出电压的采样。
 - 效果框只展示执行器真实下发的 action；全部 narrative-only（设备未连接/锁定）时为空。
-- 自动运行出现 choices 时引擎会停住等待玩家选择；这是引擎既有语义，不自动替玩家选。
+- 自动运行出现 choices 时引擎按自动运行间隔等待，超时 passive 继续；手动模式不替玩家选。
 - 完整 transcript 在内存中保存整局（通常几十条），刷新后不跨进程恢复（现有会话持久化范围）。

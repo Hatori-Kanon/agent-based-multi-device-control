@@ -548,10 +548,7 @@
       const waveform = typeof effect.waveformName === 'string' && effect.waveformName !== ''
         ? effect.waveformName
         : ''
-      const suffix = effect.status === 'rejected'
-        ? '（未下发）'
-        : effect.status === 'degraded' ? '（降级）' : ''
-      const text = [part, percent, waveform].filter(partText => partText !== '').join(' · ') + suffix
+      const text = [part, percent, waveform].filter(partText => partText !== '').join(' · ')
       const key = [part, percent, waveform].join('\u0000')
       if (text === '' || seen.has(key)) continue
       seen.add(key)

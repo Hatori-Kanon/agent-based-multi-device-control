@@ -68,7 +68,7 @@
 
 ## 4. 验证
 
-- core：52 files / **682 tests**；desktop：17 files / **216 tests**；两边 `tsc --noEmit` 0 error；
+- core：52 files / **683 tests**；desktop：17 files / **216 tests**；两边 `tsc --noEmit` 0 error；
   main/dev-server esbuild + `node --check` 通过。
   - 新增引擎测试：snapshot autopilot 字段、`setAutopilotInterval` clamp + 重排定时器。
   - 宿主测试：开局 autopilot 应用到 snapshot；`setAutopilot` 修改；ended 后新 start 成功

@@ -111,6 +111,7 @@ import {
   type ProbeRegistrar,
   type SessionEndReason,
   type SessionState,
+  type PlayerChoice,
   type WaveformLookup,
 } from '@embodied/core'
 
@@ -143,6 +144,8 @@ const TURN_PROTOCOL = [
   '必须调用 apply_plan 恰好一次；intentId 和 regions 只能取自「本回合可用」，不要发明 id。',
   '本端点工具调用不携带正文 content：给玩家看的完整正文必须写进 apply_plan 的 narration 字段（非空，篇幅遵循人设），不能只写在 reasoning 里，也不能只调用工具。',
   'narration 是玩家会看到的正文，不是计划摘要；环境/动作/身体反应用（）包裹，台词不加括号，不出现设备硬件词。',
+  'narration 必须体现本回合 beats 的 regions（使用玩家词表 label）和动作，不能写成与部位无关的泛泛台词。',
+  '玩家选项会作为下一回合用户消息（含选项文字和 tag）回传；必须据此改变动作与叙事，不要无视选项或复读上一回合。',
 ] as const
 
 /** Additional protocol lines for turn 1: the opening must establish the scene. */
@@ -400,6 +403,14 @@ export class PlaySession {
   private readonly turnBeats: string[][] = []
   /** `metaReactions` opening brief, consumed by the opening turn only. */
   private openingBrief: OpeningBrief | undefined
+  /**
+   * The exact choice the human picked, consumed by the next turn's prompt.
+   *
+   * `TurnRequest` only carries the choice id; without the label/tag the model
+   * receives `（选择：c1）` and cannot know what the player meant. The host
+   * resolves the label from the engine's offered menu before submitting.
+   */
+  private pendingChoice: PlayerChoice | undefined
 
   constructor(env: PlaySessionEnvironment) {
     this.env = env
@@ -688,10 +699,17 @@ export class PlaySession {
     if (offered.length === 0) {
       throw new SessionError('INVALID_INPUT', 'no choice menu is open')
     }
-    if (!offered.some(choice => choice.id === id)) {
+    const selected = offered.find(choice => choice.id === id)
+    if (selected === undefined) {
       throw new SessionError('INVALID_INPUT', `choice "${id}" was not offered in this turn`)
     }
-    await engine.submitChoice(id)
+    this.pendingChoice = selected
+    try {
+      await engine.submitChoice(id)
+    } catch (error) {
+      this.pendingChoice = undefined
+      throw error
+    }
     return this.requireSnapshot()
   }
 
@@ -906,14 +924,21 @@ export class PlaySession {
     const opening = request.turnId === 1
       && request.playerText === undefined
       && request.choiceId === undefined
-    const messages = this.messagesFor(request, phases, pack, snapshot, opening)
+    const choice = this.pendingChoice
+    this.pendingChoice = undefined
+    const messages = this.messagesFor(request, phases, pack, snapshot, opening, choice)
     this.openingBrief = undefined
     const result = await runTurn({
       runner: this.modelRunnerFor(),
       // The pack's intent menu and region vocabulary are the only legal values
       // for `apply_plan`; injecting them keeps the static tool schema free of
       // content while stopping the model from inventing ids (§4.9.2).
-      tools: withPlayableEnums(M2_MODEL_TOOLS, [...resolveContext.intents.keys()], resolveContext.regions),
+      tools: withPlayableEnums(
+        M2_MODEL_TOOLS,
+        [...resolveContext.intents.keys()],
+        resolveContext.regions,
+        pack.waveforms.map(waveform => waveform.id),
+      ),
       executor,
       input: {
         turnId: request.turnId,
@@ -1064,11 +1089,19 @@ export class PlaySession {
     const beats = new Map((result.plan?.beats ?? []).map(beat => [beat.id, beat] as const))
     const effects: PlayTurnEffect[] = []
     for (const action of result.dispatch?.actions ?? []) {
+      if (action.status === 'rejected') continue
+      const beat = beats.get(action.beatId)
       const found = channels.get(`${action.deviceId}:${action.channelId}`)
       const channel = found?.channel
       const region = channel?.region
+      // A beat that asked for `chest` may fall back to every online channel;
+      // only channels that actually carry one of the requested regions belong
+      // in this turn's effect box. `whole-body` is the explicit wildcard.
+      if (beat !== undefined && !beat.regions.includes(WHOLE_BODY_REGION)) {
+        if (region === undefined || !beat.regions.includes(region)) continue
+      }
       const waveform = channel?.waveform
-      const intentId = beats.get(action.beatId)?.intentId
+      const intentId = beat?.intentId
       effects.push({
         deviceId: action.deviceId,
         channelId: action.channelId,
@@ -1100,9 +1133,10 @@ export class PlaySession {
     pack: LoadedPack,
     snapshot: RegistrySnapshot,
     opening: boolean,
+    choice: PlayerChoice | undefined,
   ): readonly LlmMessage[] {
     const system = this.systemPrompt(phases, pack, snapshot, opening)
-    const playerText = playerTextOf(request)
+    const playerText = playerTextOf(request, choice)
       ?? (request.turnId > 1 ? AUTO_CONTINUE_MESSAGE : undefined)
     return buildTurnMessages({
       ...(system === '' ? {} : { system }),
@@ -1135,6 +1169,11 @@ export class PlaySession {
     const facts = this.worldFacts(snapshot)
     const briefs = [brief, sensor].filter(part => part !== '')
     const autopilot = this.engine?.autopilotEnabled === true
+    // The pack's waveform ids are namespaced; the model otherwise invents short
+    // names (`saw-spin`) and the executor rejects the plan with UNKNOWN_WAVEFORM.
+    const waveformMenu = pack.waveforms.length === 0
+      ? []
+      : [`可用波形：${pack.waveforms.map(waveform => `${waveform.id}=${waveform.name}`).join('；')}（change.waveformId 只能取这些 id）`]
     return buildSystemPrompt({
       ...(pack.manifest.boundaries === undefined ? {} : { boundaries: pack.manifest.boundaries }),
       ...(pack.host === undefined ? {} : { host: pack.host }),
@@ -1147,6 +1186,7 @@ export class PlaySession {
       // actually speak on this provider.
       protocol: [
         ...TURN_PROTOCOL,
+        ...waveformMenu,
         ...(opening ? OPENING_PROTOCOL : []),
         ...(autopilot ? AUTOPILOT_PROTOCOL : []),
       ],
@@ -1590,8 +1630,15 @@ function resolveContextOf(
 }
 
 /** A choice has no prose; render it as the player's line so the prompt still reads. */
-function playerTextOf(request: TurnRequest): string | undefined {
-  if (request.choiceId !== undefined) return `（选择：${request.choiceId}）`
+function playerTextOf(request: TurnRequest, choice?: PlayerChoice): string | undefined {
+  if (request.choiceId !== undefined) {
+    const label = choice?.label?.trim()
+    const tag = choice?.tag?.trim()
+    if (label !== undefined && label !== '') {
+      return `（玩家选择：${label}${tag === undefined || tag === '' ? '' : `（${tag}）`}）`
+    }
+    return `（选择：${request.choiceId}）`
+  }
   const text = request.playerText?.trim()
   return text === undefined || text === '' ? undefined : text
 }
