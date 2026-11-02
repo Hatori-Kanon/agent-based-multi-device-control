@@ -276,4 +276,23 @@ describe('content-pack loader', () => {
     expect(warned.resolveWaveform('bubble')).toBeUndefined()
     for (const reference of accepted) expect(warned.resolveWaveform(reference), reference).toBeDefined()
   })
+
+  it('normalizes an omitted region recommendation list to [] (v6)', async () => {
+    const files = scenarioFiles()
+    const scenario = JSON.parse(JSON.stringify(SCENARIO_JSON)) as Record<string, unknown>
+    delete scenario['regions']
+    scenario['feedbackIntents'] = [
+      { id: 'probe-touch', meaning: '短促试探' },
+      { id: 'soothe', meaning: '安抚' },
+    ]
+    files['scenario.json'] = JSON.stringify(scenario)
+
+    const pack = await loadPack(new MemoryContentSource(files))
+    expect(pack.scenario?.regions).toEqual([])
+    // Omitted intent regions default to the wildcard, not to undefined.
+    expect(pack.scenario?.feedbackIntents.map(intent => intent.regions)).toEqual([
+      ['whole-body'],
+      ['whole-body'],
+    ])
+  })
 })

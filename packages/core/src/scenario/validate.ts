@@ -464,13 +464,26 @@ function validateScenario(ctx: Context, scenario: ScenarioDefinition): { readonl
   }
 
   // --- regions ---------------------------------------------------------
+  // v6: `regions` is an optional recommendation list, not a hard vocabulary.
+  // The player can name a part freely; the runtime adds those session parts to
+  // the playable region set. A pack that wants no recommendations may omit the
+  // field (or pass []), as long as its intents omit `regions` too (they default
+  // to whole-body).
   const regionIds = new Set<string>()
   const regions = raw['regions']
-  if (!Array.isArray(regions)) {
-    error(ctx, file, 'regions', 'scenario.regions', '"regions" is required and must be an array')
+  if (regions === undefined) {
+    warn(
+      ctx,
+      file,
+      'regions',
+      'scenario.regions',
+      'no region recommendations declared; intents without explicit regions default to whole-body',
+    )
+  } else if (!Array.isArray(regions)) {
+    error(ctx, file, 'regions', 'scenario.regions', '"regions" must be an array when present')
   } else {
     if (regions.length === 0) {
-      warn(ctx, file, 'regions', 'scenario.regions', 'no regions declared; intent regions cannot resolve and fall back at runtime (S15)')
+      warn(ctx, file, 'regions', 'scenario.regions', 'no region recommendations declared (allowed); intents should omit regions or use whole-body')
     }
     for (const [index, item] of regions.entries()) {
       const base = `regions[${index}]`

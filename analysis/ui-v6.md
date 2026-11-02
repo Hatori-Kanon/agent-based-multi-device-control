@@ -1,0 +1,124 @@
+# ui-v6：玩家自由命名部位，内容包部位作为推荐（2026-11）
+
+> 触发：v5 让玩家从内容包 `regions[].label` 里选，产品负责人希望玩家**自由命名**当前会话使用的
+> 部位（「左胸」「右大腿」「绑带 2」），并让这个名称进入 LLM；同时问「如果内容包部位只作为
+> 推荐，内容包架构还需要变吗」。
+>
+> 结论：**要变，但只降级一处**：`scenario.regions` 从必填词表变成**可选推荐列表**，不新增文件
+> 或字段。玩家文本成为会话 region key，与包推荐共同组成模型可用的部位词表。
+
+## 1. 决策
+
+- **玩家自由命名是主词表**：每个通道一个文本输入；输入与包内 `label`/`id` 完全一致（trim、
+  ASCII 大小写不敏感）时提交包 id，保留作者推荐/意图/写作语义；否则提交输入原文，作为会话
+  自定义部位 key。
+- **内容包 `regions` 保留为推荐**：作者仍可给 3–5 个推荐（手/肩背/全身），它们既是玩家的
+  datalist 建议，也是意图默认与写作参考；整段可省略或 `[]`。
+- **不做模糊匹配**：不把「左胸」猜成「胸口」；需要同义词就让作者声明 `aliases`（后续）。
+- **不新增双字段**：不存「物理名称 + 叙事 region」两个值；一个 key 同时用于定点与叙事，
+  简单且不会出现两套真值。
+- **安全语义不变**：部位只决定命令去哪；cap/LOCKED/PolicyStore 仍是唯一输出边界。
+
+## 2. 内容包架构变化（回答“还需要变吗”）
+
+| 项 | v5 | v6 |
+| --- | --- | --- |
+| `scenario.regions` | 必填数组（缺失 = error；`[]` warning） | **可选**（缺失 warning，loader 归一为 `[]`） |
+| `regions[].id` | `^[a-z0-9][a-z0-9-]{0,31}$` | 不变（推荐项仍是 slug；玩家自定义 key 不走这个校验） |
+| `feedbackIntents[].regions` | 必须引用已声明 id | 仍必须引用已声明 id；**省略默认 `whole-body`**（推荐为空时建议省略） |
+| 玩家看到的部位 | 只能从 `regions[].label` 下拉选择 | 自由文本 + `regions[].label` datalist 建议；同名/同 id 自动映射 |
+| 引擎可用部位 | 包声明 + whole-body | 包声明 + 玩家自定义 key + whole-body |
+| 新增文件/字段 | — | **无** |
+
+因此 “内容包不写预设部位” 是可行的：`regions: []` 或省略，意图不写 `regions`；玩家仍可自由命名
+并让模型定点。但**推荐保留 3–5 个**：它们决定意图的默认部位语义、给玩家快捷建议，也让写作有
+稳定词表可参考。
+
+## 3. 实现
+
+### 3.1 core
+
+- `devices/regions.ts`：`RegionStore` 的 region key 从 slug 放宽为 **trim 后 1–64 个可打印字符**
+  （拒绝控制字符/空/超长）；`setByHuman`/`restore`/manifest defaults 都存储 trim 后的值，审计
+  `previous/next` 也用同一个值。旧 slug 仍合法；同名文本 = 同一 region。
+- `scenario/validate.ts`：`regions` 缺失 → warning（不再 error）；存在但非数组 → error；
+  `[]` → warning；意图 `regions` 仍必须引用已声明 id。
+- `scenario/loader.ts`：`normalizeScenario` 把缺失/非数组 `regions` 归一为 `[]`，意图缺省
+  `regions: ['whole-body']`。
+- `scenario/beat-plan.ts` / `intents.ts`：region 丢弃/降级 warning 的措辞从 “not declared by the
+  pack” 改为 “not in this session's region vocabulary”（`ctx.regions` 现在是并集）。
+
+### 3.2 宿主
+
+- `play.ts#sessionRegions(scenario, snapshot)`：包 `regions`（推荐）+ 快照里所有非空
+  `Channel.region`（玩家自定义，按出现顺序、去重）；label 用包内 label，自定义就是 key 本身。
+- `resolveContextOf`：`ResolveContext.regions` 用这个并集 → `parseBeatPlan`/`intents`/执行器都接受
+  玩家自定义 key。
+- `worldFacts`：`可用部位` 与 `已就位部位` 用并集；`withPlayableEnums` 的 `regions.items.enum`
+  也用并集，因此模型可以直接输出「左胸」作为 region key。
+- `openingBriefText` 仍按有效意图表过滤 firstIntent（v5 修复）。
+
+### 3.3 UI
+
+- 每通道 `.soft-cap-channel-head` 内：
+  - `<input class="region-input" type="text" placeholder="部位" maxlength="64" list="region-suggest-N">`；
+  - `<datalist>` 的 option 来自当前包推荐 `label`（空 label 回退 id），顺序保留（whole-body 最前）；
+  - 空输入 = 未指定；Enter（非输入法组合）只 blur，`change` 时提交，不逐键请求；
+  - 锁定时仍可编辑（部位不是安全边界）。
+- `resolveRegionInput(text)`：trim；空 → null；id 精确匹配（大小写不敏感）→ 包 id；label 匹配 →
+  包 id；否则返回 trim 后的原文。
+- `labelForRegion(value)`：包 id 显示为包 label（编辑后归一展示）；自定义值原样显示。
+- 不再有「未指定」「已设置的部位」「内容包未声明」等选项/警告——自定义部位是合法状态。
+- 词表版本/缓存/失败重试（`packId@version`、15s 重试、404 空表、force 立即重试）保持 v5 修复。
+- 请求仍走 `/api/region`；per-channel 序号防乱序；失败回滚到提交前值。
+
+## 4. 行为矩阵
+
+| 玩家输入 | 提交 | 模型看到 | 解析 |
+| --- | --- | --- | --- |
+| 空 | `null` | 该通道不在 `已就位部位` | 只有 `whole-body` 命中 |
+| 包内 label「手」 | `hands` | `hands=手` | 定点命中该通道；包意图/写作语义保留 |
+| 包内 id「hands」/「HANDS」 | `hands` | 同上 | 同上 |
+| 自定义「左胸」 | `左胸` | `左胸=左胸` | 定点命中该 key；模型可输出「左胸」 |
+| 两个通道都「左胸」 | 两个通道同 key | 词表只出现一次 | 同一意图可同时命中两个通道 |
+| 旧存档 slug `legacy-spot` | 保留 | `legacy-spot=legacy-spot` | 作为自定义 key 仍可定点（包不推荐它而已） |
+| 控制字符/空/65+ 字符 | `400 INVALID_POLICY` | — | 不落盘，审计 rejected |
+
+## 5. 验证
+
+- core：52 files / **676 tests** 全过（新增 RegionStore 自由 key、scenario 可选 regions/loader 归一）；
+  `tsc --noEmit` 0 error。
+- desktop：17 files / **211 tests** 全过（新增 play.spec「玩家命名部位进入 facts/enum」）；
+  `tsc --noEmit` 0 error；main/dev-server esbuild 通过；`node --check play.js` 通过。
+- 真实浏览器（headless Chrome + dev-server + mock 设备 + kit scenario 包）：
+  - 3 个 `input.region-input`（type=text、maxlength=64、placeholder=部位、list 绑定），
+    datalist 选项「全身/手/肩背」，datalist id 全局唯一；旧 `.region-pick`/`.region-warn` 0 个；
+  - 输入「手」→ `/api/region` 存 `hands`，展示归一为「手」；
+  - 输入「HANDS」→ `hands`；输入「 左胸 」→ `左胸`，展示「左胸」；
+  - 两个通道同名「左胸」→ 两个 device/channel 均映射到同一 key；
+  - 清空 → key 删除、API 返回无该键；
+  - 无 console/page error。截图 `.ui-shots/v6/01-lobby-region-input.png`、`02-lobby-custom-parts.png`。
+
+## 6. 已知限制
+
+- **不做模糊匹配/同义词**：自定义「左胸」不会自动映射到包推荐「胸口」；要同义请让作者声明
+  `aliases`（未来扩展）。
+- **split 写作链路未接线**：若将来启用 `TurnPipeline`，writer 的 `regionLabels` 需要把玩家自定义
+  key 映射进去，否则写作可能用「身体」兜底；单调用宿主不受影响。
+- 包推荐仍会被校验引用一致（intent 引用的 id 必须声明）；完全不写 `regions` 的包要记得让意图
+  省略 `regions`。
+- 玩家自定义 key 会进审计与提示词；含数字的自定义 key 属于“玩家命名”而非度量泄漏（与 v5 的 id
+  例外一致），仍建议不要写数值。
+- 内容包导入/卸载/版本切换仍无 UI；设备页仍保留独立软上限滑杆（与游玩卡同一 policy）。
+
+## 7. 复核
+
+- **Lead 自审**：RegionStore 的 trim 在 set/restore/defaults/snapshot/audit 一致；控制字符（C0/C1/
+  U+2028/U+2029）与 64 码点上限；旧 slug 与旧 persisted 值兼容；`scenario.regions` 缺失时
+  validator/loader 一致归一为 `[]`；意图引用仍必须声明；`sessionRegions` 与 `resolveContextOf`/
+  `worldFacts`/`withPlayableEnums` 用同一并集且只收 `level` 通道；UI 的 id 优先、label 唯一匹配、
+  歧义标签回退文本、空/清空/失败回滚/乱序响应；部位输入不进入任何安全边界。
+- **真实浏览器**：见 §5；`全身/手/肩背` 推荐、自由文本「左胸」、label/id 映射、同名合并、
+  清空均验证，旧 `.region-pick/.region-warn` 为 0，无 console error。
+- **独立 adversarial review**：本轮复核回复未在本会话时限内返回；上述自审 + 真实浏览器 + 211/676
+  测试为当前证据。若后续返回问题，会在下一轮修复并更新本节。

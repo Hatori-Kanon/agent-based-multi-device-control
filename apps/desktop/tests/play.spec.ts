@@ -936,6 +936,27 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
 
     await h.host.end('stop')
   })
+
+  it('adds player-named parts to the session vocabulary', async () => {
+    const h = await createHarness([scriptedTurn('好。', [planCall()])], await narrativePack())
+    // v6: the player may name a part freely; it becomes a region key the model
+    // can target, alongside the pack's recommendations.
+    await h.host.setRegion('mock-pulse', 'b', '左胸')
+    await h.host.start({ packId: 'narrative', plannedMinutes: 30 })
+
+    const system = h.runner.requests[0]?.messages.find(message => message.role === 'system')?.content ?? ''
+    expect(system).toContain('hands=手')
+    expect(system).toContain('左胸=左胸')
+    expect(system).toContain('已就位部位：左胸')
+
+    const applyPlan = h.runner.requests[0]?.tools.find(tool => tool.name === 'apply_plan')
+    const beat = (applyPlan!.parameters as {
+      properties: { beats: { items: { properties: { regions: { items: { enum: readonly string[] } } } } } }
+    }).properties.beats.items.properties
+    expect(beat.regions.items.enum).toEqual(['whole-body', 'hands', 'shoulders', '左胸'])
+
+    await h.host.end('stop')
+  })
 })
 
 // ── B2-T11: pause / resume / choice / transcript / ledger ──────────────────

@@ -1004,7 +1004,8 @@ export class PlaySession {
     if (scenario === undefined) return []
     return buildWorldFacts({
       intents: scenario.feedbackIntents,
-      regions: scenario.regions,
+      // Pack recommendations + player-named parts; the model may target either.
+      regions: sessionRegions(scenario, snapshot),
       channels: snapshot.devices.flatMap(device => device.channels
         .filter(channel => channel.kind === 'level')
         .map(channel => ({ region: channel.region, ready: device.lifecycle === 'ready' }))),
@@ -1352,6 +1353,40 @@ function regionsOf(snapshot: RegistrySnapshot): Readonly<Record<string, string>>
   return labels
 }
 
+/**
+ * The regions this session can speak: the pack's recommendations plus every
+ * player-named part currently on a channel.
+ *
+ * The pack's `scenario.regions` is a *recommendation* list (v6). The human may
+ * label a channel with any short text; those labels become additional region
+ * keys for this session, so the model can target them in `apply_plan.regions`
+ * and the resolver can match them. Order is pack-declared first, then player
+ * parts in snapshot order; the same string is one region.
+ */
+function sessionRegions(
+  scenario: ScenarioDefinition,
+  snapshot: RegistrySnapshot,
+): readonly { readonly id: string; readonly label: string }[] {
+  const regions: { id: string; label: string }[] = scenario.regions.map(region => ({
+    id: region.id,
+    label: region.label,
+  }))
+  const known = new Set(regions.map(region => region.id))
+  for (const device of snapshot.devices) {
+    for (const channel of device.channels) {
+      // A motion channel can never be driven by a plan, so its label must not
+      // be advertised as a targetable region.
+      if (channel.kind !== 'level') continue
+      const region = channel.region
+      if (region === undefined || region === '' || known.has(region)) continue
+      known.add(region)
+      // A player-authored part has no separate label: the key is its name.
+      regions.push({ id: region, label: region })
+    }
+  }
+  return regions
+}
+
 /** What the model may read about the world this turn: registry facts only. */
 function resolveContextOf(
   snapshot: RegistrySnapshot,
@@ -1363,7 +1398,7 @@ function resolveContextOf(
   return {
     snapshot,
     intents,
-    regions: scenario.regions.map(region => region.id),
+    regions: sessionRegions(scenario, snapshot).map(region => region.id),
     waveforms,
   }
 }

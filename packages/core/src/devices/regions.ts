@@ -3,8 +3,13 @@
  *
  * Packs speak regions (`chest`, `inner-thigh`), never device ids, so the
  * resolver has to answer "which connected channel carries `chest` right now".
- * The answer is hardware- and session-dependent, which is why it lives in its
- * own store rather than in the safety policy:
+ * Since v6 a region key is also the **player's own part name** (`左胸`, `绑带 2`):
+ * a pack's `regions[]` is a recommendation list, and the human's label is kept
+ * verbatim (trimmed). The console maps a player label that exactly matches a
+ * recommended label/id onto the pack id; anything else becomes a session part
+ * key that the model can still target. The answer is hardware- and
+ * session-dependent, which is why it lives in its own store rather than in the
+ * safety policy:
  *
  * - **Layered**: a manifest label (the baseline, restored from
  *   `state/devices.json`) sits under a human edit, which sits over whatever the
@@ -26,13 +31,23 @@
 import { SafetyError } from './errors.ts'
 
 /**
- * Shape of a region id (`M2-实施计划.md` §4.6.3 rule 3).
+ * Shape of a channel's region **key**.
  *
- * Lower-case slugs only: the ids are written by hand in manifests and packs,
- * and an unvalidated id would let `Chest` and `chest` become two regions that
- * look identical in the UI.
+ * Since v6 this is the player's part name as well as a pack region id: the
+ * human may name a physical part freely (`左胸`, `右大腿`, `绑带 2`), while a
+ * content pack's `regions[].id` remains a lower-case slug. The two share one
+ * namespace so an exact name/id match can map a player label onto the pack's
+ * recommendation (the console does that mapping; this store only owns shape).
+ *
+ * Constraints are about safety of the key, not style: trimmed, non-empty, at
+ * most {@link REGION_KEY_MAX_CODE_POINTS} code points, and no control
+ * characters (the resolver and audit lines must stay readable). `Chest` and
+ * `chest` are now allowed to be distinct player labels; the UI does the
+ * case-insensitive suggestion match before submitting.
  */
-const REGION_ID = /^[a-z0-9][a-z0-9-]{0,31}$/
+const REGION_KEY_MAX_CODE_POINTS = 64
+/** C0/C1 controls plus the Unicode line/paragraph separators. */
+const CONTROL_CHARS = /[\p{Cc}\u2028\u2029]/u
 
 /** The NUL separator used by `PolicyStore`; a channel id must not carry it. */
 const NUL = '\u0000'
@@ -56,7 +71,8 @@ export interface RegionChange {
 }
 
 /**
- * Per-channel narrative region ids, with human-only mutation.
+ * Per-channel region keys (pack recommendation id or player part name), with
+ * human-only mutation.
  *
  * A channel with no label is reachable only through the resolver's
  * `whole-body` wildcard, so clearing a label is a real (and harmless) state,
@@ -122,7 +138,7 @@ export class RegionStore {
    * Apply a human label change; `undefined` clears the label.
    *
    * @returns Before and after values so the caller can audit the change.
-   * @throws SafetyError with code `INVALID_POLICY` when the region id or the
+   * @throws SafetyError with code `INVALID_POLICY` when the region key or the
    *   key does not have the documented shape.
    */
   setByHuman(deviceId: string, channelId: string, region: string | undefined): RegionChange {
@@ -135,12 +151,12 @@ export class RegionStore {
     if (region === undefined) {
       this.overrides.delete(key)
       this.cleared.add(key)
-    } else {
-      assertRegionId(region, `channel ${key}`)
-      this.overrides.set(key, region)
-      this.cleared.delete(key)
+      return { previous, next: undefined }
     }
-    return { previous, next: region }
+    const next = assertRegionId(region, `channel ${key}`)
+    this.overrides.set(key, next)
+    this.cleared.delete(key)
+    return { previous, next }
   }
 
   /**
@@ -164,7 +180,7 @@ export class RegionStore {
    * mutation path: only the host calls it, and callers audit what was restored.
    *
    * @throws SafetyError with code `INVALID_POLICY` when a key is not
-   *   `device:channel` or a value is not a region id.
+   *   `device:channel` or a value is not a valid region key.
    */
   restore(entries: Readonly<Record<string, string>>): void {
     const next = new Map<string, string>()
@@ -215,19 +231,28 @@ function assertChannelKey(channelId: string): void {
 }
 
 /**
- * Validate a region id.
+ * Validate and normalize a region key.
  *
  * `whole-body` is a reserved id: it is the resolver's wildcard region, not an
  * alias for "every channel", so labelling one channel with it is pointless but
  * not dangerous and is accepted here. The pack loader owns rejecting
- * *undeclared* regions at validation time; this store only owns the shape.
+ * *undeclared* pack regions at validation time; this store only owns shape.
+ *
+ * A player-authored part name is trimmed and returned; the same trimmed value
+ * is what {@link RegionStore.setByHuman} persists and audits, so two spellings
+ * that differ only in surrounding whitespace collapse to one part.
  */
 function assertRegionId(value: unknown, where: string): string {
-  if (typeof value !== 'string' || !REGION_ID.test(value)) {
+  if (typeof value !== 'string') {
+    throw new SafetyError('INVALID_POLICY', `region key (${where}) must be a non-empty string`)
+  }
+  const trimmed = value.trim()
+  const codePoints = Array.from(trimmed).length
+  if (trimmed === '' || codePoints > REGION_KEY_MAX_CODE_POINTS || CONTROL_CHARS.test(trimmed)) {
     throw new SafetyError(
       'INVALID_POLICY',
-      `region id '${String(value)}' (${where}) must match ${REGION_ID.source}`,
+      `region key '${trimmed}' (${where}) must be 1-${REGION_KEY_MAX_CODE_POINTS} printable characters`,
     )
   }
-  return value
+  return trimmed
 }

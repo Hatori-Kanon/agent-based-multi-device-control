@@ -426,13 +426,20 @@ function checkWaveformReferences(
   }
 }
 
-/** Fill the documented default for omitted intent regions (S15 ladder step 0). */
+/**
+ * Fill the documented defaults for an omitted scenario field.
+ *
+ * - `intent.regions` omitted → `["whole-body"]` (S15 ladder step 0).
+ * - `regions` omitted → `[]` (v6: recommendations are optional; the session's
+ *   player-named parts are unioned in by the host at play time).
+ */
 function normalizeScenario(scenario: ScenarioDefinition): ScenarioDefinition {
   const intents = Array.isArray(scenario.feedbackIntents) ? scenario.feedbackIntents : []
   const feedbackIntents = intents.map(intent => (typeof intent === 'object' && intent !== null
     ? { ...intent, regions: intent.regions ?? ['whole-body'] }
     : intent))
-  return { ...scenario, feedbackIntents }
+  const regions = Array.isArray(scenario.regions) ? scenario.regions : []
+  return { ...scenario, regions, feedbackIntents }
 }
 
 function personaIssues(persona: string): readonly ValidationIssue[] {

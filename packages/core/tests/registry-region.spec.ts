@@ -243,27 +243,34 @@ describe('the region map persists and every human change is audited', () => {
     expect(snapshotChannel(rebooted.registry.snapshot(), 'toy', 'b').region).toBe('inner-thigh')
   })
 
-  it('refuses a region id that is not a slug and audits the refusal', async () => {
+  it('accepts player-authored part names and rejects only malformed keys', async () => {
     const h = createRuntime(clock => [labelledToy(clock, CHANNELS)])
 
-    // A display label is not an id: `Chest` would silently become a second
-    // region that looks identical to `chest` in the UI.
-    await expect(h.registry.setRegionByHuman('toy', 'a', 'Chest')).rejects.toBeInstanceOf(SafetyError)
-    expect(snapshotChannel(h.registry.snapshot(), 'toy', 'a').region).toBeUndefined()
-
+    // v6: a region key is the player's own part name; Chinese, spaces and
+    // case are fine. It is trimmed before storage and audit.
+    await h.registry.setRegionByHuman('toy', 'a', ' 左胸 ')
+    expect(snapshotChannel(h.registry.snapshot(), 'toy', 'a').region).toBe('左胸')
+    await h.registry.setRegionByHuman('toy', 'b', '绑带 2')
+    expect(snapshotChannel(h.registry.snapshot(), 'toy', 'b').region).toBe('绑带 2')
     const records = h.records()
-    expect(records).toHaveLength(1)
-    expect(records[0]).toMatchObject({
+    expect(records.at(-2)).toMatchObject({
       actor: 'human',
       action: 'region_change',
-      result: 'rejected',
-      detail: { deviceId: 'toy', channelId: 'a', next: 'Chest' },
+      result: 'ok',
+      detail: { deviceId: 'toy', channelId: 'a', previous: null, next: '左胸' },
     })
-    expect(records[0]?.reason).toContain("region id 'Chest'")
+
+    // The shape guard only rejects unusable keys: control characters, blank,
+    // or over-long text. The refusal is still audited.
+    await expect(h.registry.setRegionByHuman('toy', 'a', 'bad\nname')).rejects.toBeInstanceOf(SafetyError)
+    await expect(h.registry.setRegionByHuman('toy', 'a', '   ')).rejects.toBeInstanceOf(SafetyError)
+    await expect(h.registry.setRegionByHuman('toy', 'a', 'x'.repeat(65))).rejects.toBeInstanceOf(SafetyError)
+    expect(h.records().at(-1)).toMatchObject({ action: 'region_change', result: 'rejected' })
+    // The last good value is untouched by the rejected writes.
+    expect(snapshotChannel(h.registry.snapshot(), 'toy', 'a').region).toBe('左胸')
 
     // An unknown channel is refused the same way instead of inventing a label.
     await expect(h.registry.setRegionByHuman('toy', 'zz', 'chest')).rejects.toBeInstanceOf(SafetyError)
-    expect(h.records()).toHaveLength(2)
   })
 
   it('rejects a malformed persisted key instead of guessing', () => {
@@ -276,8 +283,11 @@ describe('the region map persists and every human change is audited', () => {
     expect(store.snapshot()).toEqual({})
     expect(store.get('toy', 'a')).toBeUndefined()
 
-    // Region ids are slugs; a display label is not an id.
-    expect(() => store.restore({ 'toy:a': 'Chest' })).toThrow(SafetyError)
+    // v6: values are player part names, not slugs; they are trimmed on restore.
+    store.restore({ 'toy:a': ' 左胸 ' })
+    expect(store.get('toy', 'a')).toBe('左胸')
+    expect(() => store.restore({ 'toy:a': 'bad\u0000name' })).toThrow(SafetyError)
+    expect(store.get('toy', 'a')).toBe('左胸')
   })
 
   it('keeps the map sorted and does not echo manifest defaults', () => {

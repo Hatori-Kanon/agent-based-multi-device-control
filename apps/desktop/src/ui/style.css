@@ -1055,8 +1055,8 @@ input[type="range"]:disabled {
   padding: 20px 22px;
 }
 
-/* 大厅里的内容包下拉占满整行；软上限卡里的部位下拉有自己的宽度规则。 */
-.lobby-card select:not(.region-pick) {
+/* 大厅里的内容包下拉占满整行；软上限卡里的部位输入有自己的宽度规则。 */
+.lobby-card select {
   max-width: none;
   flex: 1;
 }
@@ -1898,8 +1898,8 @@ input[type="range"]:disabled {
   flex: 0 0 64px;
 }
 
-/* v2 搬过来的大厅微调：内容包下拉占满整行（部位下拉除外，见 §15.5）。 */
-.lobby-card select:not(.region-pick) {
+/* v2 搬过来的大厅微调：内容包下拉占满整行（部位输入不受影响，见 §15.5）。 */
+.lobby-card select {
   flex: 1;
   width: 100%;
   max-width: none;
@@ -2089,8 +2089,8 @@ input[type="range"]:disabled {
   padding-top: 0;
 }
 
-/* 通道头：标签 + 部位下拉（+可选的警告）。344px 的右轨里允许整行换行，
-   下拉自己收缩，任何宽度下都不会把卡片撑出横向滚动条。 */
+/* 通道头：标签 + 部位输入。344px 的右轨里允许整行换行，输入自己收缩，
+   任何宽度下都不会把卡片撑出横向滚动条。 */
 .soft-cap-channel-head {
   display: flex;
   flex-wrap: wrap;
@@ -2099,26 +2099,39 @@ input[type="range"]:disabled {
   min-width: 0;
 }
 
-.region-pick {
+/* 部位是玩家给自己的命名，视觉上像一行可编辑标签而不是表单控件：
+   默认透明边框 + 半透明下划线，hover/focus 才显出输入框。边框/底色/焦点
+   全部复用 input[type=text] 的既有规则，这里只调观感（颜色只用 token）。
+   选择器带上元素名，才能压过 §6 的 input[type="text"] 基础规则。 */
+input.region-input {
   flex: 1 1 auto;
   min-width: 0;
   max-width: 190px;
   height: 26px;
   padding: 2px 8px;
   font-size: 12px;
+  background: transparent;
+  border-color: transparent;
+  border-bottom-color: var(--line);
+  color: var(--muted);
 }
 
-.region-warn {
-  flex: none;
-  font-size: 10.5px;
-  color: var(--warn);
-  white-space: nowrap;
+input.region-input:hover {
+  border-color: var(--line-2);
+  background: var(--field);
+  color: var(--text);
 }
 
-/* 手机上部位下拉独占一行，避免和通道标签/警告挤在一起。
-   放在基础规则之后，媒体查询才能覆盖上面的 flex/max-width。 */
+input.region-input:focus {
+  border-color: var(--line-gold);
+  background: var(--field);
+  color: var(--text);
+}
+
+/* 手机上部位输入独占一行，避免和通道标签挤在一起。
+   放在基础规则之后并用同样的 input.region-input 选择器，媒体查询才能覆盖。 */
 @media (max-width: 760px) {
-  .region-pick {
+  input.region-input {
     flex: 1 1 100%;
     max-width: none;
   }

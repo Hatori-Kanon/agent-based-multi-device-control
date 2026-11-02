@@ -5,7 +5,6 @@
   "type": "object",
   "required": [
     "session",
-    "regions",
     "phases",
     "feedbackIntents"
   ],
@@ -69,6 +68,7 @@
     },
     "regions": {
       "type": "array",
+      "description": "可选：作者推荐的身体部位（玩家可自由命名；名称或 id 与推荐一致时自动映射到包内 id；整段可省略或为空数组）",
       "items": {
         "type": "object",
         "required": [
@@ -144,7 +144,7 @@
             "items": {
               "type": "string"
             },
-            "description": "每个 region 必须在本文件 regions[] 声明"
+            "description": "可选建议；每个值仍必须在本文件 regions[] 声明（省略时默认 whole-body）"
           },
           "distribution": {
             "enum": [

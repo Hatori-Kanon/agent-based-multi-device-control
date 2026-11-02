@@ -511,8 +511,8 @@ function normaliseRegions(
       if (value === WHOLE_BODY_REGION || declared.has(value)) {
         regions.push(value)
       } else {
-        dropped.push({ beatId, rule: 'region', reason: `region ${describe(value)} is not declared by the pack` })
-        warnings.push(`beat ${beatId}: region ${describe(value)} is not declared by the pack; removed`)
+        dropped.push({ beatId, rule: 'region', reason: `region ${describe(value)} is not in this session's region vocabulary` })
+        warnings.push(`beat ${beatId}: region ${describe(value)} is not in this session's region vocabulary; removed`)
       }
     }
   } else if (raw !== undefined) {

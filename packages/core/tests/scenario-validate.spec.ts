@@ -58,6 +58,25 @@ function rules(issues: readonly ValidationIssue[], severity: 'error' | 'warning'
 }
 
 describe('content-pack validation', () => {
+  it('treats regions as optional recommendations (v6)', () => {
+    // A pack may ship no recommendation list at all; intents without their own
+    // regions default to whole-body, and the session adds the player's names.
+    const bare = scenario({
+      regions: undefined,
+      feedbackIntents: [
+        { id: 'probe-touch', meaning: '短促试探' },
+        { id: 'soothe', meaning: '安抚' },
+      ],
+    })
+    const issues = validatePack({ ...baseInput(), scenario: bare })
+    expect(rules(issues, 'error')).toEqual([])
+    expect(rules(issues, 'warning')).toContain('scenario.regions')
+
+    // If the field is present it must still be an array.
+    const malformed = { ...baseInput(), scenario: scenario({ regions: 'chest' }) }
+    expect(rules(validatePack(malformed), 'error')).toContain('scenario.regions')
+  })
+
   it('accepts a reachable phase graph and rejects a dead end with no terminal phase', () => {
     // The base fixture is a linear probe → resolve graph: valid, no errors.
     expect(rules(validatePack(baseInput()), 'error')).toEqual([])

@@ -15,7 +15,7 @@
 ```text
 ① 复制模板
    templates/freeform/   ← 先做这个（不写 JSON 也能玩，最快跑通）
-   templates/scenario/   ← 需要阶段、部位、意图表时再用
+   templates/scenario/   ← 需要阶段、意图表、（可选）推荐部位时再用
 ② 改文件
    pack.json   ：id / name / version / mode / rating / boundaries
    persona.md  ：角色人设（必须非空）
@@ -75,7 +75,7 @@ node tools/install-pack.mjs my-pack --zip my-pack.zip
 |---|---|
 | `内容包格式要求.md` | **权威速查**：全部字段、校验规则、运行期实际读什么、当前实现限制、常见错误 |
 | `templates/freeform/` | 轻量包模板：`pack.json` + `persona.md` + `host.md` + `setting.md`，无需 `scenario.json` |
-| `templates/scenario/` | 完整包模板：阶段图、部位、意图表、阶段写作提示、一个包内波形资产 |
+| `templates/scenario/` | 完整包模板：阶段图、意图表、可选推荐部位、阶段写作提示、一个包内波形资产 |
 | `schema/pack.schema.json` | `pack.json` 的 JSON Schema（VS Code 等编辑器可用来自动补全/检查） |
 | `schema/scenario.schema.json` | `scenario.json` 的 JSON Schema |
 | `tools/validate-pack.mjs` | 调用**仓库自己的**加载器校验目录，输出与游戏导入完全一致的结论 |

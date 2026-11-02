@@ -187,7 +187,7 @@ function resolveBeat(
 
   for (const region of beat.regions) {
     if (region !== WHOLE_BODY_REGION && !ctx.regions.includes(region)) {
-      warnings.push(`beat ${beat.id}: region "${region}" is not declared by the pack`)
+      warnings.push(`beat ${beat.id}: region "${region}" is not in this session's region vocabulary`)
     }
   }
 

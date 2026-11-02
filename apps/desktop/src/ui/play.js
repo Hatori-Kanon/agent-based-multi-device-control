@@ -5,10 +5,12 @@
 // 可见性规则（`导演与写作上下文契约.md`）：本视图只渲染玩家能看见的内容 ——
 // 台词、选项、阶段、时间。v5 把「部位」并入「软上限」：大厅的 #softCapsLobby
 // 与舞台右轨的 #devices 用同一个渲染器，每台设备一张卡、每个通道一块 ——
-// 部位选择 + 强度范围 + 频率范围放在一起（`设备范围与单窗口界面-设计说明.md`
-// §3.3）。部位词表按「内容包 + 版本」拉取（GET /api/packs/regions），只显示
-// 内容包作者写的 label，提交的是稳定 id；同一个包换版本会重拉，加载失败不
-// 缓存成「已加载」，下一次刷新会自动重试。
+// 部位输入 + 强度范围 + 频率范围放在一起（`设备范围与单窗口界面-设计说明.md`
+// §3.3）。部位由玩家自由命名：输入框可以填任意部位名（中文/空格/数字都行），
+// 内容包声明的 regions 只是 datalist 推荐 —— 输入与包内 id 或 label 完全一致
+// 时提交包 id（保留包内意图与写作语义），否则提交玩家自己的文本；后端按相同
+// 字符串归为同一部位。推荐词表按「内容包 + 版本」拉取（GET /api/packs/regions），
+// 同一个包换版本会重拉，加载失败不缓存成「已加载」，下一次刷新会自动重试。
 // 强度按通道的原生单位显示（Coyote 0-200，其它 0-100%），频率显示物理 Hz；
 // 单位元数据由宿主快照给出，缺强度元数据时按百分比降级，读不到 Hz 则该行
 // 显示「—」并禁用。
@@ -65,8 +67,8 @@
   /** Region labels keyed `device:channel` (`GET /api/region`). */
   let regions = {}
   /**
-   * 当前内容包版本声明的部位词表；`null` = 还没成功加载（picker 只给「未指定」
-   * 与通道当前值）。
+   * 当前内容包版本声明的部位词表；`null` = 还没成功加载（输入框仍可自由填写，
+   * 只是没有推荐项）。
    */
   let regionVocabulary = null
   /** 已加载词表对应的 `${packId}@${version}`；与设置用的包不同就重新拉。 */
@@ -515,11 +517,6 @@
   /** 每个通道最近一次部位提交的序号；乱序响应据此丢弃。 */
   const regionRequests = new Map()
 
-  /** 词表里是否有这个部位 id；加载完成前 `regionVocabulary` 为 null。 */
-  function vocabularyHas(id) {
-    return Array.isArray(regionVocabulary) && regionVocabulary.some(entry => entry.id === id)
-  }
-
   /**
    * 合并卡的渲染签名。
    *
@@ -605,7 +602,7 @@
     return card
   }
 
-  /** 一个通道块：部位选择 + 强度范围 +（波形通道）频率范围。 */
+  /** 一个通道块：部位输入 + 强度范围 +（波形通道）频率范围。 */
   function setupChannel(device, channel, locked) {
     const block = document.createElement('div')
     block.className = 'soft-cap-channel'
@@ -618,11 +615,18 @@
 
     const deviceName = device.name ?? device.id ?? '设备'
     const channelName = channel.label ?? channel.id ?? '通道'
-    const current = currentRegionOf(device.id, channel)
-    const pick = regionPicker(device.id, channel.id, deviceName, channelName, current)
-    pick.addEventListener('change', () => { void applyRegion(device, channel, pick, head) })
-    head.append(pick)
-    if (regionNeedsWarning(current)) head.append(regionWarningNode())
+    // 输入=玩家部位名；包 label 只是 datalist 里的建议，不是白名单。
+    const input = regionInput(device, channel, deviceName, channelName, head)
+    input.addEventListener('change', () => { void applyRegion(device, channel, input) })
+    input.addEventListener('keydown', event => {
+      // 中文输入法用 Enter 确认候选词时不要当成“提交部位”。
+      if (event.isComposing || event.keyCode === 229) return
+      if (event.key === 'Enter') {
+        event.preventDefault()
+        input.blur()
+      }
+    })
+    head.append(input)
     block.append(head)
 
     const caps = capsOf(channel)
@@ -641,66 +645,80 @@
     return typeof stored === 'string' ? stored : ''
   }
 
-  /** 部位不是词表里的 id（旧包/后端声明的值）时提示，但别把原始 id 露给玩家。 */
-  function regionNeedsWarning(value) {
-    if (!Array.isArray(regionVocabulary)) return false
-    return value !== '' && !vocabularyHas(value)
+  /** 部位输入框 datalist 的 id 序号：两个挂载点、多个通道之间保证唯一。 */
+  let regionSuggestSeq = 0
+
+  /**
+   * 部位值 → 输入框展示文本。
+   *
+   * 包内词表里的 id 显示成包内 label（保留作者写法）；自定义部位原样显示。
+   */
+  function labelForRegion(value) {
+    if (typeof value !== 'string' || value === '') return ''
+    const vocabulary = Array.isArray(regionVocabulary) ? regionVocabulary : []
+    const entry = vocabulary.find(item => item.id === value)
+    return entry === undefined ? value : entry.label
   }
 
-  function regionWarningNode() {
-    const warn = document.createElement('span')
-    warn.className = 'region-warn'
-    warn.textContent = '内容包未声明'
-    return warn
+  /**
+   * 输入文本 → 要提交的部位值。
+   *
+   * trim 后与包内词表的 id 或 label 完全一致（ASCII 大小写不敏感）时提交包 id，
+   * 保留内容包意图；否则提交玩家自己的文本（后端按相同字符串匹配，同名同部位）。
+   * 空输入返回 null（清空部位）。
+   */
+  function resolveRegionInput(text) {
+    const trimmed = typeof text === 'string' ? text.trim() : ''
+    if (trimmed === '') return null
+    const vocabulary = Array.isArray(regionVocabulary) ? regionVocabulary : []
+    const folded = trimmed.toLowerCase()
+    const byId = vocabulary.find(entry => entry.id.toLowerCase() === folded)
+    if (byId !== undefined) return byId.id
+    // Labels are not guaranteed unique (only ids are); an ambiguous label must
+    // not silently pick one pack region, so fall back to the player's text.
+    const byLabel = vocabulary.filter(entry => entry.label.toLowerCase() === folded)
+    if (byLabel.length === 1) return byLabel[0].id
+    return trimmed
   }
 
-  /** 部位下拉：词表里的 label 给玩家看，提交的是稳定 id。 */
-  function regionPicker(deviceId, channelId, deviceName, channelName, current) {
-    const pick = document.createElement('select')
-    pick.className = 'region-pick'
-    pick.setAttribute('aria-label', `${deviceName} ${channelName} 部位`)
-    const options = []
-    const none = document.createElement('option')
-    none.value = ''
-    none.textContent = '未指定'
-    options.push(none)
+  /** 部位输入框 + 推荐 datalist；词表为空/加载失败时仍可自由输入。 */
+  function regionInput(device, channel, deviceName, channelName, head) {
+    regionSuggestSeq += 1
+    const listId = `region-suggest-${regionSuggestSeq}`
+    const input = document.createElement('input')
+    input.className = 'region-input'
+    input.type = 'text'
+    input.placeholder = '部位'
+    input.maxLength = 64
+    input.setAttribute('aria-label', `${deviceName} ${channelName} 部位`)
+    input.setAttribute('list', listId)
+    input.value = labelForRegion(currentRegionOf(device.id, channel))
+    // 部位不是安全边界：锁定时仍可编辑（后端接受）。
+    const list = document.createElement('datalist')
+    list.id = listId
     const vocabulary = Array.isArray(regionVocabulary) ? regionVocabulary : []
     for (const entry of vocabulary) {
       const option = document.createElement('option')
-      option.value = entry.id
-      option.textContent = entry.label
-      options.push(option)
+      option.value = entry.label !== '' ? entry.label : entry.id
+      list.append(option)
     }
-    // 存档里可能是旧包/后端声明的部位：给一个不带原始 id 的已选项。
-    if (current !== '' && !vocabularyHas(current)) {
-      const stale = document.createElement('option')
-      stale.value = current
-      stale.textContent = '已设置的部位'
-      options.push(stale)
-    }
-    pick.replaceChildren(...options)
-    pick.value = current
-    // 部位不是安全边界：锁定时仍可编辑（后端接受）。
-    return pick
+    head.append(list)
+    return input
   }
 
-  /** 就地同步部位下拉旁边的「内容包未声明」提示。 */
-  function updateRegionWarning(head, value) {
-    const existing = head.querySelector('.region-warn')
-    if (regionNeedsWarning(value)) {
-      if (existing === null) head.append(regionWarningNode())
-      return
-    }
-    if (existing !== null) existing.remove()
-  }
-
-  async function applyRegion(device, channel, pick, head) {
+  async function applyRegion(device, channel, input) {
     const deviceId = device.id
     const channelId = channel.id
     const key = regionKey(deviceId, channelId)
     // 提交前的值：失败时回滚到它（而不是可能已被旧响应改过的 regions 映射）。
     const before = currentRegionOf(deviceId, channel)
-    const wanted = pick.value === '' ? null : pick.value
+    const wanted = resolveRegionInput(input.value)
+    // 内容没变（例如输入了包内 label「手」而存档已经是 hands）：只把展示归一，
+    // 不发请求。
+    if ((wanted ?? '') === before) {
+      input.value = labelForRegion(before)
+      return
+    }
     // 每个通道一个请求序号：只有最新一次提交的响应有权改 UI/回滚，快速连续
     // 修改时旧响应直接丢弃，避免标签被乱序响应拨回去。
     const seq = (regionRequests.get(key) ?? 0) + 1
@@ -717,19 +735,17 @@
       }
       const applied = regions[key] ?? ''
       // 快照要等下一轮才更新；先把本地这份的 region 改成服务端生效值，避免
-      // 「失焦后立刻重画」把刚选的部位画回旧值。
+      // 「失焦后立刻重画」把刚填的部位画回旧值。
       channel.region = applied === '' ? undefined : applied
-      pick.value = applied
-      updateRegionWarning(head, applied)
+      input.value = labelForRegion(applied)
       // 让下一次快照轮询重画（被跳过的这次渲染不算数）。
       setupSignatures.clear()
-      if (document.activeElement !== pick) renderSetup()
+      if (document.activeElement !== input) renderSetup()
     } catch (error) {
       if (regionRequests.get(key) !== seq) return
       noteError('region', `修改部位失败：${describe(error)}`)
-      pick.value = before
+      input.value = labelForRegion(before)
       channel.region = before === '' ? undefined : before
-      updateRegionWarning(head, pick.value)
     }
   }
 
@@ -1044,7 +1060,7 @@
   // ── 部位词表（随内容包版本变化，不进 500ms 轮询） ───────────────────────
   /**
    * 当前设置用的内容包：有会话时用会话的包与版本（避免会话中途后台激活了
-   * 别的版本导致 picker 标签漂移），否则用大厅下拉框的选择。
+   * 别的版本导致部位推荐标签漂移），否则用大厅下拉框的选择。
    */
   function currentSetupPack() {
     if (session !== null && typeof session.packId === 'string' && session.packId !== '') {
@@ -1071,8 +1087,8 @@
    * 版本，是确定的「没有词表」，缓存空数组且不打扰玩家；500/超时/断网不算
    * 已加载：置 `vocabularyRetry`，让下一次 boot/refreshAll/viewchange/
    * applySession/applyNoSession 的调用重试。失败期间如果同 key 已有一份好
-   * 词表就继续用（force 失败不会清掉好数据），否则退回 null（picker 只剩
-   * 「未指定」与通道当前值）。
+   * 词表就继续用（force 失败不会清掉好数据），否则退回 null（datalist 没有
+   * 推荐，输入框仍可自由填写）。
    */
   async function refreshVocabulary(pack = currentSetupPack(), force = false) {
     const wanted = pack !== null && typeof pack === 'object' ? pack : { id: '', version: '' }

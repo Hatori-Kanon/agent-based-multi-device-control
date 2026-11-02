@@ -1352,10 +1352,14 @@ describe('play page (B2-T12)', () => {
     expect(js).toContain('/api/session/transcript')
     expect(js).toContain('/api/panic')
     expect(js).toContain('/api/cap')
-    // The per-channel region picker reads the pack vocabulary and writes the
-    // human label through the same endpoint the old text input used.
+    // The per-channel region field is a free-text input with the current pack's
+    // recommended labels as a datalist; the old select/warning classes are gone.
     expect(js).toContain('/api/region')
     expect(js).toContain('/api/packs/regions')
+    expect(js).toContain('region-input')
+    expect(js).toContain('datalist')
+    expect(js).not.toContain('region-pick')
+    expect(js).not.toContain('region-warn')
     // The global ceiling route and the debug/probe surface are gone from this view.
     expect(js).not.toContain('/api/session/ceiling')
     expect(js).not.toContain('/api/debug')
