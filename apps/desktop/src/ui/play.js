@@ -15,6 +15,12 @@
 // 单位元数据由宿主快照给出，缺强度元数据时按百分比降级，读不到 Hz 则该行
 // 显示「—」并禁用。
 //
+// 自动运行（P3 pacing）：大厅的 checkbox/slider 只改本地设置，随开局请求一起
+// 提交；会话内控件跟随快照的 autopilot（启停/间隔/边界），修改走
+// POST /api/session/autopilot。结束用 shell.js 的应用内确认（window.embodiedConfirm）；
+// 一局结束后回到大厅（同一进程可以再开一局），并将最后采用的自动运行设置写回
+// 大厅控件。旧局迟到的 ended 快照按 sessionId 丢弃，不把新一局打回大厅。
+//
 // 轮询 2Hz：会话与台词每 500ms，设备/部位/软上限每 2s，内容包每 30s；部位
 // 词表只随内容包/版本变化单独拉取，不进 500ms 轮询。设备/设置视图打开时
 // （document.body.dataset.view !== 'play'）本视图停止轮询；切回时 `viewchange`
@@ -24,6 +30,10 @@
   const token = new URLSearchParams(location.search).get('token') ?? ''
   const POLL_MS = 500
   const HOLD_MS = 1000
+  /** 自动运行（P3 pacing）的秒数域；引擎快照会给出自己的 min/max。 */
+  const AUTO_MIN_SEC = 10
+  const AUTO_MAX_SEC = 60
+  const AUTO_DEFAULT_SEC = 20
 
   const el = {
     conn: document.getElementById('conn'),
@@ -40,6 +50,12 @@
     pause: document.getElementById('pause'),
     resume: document.getElementById('resume'),
     end: document.getElementById('end'),
+    autoLobbyEnabled: document.getElementById('autoLobbyEnabled'),
+    autoLobbyInterval: document.getElementById('autoLobbyInterval'),
+    autoLobbyValue: document.getElementById('autoLobbyValue'),
+    autoRunEnabled: document.getElementById('autoRunEnabled'),
+    autoRunInterval: document.getElementById('autoRunInterval'),
+    autoRunValue: document.getElementById('autoRunValue'),
     lobby: document.getElementById('lobby'),
     sessionView: document.getElementById('sessionView'),
     sessionState: document.getElementById('sessionState'),
@@ -104,6 +120,13 @@
   let packSignature = '\u0000init'
   /** A player action (start/message/choice/control) is in flight. */
   let busy = false
+  /** 大厅的自动运行设置；跨局保留（上一局结束后写回这里）。 */
+  let lobbyAutoEnabled = false
+  let lobbyAutoSeconds = AUTO_DEFAULT_SEC
+  /** 已经播到大厅控件的那一局 id：宿主会继续返回 ended 快照，别每次轮询都覆盖玩家刚改的设置。 */
+  let lobbyAutoSeeded = ''
+  /** 会话内有一笔自动运行修改在请求中。 */
+  let autoBusy = false
   let polling = false
   let ticks = 0
   let errorTimer
@@ -182,7 +205,7 @@
   const ERROR_TEXT = {
     LOCKED: '输出已锁定：先点「解锁」再继续',
     NO_SESSION: '尚未开局',
-    SESSION_OPEN: '本进程已有一局（一次只跑一局）；要重开请重启宿主',
+    SESSION_OPEN: '本进程已有正在进行的会话；结束本局后可再开',
     SESSION_ENDING: '本局正在收尾，请稍候',
     SESSION_ENDED: '本局已结束',
     INVALID_INPUT: '输入不被接受',
@@ -250,6 +273,21 @@
 
   function applySession(next) {
     if (next === null || typeof next !== 'object') return
+    // 结束后回到大厅：后端允许同一进程再开一局，开局按钮必须恢复可用。
+    // 先按 sessionId 判断不是上一局迟到的 ended 快照，否则会把刚开的新一局
+    // 打回大厅（轮询请求与 start 响应可能乱序）。
+    if (next.state === 'ended') {
+      const endedSessionId = typeof next.sessionId === 'string' ? next.sessionId : ''
+      if (session !== null && sessionId !== '' && endedSessionId !== sessionId) return
+      // 宿主会继续返回同一个 ended 快照；只把这一局的设置采纳一次，之后玩家在
+      // 大厅里改的设置不能被 500ms 轮询覆盖。
+      if (endedSessionId !== lobbyAutoSeeded) {
+        lobbyAutoSeeded = endedSessionId
+        rememberLobbyAuto(next.autopilot)
+      }
+      applyNoSession()
+      return
+    }
     const nextId = typeof next.sessionId === 'string' ? next.sessionId : ''
     const switched = session !== null && sessionId !== '' && nextId !== sessionId
     if (switched) resetStream()
@@ -309,6 +347,7 @@
     renderChoices(current === null ? undefined : current.choices)
     renderLock()
     renderControls()
+    renderAutoRun()
   }
 
   /** 时间只进舞台头和状态卡；台词区不重复显示。 */
@@ -399,6 +438,100 @@
     el.send.disabled = !sendable
     for (const button of el.choices.querySelectorAll('button')) button.disabled = !sendable
     el.message.placeholder = sendable ? '说点什么…' : notSendableReason(state, running, locked)
+
+    // 自动运行：大厅在开局前设置（跨局保留），会话内跟着快照走。
+    el.autoLobbyEnabled.disabled = busy || running
+    el.autoLobbyInterval.disabled = busy || running
+    const autoDisabled = !running || locked || state === 'ended' || state === 'ending'
+    el.autoRunEnabled.disabled = autoDisabled
+    el.autoRunInterval.disabled = autoDisabled
+  }
+
+  // ── 自动运行（P3 pacing） ────────────────────────────────────────────────
+  /** 秒数边界：宿主快照的 minSec/maxSec；缺失/非法时退回默认 10/60。 */
+  function autoBound(value, fallback) {
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.round(value) : fallback
+  }
+
+  /** 秒数：四舍五入并夹到 [min, max]（默认大厅的 10–60）。 */
+  function clampAutoSeconds(value, min = AUTO_MIN_SEC, max = AUTO_MAX_SEC) {
+    const low = Math.min(min, max)
+    const high = Math.max(min, max)
+    const sec = typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : AUTO_DEFAULT_SEC
+    return Math.min(high, Math.max(low, sec))
+  }
+
+  /** 大厅自动运行控件：默认值或上一局留下的设置。 */
+  function renderLobbyAuto() {
+    el.autoLobbyEnabled.checked = lobbyAutoEnabled
+    el.autoLobbyInterval.min = String(AUTO_MIN_SEC)
+    el.autoLobbyInterval.max = String(AUTO_MAX_SEC)
+    el.autoLobbyInterval.value = String(lobbyAutoSeconds)
+    el.autoLobbyValue.textContent = `${lobbyAutoSeconds}s`
+  }
+
+  /**
+   * 用当前 session.autopilot 重写会话内控件（不检查焦点）。
+   *
+   * 引擎会在采用计划后的下一拍夹取/采纳 intervalSec，轮询回来的快照就是实际
+   * 生效值，所以这里始终以快照为准。
+   */
+  function syncAutoFromSession() {
+    const current = session
+    if (current === null) return
+    const autopilot = current.autopilot
+    if (autopilot === null || typeof autopilot !== 'object') return
+    const minSec = autoBound(autopilot.minSec, AUTO_MIN_SEC)
+    const maxSec = autoBound(autopilot.maxSec, AUTO_MAX_SEC)
+    const intervalSec = clampAutoSeconds(autopilot.intervalSec, minSec, maxSec)
+    el.autoRunInterval.min = String(minSec)
+    el.autoRunInterval.max = String(maxSec)
+    el.autoRunInterval.value = String(intervalSec)
+    el.autoRunEnabled.checked = autopilot.enabled === true
+    el.autoRunValue.textContent = `${intervalSec}s`
+  }
+
+  /**
+   * renderSession/applySession 之后刷新会话内自动运行控件。
+   *
+   * 焦点在控件上时跳过：正在拖动滑杆/点 checkbox 的瞬间不能被 500ms 轮询
+   * 把值搬回去。结束态不做（马上回大厅，由大厅控件承接）。
+   */
+  function renderAutoRun() {
+    const current = session
+    if (current === null || current.state === 'ended') return
+    const autopilot = current.autopilot
+    if (autopilot === null || typeof autopilot !== 'object') return
+    const active = document.activeElement
+    if (active !== null && (active === el.autoRunEnabled || active === el.autoRunInterval)) return
+    syncAutoFromSession()
+  }
+
+  /** 一局收尾时把最后采用的自动运行设置留给大厅（下一局沿用）。 */
+  function rememberLobbyAuto(autopilot) {
+    if (autopilot === null || typeof autopilot !== 'object') return
+    lobbyAutoEnabled = autopilot.enabled === true
+    lobbyAutoSeconds = clampAutoSeconds(autopilot.intervalSec, AUTO_MIN_SEC, AUTO_MAX_SEC)
+    renderLobbyAuto()
+  }
+
+  /** 会话内切换自动运行/改间隔；成功用返回的快照刷新，失败把控件拉回真值。 */
+  async function postAutopilot(patch) {
+    if (autoBusy || session === null) return
+    autoBusy = true
+    try {
+      const body = await api('/api/session/autopilot', {
+        method: 'POST',
+        body: JSON.stringify(patch),
+      })
+      applySession(body)
+    } catch (error) {
+      noteError('autopilot', `修改自动运行失败：${describe(error)}`)
+      // 控件可能已经被本地操作改过：拉回服务端当时的真实值。
+      syncAutoFromSession()
+    } finally {
+      autoBusy = false
+    }
   }
 
   function notSendableReason(state, running, locked) {
@@ -955,9 +1088,14 @@
   }
 
   async function refreshTranscript() {
+    // 结束回大厅后轮询仍会跑：没有会话就不要读 transcript，否则上一局的台词
+    // 会被重新塞回对话流，污染下一局的开场。
+    if (session === null) return
     try {
       const query = lastAt > 0 ? `?since=${lastAt}` : ''
       const body = await api(`/api/session/transcript${query}`)
+      // 请求期间会话可能已经结束：丢弃迟到的转写，别写进大厅。
+      if (session === null) return
       clearError('transcript')
       const entries = body !== null && typeof body === 'object' && Array.isArray(body.transcript)
         ? body.transcript
@@ -1278,7 +1416,14 @@
       // v3：不再随开局写会话上限；输出边界由每通道的软上限持有。
       const next = await api('/api/session/start', {
         method: 'POST',
-        body: JSON.stringify({ packId, plannedMinutes }),
+        body: JSON.stringify({
+          packId,
+          plannedMinutes,
+          autopilot: {
+            enabled: el.autoLobbyEnabled.checked === true,
+            intervalSec: Number(el.autoLobbyInterval.value),
+          },
+        }),
         timeoutMs: 90000, // 开局要跑一整回合，别用轮询的 8s 预算
       })
       resetStream()
@@ -1310,8 +1455,11 @@
 
   async function endSession() {
     if (busy || session === null) return
-    if (!window.confirm('结束本局？')) return
-    if (busy) return
+    // 应用内确认（shell.js 的原生 <dialog>），不用浏览器原生 confirm 弹窗。
+    const ok = await window.embodiedConfirm('结束本局？')
+    if (!ok) return
+    // 确认框打开期间会话可能已经自己结束/被替换：再核一次再发请求。
+    if (busy || session === null) return
     busy = true
     renderControls()
     try {
@@ -1469,6 +1617,33 @@
   el.resume.addEventListener('click', () => { void control('/api/session/resume', '继续') })
   el.end.addEventListener('click', () => { void endSession() })
 
+  // 大厅：只改本地设置，开局时才随 /api/session/start 一起提交。
+  el.autoLobbyEnabled.addEventListener('change', () => {
+    lobbyAutoEnabled = el.autoLobbyEnabled.checked === true
+  })
+  el.autoLobbyInterval.addEventListener('input', () => {
+    lobbyAutoSeconds = clampAutoSeconds(Number(el.autoLobbyInterval.value))
+    el.autoLobbyInterval.value = String(lobbyAutoSeconds)
+    el.autoLobbyValue.textContent = `${lobbyAutoSeconds}s`
+  })
+
+  // 会话内：勾选/松手才提交，拖动过程只更新读数。
+  el.autoRunEnabled.addEventListener('change', () => {
+    void postAutopilot({
+      enabled: el.autoRunEnabled.checked === true,
+      intervalSec: Number(el.autoRunInterval.value),
+    })
+  })
+  el.autoRunInterval.addEventListener('input', () => {
+    el.autoRunValue.textContent = `${Number(el.autoRunInterval.value)}s`
+  })
+  el.autoRunInterval.addEventListener('change', () => {
+    void postAutopilot({
+      enabled: el.autoRunEnabled.checked === true,
+      intervalSec: Number(el.autoRunInterval.value),
+    })
+  })
+
   el.composer.addEventListener('submit', event => {
     event.preventDefault()
     void sendMessage(el.message.value)
@@ -1532,6 +1707,8 @@
 
   // ── 启动 ────────────────────────────────────────────────────────────────
   async function boot() {
+    // 大厅自动运行控件先落到默认值（上一局结束时会被覆盖）。
+    renderLobbyAuto()
     if (token.length < 16) {
       el.conn.textContent = '缺少 token'
       el.conn.classList.remove('on')

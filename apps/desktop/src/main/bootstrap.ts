@@ -1356,6 +1356,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       pause: async () => await play.pause(),
       resume: async () => await play.resume(),
       choose: async (choiceId: string) => await play.choice(choiceId),
+      setAutopilot: async input => await play.setAutopilot(input),
       transcript: () => play.transcript(),
     },
     ledger: async (limit?: number) => await play.ledger(limit),

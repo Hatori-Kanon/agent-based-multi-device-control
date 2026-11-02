@@ -1328,6 +1328,15 @@ describe('play page (B2-T12)', () => {
     expect(html).toContain('id="packImport"')
     expect(html).toContain('id="packFile"')
     expect(html).toContain('id="packImportStatus"')
+    // Autopilot is a human pacing control in both the lobby and the session rail.
+    for (const id of ['autoLobbyEnabled', 'autoLobbyInterval', 'autoLobbyValue',
+      'autoRunEnabled', 'autoRunInterval', 'autoRunValue']) {
+      expect(html).toContain(`id="${id}"`)
+    }
+    // Confirmations are rendered in-page (native <dialog>), never a browser popup.
+    for (const id of ['confirmDialog', 'confirmText', 'confirmCancel', 'confirmOk']) {
+      expect(html).toContain(`id="${id}"`)
+    }
     // The product console shows no telemetry surface at all: no log/audit/debug
     // panels and no probe field name or probe number on the default page.
     expect(html).not.toContain('id="debugToggle"')
@@ -1362,6 +1371,10 @@ describe('play page (B2-T12)', () => {
     expect(js).toContain('/api/packs/regions')
     // The lobby imports zip packs through the same host route the installer uses.
     expect(js).toContain('/api/packs/import')
+    // Autopilot is session-scoped; end uses the in-page confirmation helper.
+    expect(js).toContain('/api/session/autopilot')
+    expect(js).toContain('embodiedConfirm')
+    expect(js).not.toContain('window.confirm')
     expect(js).toContain('region-input')
     expect(js).toContain('datalist')
     expect(js).not.toContain('region-pick')
@@ -1385,6 +1398,9 @@ describe('play page (B2-T12)', () => {
     expect(consoleJs).not.toContain('/api/logs')
     expect(consoleJs).not.toContain('/api/audit')
     expect(consoleJs).not.toContain('/api/debug')
+    // Device removal asks through the same in-page dialog, never window.confirm.
+    expect(consoleJs).toContain('embodiedConfirm')
+    expect(consoleJs).not.toContain('window.confirm')
 
     // The settings view's script talks to the settings API and never persists
     // the token itself.
@@ -1407,6 +1423,10 @@ describe('play page (B2-T12)', () => {
     expect(shellJs).toContain('replaceState')
     expect(shellJs).toContain('viewchange')
     expect(shellJs).toContain('settings')
+    // All confirmations go through the in-page <dialog> helper, not window.confirm.
+    expect(shellJs).toContain('embodiedConfirm')
+    expect(shellJs).toContain('showModal')
+    expect(shellJs).not.toContain('window.confirm')
 
     // `/device` and `/settings` are deep links to the same page, and the
     // deleted play.html is not reachable any more.

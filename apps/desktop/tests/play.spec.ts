@@ -286,18 +286,35 @@ describe('play session', () => {
     await expect(h.session.message('还在吗')).rejects.toMatchObject({ code: 'LOCKED' })
   })
 
-  it('refuses a second session start while one is open', async () => {
+  it('refuses a second start while open and allows a new one after end', async () => {
     const h = await createHarness([scriptedTurn('第一次。'), scriptedTurn('第二次。')])
 
-    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    const first = await h.host.start({ packId: 'demo', plannedMinutes: 30 })
     await expect(h.host.start({ packId: 'demo', plannedMinutes: 30 }))
       .rejects.toMatchObject({ code: 'SESSION_OPEN' })
 
-    // "One process, one session" also holds after the session ends.
+    // An ended session is replaced, not reused: the lobby is shown again, so
+    // the next 开局 gets a fresh session (new id, turn 1).
     await h.host.end('left_early')
-    await expect(h.host.start({ packId: 'demo', plannedMinutes: 30 }))
-      .rejects.toMatchObject({ code: 'SESSION_OPEN' })
-    expect(h.runner.requests).toHaveLength(1)
+    const second = await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    expect(second.sessionId).not.toBe(first.sessionId)
+    expect(second).toMatchObject({ state: 'idle', turnId: 1, lastLine: '第二次。' })
+    expect(h.runner.requests).toHaveLength(2)
+  })
+
+  it('applies the lobby autopilot choice and accepts live changes', async () => {
+    const h = await createHarness([scriptedTurn('第一句。'), scriptedTurn('第二句。')])
+
+    const started = await h.host.start({
+      packId: 'demo',
+      plannedMinutes: 30,
+      autopilot: { enabled: true, intervalSec: 15 },
+    })
+    expect(started.autopilot).toEqual({ enabled: true, intervalSec: 15, minSec: 10, maxSec: 60 })
+
+    const changed = await h.host.setAutopilot({ enabled: false, intervalSec: 45 })
+    expect(changed.autopilot).toEqual({ enabled: false, intervalSec: 45, minSec: 10, maxSec: 60 })
+    await h.host.end('completed')
   })
 
   it('persists the human-set ceiling and audits policy_change with scope session', async () => {
@@ -462,10 +479,18 @@ describe('session HTTP routes', () => {
       packVersion: '1.0.0',
     })
 
-    // A second start is a 400, not a 500: one process, one session.
+    // A second start is a 400, not a 500: one active session.
     const secondStart = await post('/api/session/start', { packId: 'demo', plannedMinutes: 30 })
     expect(secondStart.status).toBe(400)
     expect((await secondStart.json() as { code?: string }).code).toBe('SESSION_OPEN')
+
+    // Human autopilot control is a session-scoped POST and carries the adopted
+    // interval back; a malformed flag is a caller error.
+    const autoOn = await post('/api/session/autopilot', { enabled: true, intervalSec: 15 })
+    expect(autoOn.status).toBe(200)
+    expect((await autoOn.json() as { autopilot: unknown }).autopilot)
+      .toMatchObject({ enabled: true, intervalSec: 15 })
+    expect((await post('/api/session/autopilot', { enabled: 'yes' })).status).toBe(400)
 
     const messaged = await post('/api/session/message', { text: '我往后缩了一下' })
     expect(messaged.status).toBe(200)

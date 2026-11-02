@@ -36,7 +36,7 @@ import type { FeatureSample, ProbeRecord, SensorQuality, SensorStatus, Snapshot 
 import type { DeviceManagerEntry, DeviceProtocol } from './bootstrap.ts'
 import type { SettingsDeps } from './host-settings.ts'
 import { isSessionError } from './play.ts'
-import type { PlayHostStartRequest } from './play.ts'
+import type { PlayAutopilotInput, PlayHostStartRequest } from './play.ts'
 import { handleSettingsRequest, isSettingsPath } from './settings-routes.ts'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -185,6 +185,8 @@ export interface DashboardSession {
   pause?(): Promise<unknown>
   resume?(): Promise<unknown>
   choose?(choiceId: string): Promise<unknown>
+  /** Human autopilot toggle/interval while playing (`POST /api/session/autopilot`). */
+  setAutopilot?(input: PlayAutopilotInput): Promise<unknown>
   /** Recent spoken lines, newest last. */
   transcript?(): readonly unknown[]
   /** Cross-session ledger entries, newest last (B2-T8). */
@@ -927,10 +929,34 @@ export class DashboardServer {
         sendError(response, 400, 'ceilingPercent must be a whole number from 0 to 100')
         return
       }
+      let autopilot: PlayAutopilotInput | undefined
+      if (body.autopilot !== undefined) {
+        const raw = body.autopilot
+        if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+          sendError(response, 400, 'autopilot must be an object')
+          return
+        }
+        const record = raw as Record<string, unknown>
+        if (typeof record.enabled !== 'boolean') {
+          sendError(response, 400, 'autopilot.enabled must be a boolean')
+          return
+        }
+        const intervalSec = record.intervalSec
+        if (intervalSec !== undefined
+          && (typeof intervalSec !== 'number' || !Number.isFinite(intervalSec) || intervalSec <= 0)) {
+          sendError(response, 400, 'autopilot.intervalSec must be a positive number')
+          return
+        }
+        autopilot = {
+          enabled: record.enabled,
+          ...(typeof intervalSec === 'number' ? { intervalSec } : {}),
+        }
+      }
       const input: PlayHostStartRequest = {
         packId,
         plannedMinutes,
         ...(typeof rawCeiling === 'number' ? { ceilingPercent: rawCeiling } : {}),
+        ...(autopilot === undefined ? {} : { autopilot }),
       }
       try {
         sendJson(response, 200, await session.start(input))
@@ -1091,6 +1117,45 @@ export class DashboardServer {
       }
       try {
         sendJson(response, 200, await setSessionCeiling(percent))
+      } catch (error) {
+        sendSessionFailure(response, error)
+      }
+      return
+    }
+
+    // ── Autopilot (P3 pacing) ─────────────────────────────────────────────
+    // Human pacing control, not a model write: the engine clamps the interval
+    // and only the host's own session can be affected. Disabled sub-routes 404
+    // so a console test double without a session keeps working.
+    if (request.method === 'POST' && pathname === '/api/session/autopilot') {
+      const setAutopilot = this.options.deps.session?.setAutopilot
+      if (setAutopilot === undefined) {
+        sendError(response, 404, 'the session service is not available')
+        return
+      }
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(request)
+      } catch (error) {
+        sendError(response, 400, `invalid JSON body: ${error instanceof Error ? error.message : 'unreadable'}`)
+        return
+      }
+      const enabled = body.enabled
+      if (typeof enabled !== 'boolean') {
+        sendError(response, 400, 'enabled must be a boolean')
+        return
+      }
+      const intervalSec = body.intervalSec
+      if (intervalSec !== undefined
+        && (typeof intervalSec !== 'number' || !Number.isFinite(intervalSec) || intervalSec <= 0)) {
+        sendError(response, 400, 'intervalSec must be a positive number')
+        return
+      }
+      try {
+        sendJson(response, 200, await setAutopilot({
+          enabled,
+          ...(typeof intervalSec === 'number' ? { intervalSec } : {}),
+        }))
       } catch (error) {
         sendSessionFailure(response, error)
       }

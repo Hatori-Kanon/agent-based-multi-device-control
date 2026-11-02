@@ -54,6 +54,29 @@ function immediateRunner(line = '（低笑）你退后了半步。'): TurnRunner
 }
 
 describe('autopilot pacing (B2-T5)', () => {
+  it('exposes autopilot state in the snapshot and clamps interval changes', () => {
+    const h = createHarness(immediateRunner())
+    expect(h.engine.snapshot().autopilot).toEqual({
+      enabled: false,
+      intervalSec: 20,
+      minSec: 10,
+      maxSec: 60,
+    })
+
+    h.engine.setAutopilot(true)
+    expect(h.engine.snapshot().autopilot.enabled).toBe(true)
+    // Human interval changes are clamped and re-arm the pending tick.
+    expect(h.engine.setAutopilotInterval(5)).toBe(10)
+    expect(h.engine.snapshot().autopilot.intervalSec).toBe(10)
+    expect(h.clock.pendingCount).toBe(1)
+    expect(h.engine.setAutopilotInterval(999)).toBe(60)
+    expect(h.engine.snapshot().autopilot.intervalSec).toBe(60)
+
+    h.engine.setAutopilot(false)
+    expect(h.engine.snapshot().autopilot.enabled).toBe(false)
+    expect(h.clock.pendingCount).toBe(0)
+  })
+
   it('runs one autopilot turn per interval and skips a busy slot', async () => {
     const resolvers: (() => void)[] = []
     let calls = 0

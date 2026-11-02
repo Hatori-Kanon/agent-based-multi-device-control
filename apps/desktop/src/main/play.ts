@@ -26,13 +26,15 @@
  * constructed here, so `bootstrap.ts` decides where the files live; absent
  * ports mean the session runs exactly as B1-T16 did and writes nothing.
  *
- * ## One process, one session
+ * ## One active session
  *
- * {@link PlayHost} holds at most one {@link PlaySession}. `start` is refused
- * while a session exists — including after `end`, because the process-level
- * contract is "one session per process" for M2. `message` and `end` are
- * refused when no session was ever opened. Every refusal is a typed
- * {@link SessionError}; the HTTP layer maps it to `400`, never `500`.
+ * {@link PlayHost} holds at most one {@link PlaySession} at a time. `start` is
+ * refused while a session is running; an `ended` session is disposed and
+ * replaced by the next `start` (the play view returns to the lobby after 结束,
+ * so the next 开局 must be able to open a fresh session in the same process).
+ * `message` and `end` are refused when no session was ever opened. Every
+ * refusal is a typed {@link SessionError}; the HTTP layer maps it to `400`,
+ * never `500`.
  *
  * ## The ceiling is human-only (D4)
  *
@@ -217,6 +219,13 @@ export interface PlaySessionEnvironment {
   readonly engineConfig?: Partial<EngineConfig>
 }
 
+/** Human-facing autopilot request: enable flag plus an optional interval. */
+export interface PlayAutopilotInput {
+  readonly enabled: boolean
+  /** Seconds; clamped by the engine into its configured bounds. */
+  readonly intervalSec?: number
+}
+
 /** `start` input: the human's pack, time budget and optional ceiling. */
 export interface PlayStartInput {
   readonly pack: LoadedPack
@@ -228,6 +237,8 @@ export interface PlayStartInput {
    * explicitly, and a missing field is never an implicit raise.
    */
   readonly ceilingPercent?: number
+  /** Human autopilot choice made in the lobby; applied after the opening turn. */
+  readonly autopilot?: PlayAutopilotInput
 }
 
 /** What `GET /api/session` returns: the engine snapshot plus the pack identity. */
@@ -264,6 +275,7 @@ export interface PlayHostStartRequest {
   readonly packId: string
   readonly plannedMinutes: number
   readonly ceilingPercent?: number
+  readonly autopilot?: PlayAutopilotInput
 }
 
 /**
@@ -376,6 +388,7 @@ export class PlaySession {
   /** Body of {@link start}; the latch is held by the caller. */
   private async openSession(input: PlayStartInput): Promise<PlaySnapshot> {
     const plannedMinutes = normalizePlannedMinutes(input.plannedMinutes)
+    const autopilot = normalizeAutopilot(input.autopilot)
     if (this.env.registry.isLocked) {
       throw new SessionError('LOCKED', 'the device registry is locked; unlock it before starting a session')
     }
@@ -523,6 +536,13 @@ export class PlaySession {
     engine.startSession()
     engine.submit({ priority: 'session', kind: OPENING_TRIGGER_KIND, at: this.env.clock.now() })
     await engine.whenIdle()
+    // Apply the lobby's autopilot choice after the opening turn: an enabled
+    // timer controls only *subsequent* P3 turns, and starting it earlier would
+    // only arm a tick that the opening turn immediately drops.
+    if (autopilot !== undefined) {
+      if (autopilot.intervalSec !== undefined) engine.setAutopilotInterval(autopilot.intervalSec)
+      engine.setAutopilot(autopilot.enabled)
+    }
     return this.requireSnapshot()
   }
 
@@ -572,6 +592,19 @@ export class PlaySession {
   async resume(): Promise<PlaySnapshot> {
     const engine = this.liveEngine()
     await engine.resume()
+    return this.requireSnapshot()
+  }
+
+  /**
+   * Human autopilot change while playing: toggle and/or set the interval.
+   *
+   * The engine clamps the interval into its configured bounds; the next
+   * snapshot carries the adopted values so the UI can re-render the slider.
+   */
+  setAutopilot(input: PlayAutopilotInput): PlaySnapshot {
+    const engine = this.liveEngine()
+    if (input.intervalSec !== undefined) engine.setAutopilotInterval(input.intervalSec)
+    engine.setAutopilot(input.enabled)
     return this.requireSnapshot()
   }
 
@@ -1014,11 +1047,13 @@ export class PlaySession {
 }
 
 /**
- * One session per process: pack lookup, the start gate and panic delegation.
+ * One *active* session per process: pack lookup, the start gate and panic
+ * delegation.
  *
- * B1-T16 exposes the engine snapshot; pause/resume/choice/transcript belong to
- * B2-T11 and plug into this class without changing the start/message/end/snapshot
- * surface.
+ * "One process, one session" still holds while a session is running; a session
+ * that has reached `ended` is closed and may be replaced by a fresh start (the
+ * play view returns to the lobby, so the next 开局 must be able to open a new
+ * one). The old session is disposed before the replacement is created.
  */
 export class PlayHost {
   private readonly options: PlayHostOptions
@@ -1031,15 +1066,24 @@ export class PlayHost {
   }
 
   /**
-   * Resolve the pack and open the only session this process will run.
+   * Resolve the pack and open a session.
    *
    * A failed start leaves the process open for a retry (for example after the
-   * operator removes the lock); the "already open" refusal applies only to a
-   * session that actually started.
+   * operator removes the lock); a still-running session refuses a second start
+   * with `SESSION_OPEN`. Only an `ended` session is reusable by replacement.
    */
   async start(request: PlayHostStartRequest): Promise<PlaySnapshot> {
-    if (this.session !== undefined || this.starting) {
-      throw new SessionError('SESSION_OPEN', 'a session is already open in this process')
+    if (this.starting) {
+      throw new SessionError('SESSION_OPEN', 'a session start is already in progress')
+    }
+    if (this.session !== undefined) {
+      if (this.session.snapshot()?.state !== 'ended') {
+        throw new SessionError('SESSION_OPEN', 'a session is already open in this process')
+      }
+      // The lobby is the next screen after 结束; dispose the finished engine so
+      // its timers/archive handle cannot leak into the replacement.
+      this.session.dispose()
+      this.session = undefined
     }
     this.starting = true
     try {
@@ -1061,6 +1105,7 @@ export class PlayHost {
           pack,
           plannedMinutes,
           ...(ceilingPercent === undefined ? {} : { ceilingPercent }),
+          ...(request.autopilot === undefined ? {} : { autopilot: request.autopilot }),
         })
       } catch (error) {
         this.session = undefined
@@ -1091,6 +1136,13 @@ export class PlayHost {
     const session = this.session
     if (session === undefined) throw new SessionError('NO_SESSION', 'no session is open')
     return await session.resume()
+  }
+
+  /** Human autopilot change; requires an open, non-terminal session. */
+  async setAutopilot(input: PlayAutopilotInput): Promise<PlaySnapshot> {
+    const session = this.session
+    if (session === undefined) throw new SessionError('NO_SESSION', 'no session is open')
+    return session.setAutopilot(input)
   }
 
   /** Pick an offered option; the session validates the id against its menu. */
@@ -1430,6 +1482,28 @@ export function openingBriefText(
     parts.push(`首个意图「${brief.firstIntent}」`)
   }
   return parts.length === 0 ? '' : `开场指引：${parts.join('，')}。`
+}
+
+/**
+ * Validate the human autopilot request.
+ *
+ * `enabled` must be a real boolean (a string "false" must not silently switch
+ * the timer on); the interval is optional, positive and finite, and the engine
+ * clamps it into its configured range. A malformed request is a caller error.
+ */
+function normalizeAutopilot(input: PlayAutopilotInput | undefined): PlayAutopilotInput | undefined {
+  if (input === undefined) return undefined
+  if (typeof input.enabled !== 'boolean') {
+    throw new SessionError('INVALID_INPUT', 'autopilot.enabled must be a boolean')
+  }
+  if (input.intervalSec !== undefined
+    && (!Number.isFinite(input.intervalSec) || input.intervalSec <= 0)) {
+    throw new SessionError('INVALID_INPUT', 'autopilot.intervalSec must be a positive number')
+  }
+  return {
+    enabled: input.enabled,
+    ...(input.intervalSec === undefined ? {} : { intervalSec: input.intervalSec }),
+  }
 }
 
 function normalizePlannedMinutes(value: number): number {

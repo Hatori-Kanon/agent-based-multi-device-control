@@ -122,4 +122,51 @@
   const initial = initialView()
   paint(initial)
   if (pathView() !== undefined) syncPath(initial)
+
+  /**
+   * 应用内确认框（替代原生 confirm 弹窗）。
+   *
+   * 返回 `Promise<boolean>`：点「确定」→ true；点「取消」、按 Esc、
+   * 浏览器不支持 `showModal`、或页面里没有对话框元素 → false（安静降级，
+   * 不向调用方抛错）。破坏性操作（结束本局 / 移除设备）走这里，脚本里
+   * 不再出现原生 confirm。
+   */
+  window.embodiedConfirm = function embodiedConfirm(message) {
+    const dialog = document.getElementById('confirmDialog')
+    const text = document.getElementById('confirmText')
+    const ok = document.getElementById('confirmOk')
+    const cancel = document.getElementById('confirmCancel')
+    if (dialog === null || text === null || ok === null || cancel === null) return Promise.resolve(false)
+    if (typeof dialog.showModal !== 'function') return Promise.resolve(false)
+    if (dialog.open) return Promise.resolve(false)
+    text.textContent = String(message)
+    dialog.returnValue = ''
+    return new Promise(resolve => {
+      let settled = false
+      const finish = value => {
+        if (settled) return
+        settled = true
+        ok.onclick = null
+        cancel.onclick = null
+        dialog.removeEventListener('close', onClose)
+        if (dialog.open) dialog.close()
+        resolve(value)
+      }
+      // Esc 走 dialog 的 close 事件，returnValue 不是 'ok' → 按取消处理。
+      const onClose = () => finish(dialog.returnValue === 'ok')
+      ok.onclick = () => {
+        dialog.returnValue = 'ok'
+        finish(true)
+      }
+      cancel.onclick = () => finish(false)
+      dialog.addEventListener('close', onClose)
+      try {
+        dialog.showModal()
+        ok.focus()
+      } catch {
+        // 已在打开状态 / 浏览器拒绝打开：按取消处理，不把异常抛给调用方。
+        finish(false)
+      }
+    })
+  }
 })()

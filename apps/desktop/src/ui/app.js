@@ -794,7 +794,7 @@
         remove.textContent = '移除'
         remove.style.color = 'var(--bad)'
         remove.addEventListener('click', async () => {
-          if (!window.confirm(`移除 ${device.name}？`)) return
+          if (!(await window.embodiedConfirm(`移除 ${device.name}？`))) return
           for (const channel of Array.isArray(device.channels) ? device.channels : []) {
             const state = levels.get(`${device.id}:${channel.id}`)
             if (state !== undefined) releaseLevel(state, false)

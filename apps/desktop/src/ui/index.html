@@ -70,6 +70,11 @@
               <input id="plannedMinutes" type="number" min="1" max="240" step="5" value="30">
               <span class="hint">分钟</span>
             </div>
+            <div class="auto-run-row">
+              <label class="auto-run-toggle"><input type="checkbox" id="autoLobbyEnabled"> 自动运行</label>
+              <input id="autoLobbyInterval" type="range" min="10" max="60" step="1" value="20" aria-label="自动运行间隔（秒）">
+              <span class="auto-run-value" id="autoLobbyValue">20s</span>
+            </div>
             <button class="btn btn-accent btn-lg btn-block" id="start" type="button">开局</button>
           </section>
 
@@ -119,6 +124,15 @@
               <dt>时间</dt><dd>—</dd>
               <dt>内容包</dt><dd>—</dd>
             </dl>
+          </section>
+
+          <section class="card">
+            <h2 class="card-title">自动运行</h2>
+            <div class="auto-run-row">
+              <label class="auto-run-toggle"><input type="checkbox" id="autoRunEnabled"> 自动运行</label>
+              <input id="autoRunInterval" type="range" min="10" max="60" step="1" value="20" aria-label="自动运行间隔（秒）">
+              <span class="auto-run-value" id="autoRunValue">20s</span>
+            </div>
           </section>
 
           <section class="card">
@@ -242,6 +256,14 @@
 </div>
 
 <div class="toast" id="err" role="status" aria-live="polite"></div>
+
+<dialog class="confirm-dialog" id="confirmDialog" aria-labelledby="confirmText">
+  <p id="confirmText"></p>
+  <div class="modal-actions">
+    <button class="btn btn-ghost" id="confirmCancel" type="button">取消</button>
+    <button class="btn btn-accent" id="confirmOk" type="button">确定</button>
+  </div>
+</dialog>
 
 <div class="hold-overlay" id="holdOverlay" aria-hidden="true">
   <div class="hold-card">

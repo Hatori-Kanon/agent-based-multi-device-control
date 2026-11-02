@@ -160,6 +160,13 @@ export interface EngineSnapshot {
   readonly checkpoint: number | undefined
   /** True from the 90% checkpoint on: the next turn must produce a closing plan. */
   readonly mustResolve: boolean
+  /** Human-facing autopilot state: enabled flag, adopted interval and its bounds. */
+  readonly autopilot: {
+    readonly enabled: boolean
+    readonly intervalSec: number
+    readonly minSec: number
+    readonly maxSec: number
+  }
 }
 
 /**
@@ -328,6 +335,24 @@ export class TurnEngine {
     return this.intervalSec
   }
 
+  /**
+   * Change the adopted autopilot interval (human setting, seconds).
+   *
+   * Clamped into `[autopilot.minSec, autopilot.maxSec]`; an armed timer is
+   * re-armed so the new gap applies from now, not after the old tick. The
+   * engine still adopts a plan's `nextTurnAfterSec` afterwards (that is the
+   * model's pacing suggestion), so a host slider is a starting point rather
+   * than a lock. Returns the clamped value.
+   */
+  setAutopilotInterval(seconds: number): number {
+    const next = this.clampAutopilotSec(seconds)
+    if (next === this.intervalSec) return next
+    this.intervalSec = next
+    if (this.autopilotOn) this.scheduleAutopilotTick()
+    this.publishPacing()
+    return next
+  }
+
   /** Highest time checkpoint reached so far (`0.5` / `0.8` / `0.9`), if any. */
   get checkpoint(): number | undefined {
     return this.lastCheckpoint
@@ -418,6 +443,12 @@ export class TurnEngine {
       outcome: this.lastOutcome,
       checkpoint: this.lastCheckpoint,
       mustResolve: this.mustResolveFlag,
+      autopilot: {
+        enabled: this.autopilotOn,
+        intervalSec: this.intervalSec,
+        minSec: this.config.autopilot.minSec,
+        maxSec: this.config.autopilot.maxSec,
+      },
     }
   }
 

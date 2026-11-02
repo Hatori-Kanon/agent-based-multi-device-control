@@ -2231,3 +2231,76 @@ input.region-input:focus {
 .settings-warning[hidden] {
   display: none;
 }
+
+/* ── 17. 自动运行与确认弹窗 ─────────────────────────────────────────────── */
+
+/* 自动运行：勾选 + 间隔滑杆 + 秒数读值，大厅开局卡与舞台右轨共用。 */
+.auto-run-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  min-width: 0;
+}
+
+.auto-run-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.auto-run-row input[type="range"] {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.auto-run-value {
+  flex: none;
+  min-width: 32px;
+  font-size: 11.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* 应用内确认弹窗：替代 window.confirm，沿用卡片 token 与顶部图层。 */
+.confirm-dialog {
+  max-width: min(92vw, 420px);
+  padding: 20px 22px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: var(--shadow-pop);
+}
+
+.confirm-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.55);
+}
+
+#confirmText {
+  margin: 0 0 16px;
+  font-size: 14px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.confirm-dialog .modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* 窄屏：自动运行行允许换行，滑杆独占一行，避免挤出卡片。 */
+@media (max-width: 760px) {
+  .auto-run-row {
+    flex-wrap: wrap;
+  }
+
+  .auto-run-row input[type="range"] {
+    flex: 1 1 100%;
+  }
+}
