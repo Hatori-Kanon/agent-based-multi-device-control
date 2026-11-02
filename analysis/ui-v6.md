@@ -9,8 +9,8 @@
 
 ## 1. 决策
 
-- **玩家自由命名是主词表**：每个通道一个文本输入；输入与包内 `label`/`id` 完全一致（trim、
-  ASCII 大小写不敏感）时提交包 id，保留作者推荐/意图/写作语义；否则提交输入原文，作为会话
+- **玩家自由命名是主词表**：每个通道一个文本输入；输入与包内 `label`/`id` 完全一致（NFC、trim、
+  Unicode 大小写折叠）时提交包 id，保留作者推荐/意图/写作语义；否则提交输入原文，作为会话
   自定义部位 key。
 - **内容包 `regions` 保留为推荐**：作者仍可给 3–5 个推荐（手/肩背/全身），它们既是玩家的
   datalist 建议，也是意图默认与写作参考；整段可省略或 `[]`。
@@ -38,9 +38,9 @@
 
 ### 3.1 core
 
-- `devices/regions.ts`：`RegionStore` 的 region key 从 slug 放宽为 **trim 后 1–64 个可打印字符**
-  （拒绝控制字符/空/超长）；`setByHuman`/`restore`/manifest defaults 都存储 trim 后的值，审计
-  `previous/next` 也用同一个值。旧 slug 仍合法；同名文本 = 同一 region。
+- `devices/regions.ts`：`RegionStore` 的 region key 从 slug 放宽为 **NFC 归一后 trim、1–64 个可见字符**
+  （拒绝 C0/C1/Cf/Cs 控制/格式/代理字符、U+2028/U+2029、以及会破坏提示词菜单的 `;`/`；`/`=`）；
+  `setByHuman`/`restore`/manifest defaults 都存储归一后的值。旧 slug 仍合法；同名文本 = 同一 region。
 - `scenario/validate.ts`：`regions` 缺失 → warning（不再 error）；存在但非数组 → error；
   `[]` → warning；意图 `regions` 仍必须引用已声明 id。
 - `scenario/loader.ts`：`normalizeScenario` 把缺失/非数组 `regions` 归一为 `[]`，意图缺省
@@ -65,8 +65,8 @@
   - `<datalist>` 的 option 来自当前包推荐 `label`（空 label 回退 id），顺序保留（whole-body 最前）；
   - 空输入 = 未指定；Enter（非输入法组合）只 blur，`change` 时提交，不逐键请求；
   - 锁定时仍可编辑（部位不是安全边界）。
-- `resolveRegionInput(text)`：trim；空 → null；id 精确匹配（大小写不敏感）→ 包 id；label 匹配 →
-  包 id；否则返回 trim 后的原文。
+- `resolveRegionInput(text)`：NFC + trim；空 → null；id 精确匹配（Unicode 大小写折叠）→ 包 id；
+  label 唯一匹配 → 包 id（重复 label 歧义时回退文本）；否则返回归一后的原文。
 - `labelForRegion(value)`：包 id 显示为包 label（编辑后归一展示）；自定义值原样显示。
 - 不再有「未指定」「已设置的部位」「内容包未声明」等选项/警告——自定义部位是合法状态。
 - 词表版本/缓存/失败重试（`packId@version`、15s 重试、404 空表、force 立即重试）保持 v5 修复。
@@ -86,8 +86,8 @@
 
 ## 5. 验证
 
-- core：52 files / **676 tests** 全过（新增 RegionStore 自由 key、scenario 可选 regions/loader 归一）；
-  `tsc --noEmit` 0 error。
+- core：52 files / **677 tests** 全过（新增 RegionStore 自由 key/NFC/控制字符/分隔符、scenario 可选
+  regions/显式 whole-body/loader 归一、玩家命名标签保留数字）；`tsc --noEmit` 0 error。
 - desktop：17 files / **211 tests** 全过（新增 play.spec「玩家命名部位进入 facts/enum」）；
   `tsc --noEmit` 0 error；main/dev-server esbuild 通过；`node --check play.js` 通过。
 - 真实浏览器（headless Chrome + dev-server + mock 设备 + kit scenario 包）：
@@ -109,16 +109,41 @@
   省略 `regions`。
 - 玩家自定义 key 会进审计与提示词；含数字的自定义 key 属于“玩家命名”而非度量泄漏（与 v5 的 id
   例外一致），仍建议不要写数值。
+- **词表未加载时的映射**：如果玩家在推荐词表到达前就输入了包内 label（如「手」），它会被当作
+  自定义 key 保存；词表到达后不会自动迁移（避免后台改写玩家数据）。重输一次即可映射；推荐词表
+  通常在页面 boot 阶段很快到达。
+- `;`/`；`/`=` 不能出现在玩家自定义 key 中（会破坏 `id=label；…` 菜单行）；包内 label 出现这些
+  字符时，facts 会用空格替代（id 不变）。
 - 内容包导入/卸载/版本切换仍无 UI；设备页仍保留独立软上限滑杆（与游玩卡同一 policy）。
 
 ## 7. 复核
 
-- **Lead 自审**：RegionStore 的 trim 在 set/restore/defaults/snapshot/audit 一致；控制字符（C0/C1/
-  U+2028/U+2029）与 64 码点上限；旧 slug 与旧 persisted 值兼容；`scenario.regions` 缺失时
-  validator/loader 一致归一为 `[]`；意图引用仍必须声明；`sessionRegions` 与 `resolveContextOf`/
-  `worldFacts`/`withPlayableEnums` 用同一并集且只收 `level` 通道；UI 的 id 优先、label 唯一匹配、
-  歧义标签回退文本、空/清空/失败回滚/乱序响应；部位输入不进入任何安全边界。
-- **真实浏览器**：见 §5；`全身/手/肩背` 推荐、自由文本「左胸」、label/id 映射、同名合并、
-  清空均验证，旧 `.region-pick/.region-warn` 为 0，无 console error。
-- **独立 adversarial review**：本轮复核回复未在本会话时限内返回；上述自审 + 真实浏览器 + 211/676
-  测试为当前证据。若后续返回问题，会在下一轮修复并更新本节。
+### 7.1 独立 adversarial review 与修复
+
+复核结论：**无 BLOCKER**；安全面（region 只影响路由、无新写路径、cap/LOCKED 不变）通过。
+已修复：
+
+| # | 级别 | 问题 | 修复 |
+| --- | --- | --- | --- |
+| 1 | MAJOR | `regions: []` + 意图 `regions:["whole-body"]` 被 `intent.region-undeclared` 拒绝 | validator 把 `whole-body` 视为永远合法；补 validate/loader 测试 |
+| 2 | MINOR | Cf/Cs/零宽/bidi/代理字符可进 key；无 NFC | key 改为 NFC + 拒绝 `\p{Cc}\p{Cf}\p{Cs}\u2028\u2029`；补拒绝/NFC 测试 |
+| 3 | MINOR | 自定义含数字标签被 facts 去数字（`绑带 2` → `绑带`） | `label === id`（玩家命名）跳过 digitFree；补测试 |
+| 4 | MINOR | 自定义名可注入 `；`/`=` 破坏菜单 | RegionStore 拒绝这些字符；包 label 在 facts 里降级为空格 |
+| 5 | MINOR | 词表未加载时输入包 label 被存成自定义、之后不迁移 | 已知限制（§6）：不后台改写玩家数据，重输一次即映射 |
+| 6 | MINOR | 无 Unicode NFC，组合字符形成两个 key | RegionStore/UI 均 NFC 归一；测试覆盖 |
+| 7 | MINOR | 文档漂移（kit README/error table、device doc、ASCII 表述） | 已更新 kit README/格式文档、前端设计 §11、设备说明 §9、本文件 |
+| 8 | MINOR | 缺少 whole-body/自定义数字/Cf/Cs/映射竞态测试 | 已补 whole-body、数字标签、Cf/Cs/分隔符/NFC 测试；UI 输入仍由真实浏览器验证 |
+| 9 | NIT | UI `maxlength=64` 是 UTF-16 单元、store 是码点 | 记录为已知差异（星面字符 UI 更严，不影响安全） |
+| 10 | NIT | 输入只在 change 提交，关窗可能丢未失焦编辑 | 与其它页面一致；未加 pagehide 异步 flush（fetch 可能被中断） |
+| 11 | NIT | 断开设备的自定义部位仍出现在 `可用部位` | 低优先级；`已就位部位` 已正确排除 |
+
+### 7.2 其余复核
+
+- **Lead 自审**：RegionStore NFC/trim 在 set/restore/defaults/snapshot/audit 一致；旧 slug 与旧
+  persisted 值兼容；`scenario.regions` 缺失时 validator/loader 一致归一为 `[]`，意图显式
+  whole-body 合法；`sessionRegions` 与 `resolveContextOf`/`worldFacts`/`withPlayableEnums` 用同一
+  并集且只收 `level` 通道；UI id 优先、label 唯一匹配、歧义回退文本、空/清空/失败回滚/乱序响应；
+  部位输入不进入任何安全边界。
+- **真实浏览器**：见 §5；推荐 `全身/手/肩背`、自由文本「左胸」、label/id 映射、同名合并、清空
+  均验证，旧 `.region-pick/.region-warn` 为 0，无 console error。
+- 仍未覆盖：真实 LLM key 下的 plan 合法率、真实郊狼硬件、Electron 真机（既有的人工验收项）。

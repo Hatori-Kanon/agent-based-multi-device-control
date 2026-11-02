@@ -23,6 +23,13 @@
 import type { PackManifest, ScenarioDefinition } from './loader.ts'
 import { isValidVersion, satisfiesVersion } from './semver.ts'
 
+/**
+ * The resolver's wildcard region. Duplicated as a literal (instead of importing
+ * `beat-plan.ts`) to keep this pure validator free of that module's cycle with
+ * `intents.ts`; it must stay equal to `WHOLE_BODY_REGION`.
+ */
+const WHOLE_BODY_REGION = 'whole-body'
+
 export type ValidationSeverity = 'error' | 'warning'
 
 export interface ValidationIssue {
@@ -679,7 +686,11 @@ function validateScenario(ctx: Context, scenario: ScenarioDefinition): { readonl
           error(ctx, file, `${base}.regions`, 'scenario.intents', '"regions" must be an array of region ids')
         } else {
           for (const region of regions) {
-            if (!regionIds.has(region)) {
+            // `whole-body` is the resolver's reserved wildcard and is legal for
+            // every pack, whether or not it appears in `regions` (v6 makes the
+            // recommendation list optional, so requiring an explicit entry
+            // would make `regions: []` + `whole-body` intents unrepresentable).
+            if (region !== WHOLE_BODY_REGION && !regionIds.has(region)) {
               // S15 ladder step 1: undeclared region is refused, not degraded.
               error(ctx, file, `${base}.regions`, 'intent.region-undeclared', `intent "${id ?? base}" references undeclared region "${region}" (S15)`)
             }

@@ -116,7 +116,7 @@ freeform 不需要 `scenario.json`；引擎会自动给一个「自由沙盒」�
 
 在 freeform 的基础上再加：
 
-- `scenario.json`：`session` / `regions` / `phases` / `feedbackIntents`。
+- `scenario.json`：`session` / `phases` / `feedbackIntents`，以及**可选**的 `regions`（作者推荐部位）。
 - `phases/<阶段id>.md`：每个阶段的写作提示（只有当前阶段那篇会注入；缺失只用 goal+警告）。
 - `waveforms/*.json`：包内波形资产（可选；`suggest.waveform` 用裸 id 或 `builtin:<id>` 引用）。
 - `pack.json#mode` 改成 `"scenario"`。

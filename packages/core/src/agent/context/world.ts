@@ -83,7 +83,13 @@ const DIGIT_RUN = /\p{Nd}+/gu
 /** Strip decimal digits and collapse whitespace in generated prose. */
 function digitFree(text: string | undefined): string {
   if (text === undefined) return ''
-  return text.replace(DIGIT_RUN, '').replace(/\s+/gu, ' ').trim()
+  // `；`/`=` are the menu delimiters; a pack label/meaning carrying one would
+  // make the `id=label；…` line ambiguous, so they degrade to spaces too.
+  return text
+    .replace(DIGIT_RUN, '')
+    .replace(/[;；=]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim()
 }
 
 /** A pack intent after trimming, dedupe and digit removal. */
@@ -131,7 +137,11 @@ function normalizeRegions(regions: readonly WorldFactsRegion[]): NormalizedRegio
     const id = region.id.trim()
     if (id === '' || seen.has(id)) continue
     seen.add(id)
-    const label = digitFree(region.label)
+    // A player-authored part (the host passes `label === id`) must reach the
+    // model exactly as the player wrote it, including digits: stripping them
+    // would show a name the player never chose. Pack-authored labels are prose
+    // and stay digit-free.
+    const label = region.label === region.id ? region.id : digitFree(region.label)
     // Same fallback rule as an intent meaning; the id exception is documented
     // on the module because a digit-bearing id would otherwise be renamed.
     out.push({ id, label: label === '' ? id : label })

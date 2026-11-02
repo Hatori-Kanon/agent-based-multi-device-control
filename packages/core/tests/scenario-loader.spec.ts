@@ -282,7 +282,7 @@ describe('content-pack loader', () => {
     const scenario = JSON.parse(JSON.stringify(SCENARIO_JSON)) as Record<string, unknown>
     delete scenario['regions']
     scenario['feedbackIntents'] = [
-      { id: 'probe-touch', meaning: '短促试探' },
+      { id: 'probe-touch', meaning: '短促试探', regions: ['whole-body'] },
       { id: 'soothe', meaning: '安抚' },
     ]
     files['scenario.json'] = JSON.stringify(scenario)

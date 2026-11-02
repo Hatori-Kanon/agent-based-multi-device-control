@@ -668,15 +668,17 @@
    * 空输入返回 null（清空部位）。
    */
   function resolveRegionInput(text) {
-    const trimmed = typeof text === 'string' ? text.trim() : ''
+    // Match the host's NFC normalization so a decomposed label still maps to
+    // the pack id (and the stored custom key is the composed spelling).
+    const trimmed = typeof text === 'string' ? text.normalize('NFC').trim() : ''
     if (trimmed === '') return null
     const vocabulary = Array.isArray(regionVocabulary) ? regionVocabulary : []
     const folded = trimmed.toLowerCase()
-    const byId = vocabulary.find(entry => entry.id.toLowerCase() === folded)
+    const byId = vocabulary.find(entry => entry.id.normalize('NFC').toLowerCase() === folded)
     if (byId !== undefined) return byId.id
     // Labels are not guaranteed unique (only ids are); an ambiguous label must
     // not silently pick one pack region, so fall back to the player's text.
-    const byLabel = vocabulary.filter(entry => entry.label.toLowerCase() === folded)
+    const byLabel = vocabulary.filter(entry => entry.label.normalize('NFC').toLowerCase() === folded)
     if (byLabel.length === 1) return byLabel[0].id
     return trimmed
   }

@@ -260,14 +260,22 @@ describe('the region map persists and every human change is audited', () => {
       detail: { deviceId: 'toy', channelId: 'a', previous: null, next: '左胸' },
     })
 
-    // The shape guard only rejects unusable keys: control characters, blank,
-    // or over-long text. The refusal is still audited.
+    // The shape guard only rejects unusable keys: control/format/surrogate
+    // characters, blank, menu delimiters, or over-long text. Each refusal is
+    // audited.
     await expect(h.registry.setRegionByHuman('toy', 'a', 'bad\nname')).rejects.toBeInstanceOf(SafetyError)
     await expect(h.registry.setRegionByHuman('toy', 'a', '   ')).rejects.toBeInstanceOf(SafetyError)
+    await expect(h.registry.setRegionByHuman('toy', 'a', 'a\u200Bb')).rejects.toBeInstanceOf(SafetyError)
+    await expect(h.registry.setRegionByHuman('toy', 'a', 'a\uD800b')).rejects.toBeInstanceOf(SafetyError)
+    await expect(h.registry.setRegionByHuman('toy', 'a', 'a；b')).rejects.toBeInstanceOf(SafetyError)
     await expect(h.registry.setRegionByHuman('toy', 'a', 'x'.repeat(65))).rejects.toBeInstanceOf(SafetyError)
     expect(h.records().at(-1)).toMatchObject({ action: 'region_change', result: 'rejected' })
     // The last good value is untouched by the rejected writes.
     expect(snapshotChannel(h.registry.snapshot(), 'toy', 'a').region).toBe('左胸')
+
+    // NFC: decomposed and composed spellings collapse to one key.
+    await h.registry.setRegionByHuman('toy', 'a', 'e\u0301')
+    expect(snapshotChannel(h.registry.snapshot(), 'toy', 'a').region).toBe('é')
 
     // An unknown channel is refused the same way instead of inventing a label.
     await expect(h.registry.setRegionByHuman('toy', 'zz', 'chest')).rejects.toBeInstanceOf(SafetyError)

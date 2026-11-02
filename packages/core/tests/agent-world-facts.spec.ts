@@ -107,6 +107,18 @@ describe('world facts projection', () => {
     expect(lines.join('\n')).toContain('sensation2=触及')
   })
 
+  it('keeps player-authored part labels verbatim, including digits', () => {
+    // The host passes custom regions with label === id; they are the player's
+    // own words, so the "no numbers" prose rule must not rename them.
+    const lines = buildWorldFacts({
+      intents: [{ id: 'probe-touch', meaning: '短促试探' }],
+      regions: [{ id: '绑带 2', label: '绑带 2' }],
+      channels: [{ region: '绑带 2', ready: true }],
+    })
+    expect(lines[1]).toContain('绑带 2=绑带 2')
+    expect(lines[2]).toBe('已就位部位：绑带 2')
+  })
+
   it('drops the readiness line before truncating the remaining text', () => {
     const input: WorldFactsInput = {
       intents: [

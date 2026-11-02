@@ -39,15 +39,21 @@ import { SafetyError } from './errors.ts'
  * namespace so an exact name/id match can map a player label onto the pack's
  * recommendation (the console does that mapping; this store only owns shape).
  *
- * Constraints are about safety of the key, not style: trimmed, non-empty, at
- * most {@link REGION_KEY_MAX_CODE_POINTS} code points, and no control
- * characters (the resolver and audit lines must stay readable). `Chest` and
- * `chest` are now allowed to be distinct player labels; the UI does the
- * case-insensitive suggestion match before submitting.
+ * Constraints are about safety of the key, not style: NFC-normalized, trimmed,
+ * non-empty, at most {@link REGION_KEY_MAX_CODE_POINTS} code points, no control/
+ * format/surrogate characters, and no `;`/`=` (the model menu delimiters).
+ * `Chest` and `chest` are now allowed to be distinct player labels; the UI does
+ * the case-insensitive suggestion match before submitting.
  */
 const REGION_KEY_MAX_CODE_POINTS = 64
-/** C0/C1 controls plus the Unicode line/paragraph separators. */
-const CONTROL_CHARS = /[\p{Cc}\u2028\u2029]/u
+/** C0/C1/Cf/Cs controls plus the Unicode line/paragraph separators. */
+const CONTROL_CHARS = /[\p{Cc}\p{Cf}\p{Cs}\u2028\u2029]/u
+/**
+ * Characters that would make the model-facing `id=label；…` menu ambiguous
+ * (`buildWorldFacts` joins entries with `；` and `=`). Pack labels are trusted
+ * content; player-authored region keys reject them here.
+ */
+const MENU_DELIMITERS = /[;；=]/u
 
 /** The NUL separator used by `PolicyStore`; a channel id must not carry it. */
 const NUL = '\u0000'
@@ -246,12 +252,15 @@ function assertRegionId(value: unknown, where: string): string {
   if (typeof value !== 'string') {
     throw new SafetyError('INVALID_POLICY', `region key (${where}) must be a non-empty string`)
   }
-  const trimmed = value.trim()
+  const trimmed = value.normalize('NFC').trim()
   const codePoints = Array.from(trimmed).length
-  if (trimmed === '' || codePoints > REGION_KEY_MAX_CODE_POINTS || CONTROL_CHARS.test(trimmed)) {
+  if (trimmed === ''
+    || codePoints > REGION_KEY_MAX_CODE_POINTS
+    || CONTROL_CHARS.test(trimmed)
+    || MENU_DELIMITERS.test(trimmed)) {
     throw new SafetyError(
       'INVALID_POLICY',
-      `region key '${trimmed}' (${where}) must be 1-${REGION_KEY_MAX_CODE_POINTS} printable characters`,
+      `region key '${trimmed}' (${where}) must be 1-${REGION_KEY_MAX_CODE_POINTS} visible characters without ';' or '='`,
     )
   }
   return trimmed

@@ -64,7 +64,8 @@ describe('content-pack validation', () => {
     const bare = scenario({
       regions: undefined,
       feedbackIntents: [
-        { id: 'probe-touch', meaning: '短促试探' },
+        // `whole-body` is legal without a declared regions list.
+        { id: 'probe-touch', meaning: '短促试探', regions: ['whole-body'] },
         { id: 'soothe', meaning: '安抚' },
       ],
     })
