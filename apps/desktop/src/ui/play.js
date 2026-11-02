@@ -3,16 +3,19 @@
 // 请求头里 —— 不落本地存储、不写 DOM 文本、不进日志。
 //
 // 可见性规则（`导演与写作上下文契约.md`）：本视图只渲染玩家能看见的内容 ——
-// 台词、选项、阶段、时间。v3 的「软上限」是人类自己持有的边界，所以按
-// `设备范围与单窗口界面-设计说明.md` §3.3 在大厅与右轨直接可见、可改。
+// 台词、选项、阶段、时间。v5 把「部位」并入「软上限」：大厅的 #softCapsLobby
+// 与舞台右轨的 #devices 用同一个渲染器，每台设备一张卡、每个通道一块 ——
+// 部位选择 + 强度范围 + 频率范围放在一起（`设备范围与单窗口界面-设计说明.md`
+// §3.3）。部位词表来自当前内容包（GET /api/packs/regions），只显示内容包
+// 作者写的 label，提交的是稳定 id。
 // 强度按通道的原生单位显示（Coyote 0-200，其它 0-100%），频率显示物理 Hz；
 // 单位元数据由宿主快照给出，缺强度元数据时按百分比降级，读不到 Hz 则该行
 // 显示「—」并禁用。
 //
-// 轮询 2Hz：会话与台词每 500ms，设备/部位与软上限每 2s，内容包每 30s。设备/
-// 设置视图打开时（document.body.dataset.view !== 'play'）本视图停止轮询；切回时
-// `viewchange` 监听器立即刷新一次。所有失败都在页面上显示可读错误，不往
-// console 裸奔。
+// 轮询 2Hz：会话与台词每 500ms，设备/部位/软上限每 2s，内容包每 30s；部位
+// 词表只随内容包变化单独拉取，不进 500ms 轮询。设备/设置视图打开时
+// （document.body.dataset.view !== 'play'）本视图停止轮询；切回时 `viewchange`
+// 监听器立即刷新一次。所有失败都在页面上显示可读错误，不往 console 裸奔。
 
 (() => {
   const token = new URLSearchParams(location.search).get('token') ?? ''
@@ -49,7 +52,6 @@
     status: document.getElementById('status'),
     devices: document.getElementById('devices'),
     softCapsLobby: document.getElementById('softCapsLobby'),
-    softCapsRail: document.getElementById('softCapsRail'),
     holdOverlay: document.getElementById('holdOverlay'),
     holdFill: document.getElementById('holdFill'),
   }
@@ -61,6 +63,12 @@
   let snapshot = null
   /** Region labels keyed `device:channel` (`GET /api/region`). */
   let regions = {}
+  /** 当前内容包声明的部位词表；`null` = 还没加载（picker 只给「未指定」）。 */
+  let regionVocabulary = null
+  /** 词表对应的内容包 id；与设置用的包不同就重新拉。 */
+  let vocabularyPackId = ''
+  /** 词表请求进行中的包 id；`null` = 空闲（避免轮询重复发请求）。 */
+  let vocabularyLoading = null
   /** Newest settled assistant turn already appended to the feed. */
   let lastTurnId = 0
   /** Newest `at` already seen; sent back as `?since=` (forward compatible). */
@@ -76,7 +84,6 @@
   // 渲染签名：只有内容变了才重建 DOM（也避免轮询把输入框从光标下拿走）。
   // 初值用哨兵而不是空串，否则“列表清空”与“从未加载”无法区分。
   let choiceSignature = '\u0000init'
-  let deviceSignature = ''
   let packSignature = '\u0000init'
   /** A player action (start/message/choice/control) is in flight. */
   let busy = false
@@ -237,6 +244,11 @@
     sessionId = nextId
     session = next
     renderSession()
+    // 会话的包决定部位词表；与已加载的包不同就换词表。
+    const sessionPackId = typeof next.packId === 'string' ? next.packId : ''
+    if (sessionPackId !== '' && sessionPackId !== vocabularyPackId) {
+      void refreshVocabulary(sessionPackId)
+    }
   }
 
   function applyNoSession() {
@@ -246,6 +258,8 @@
       resetStream()
     }
     renderSession()
+    // 回到大厅：设置用的包变回下拉框的选择，词表不一致就换回来。
+    if (currentSetupPackId() !== vocabularyPackId) void refreshVocabulary()
   }
 
   function renderSession() {
@@ -470,93 +484,229 @@
     }))
   }
 
-  // ── 设备 / 部位 ─────────────────────────────────────────────────────────
-  function deviceSignatureOf(snap, regionMap) {
+  // ── 设备 / 部位 / 软上限（同一张卡） ───────────────────────────────────
+  // 大厅的 #softCapsLobby 与舞台右轨的 #devices 用同一个渲染器：每台设备一张
+  // 卡，卡里按通道分段，每段一行「部位」选择 + 强度范围 + 频率范围。数据来自
+  // /api/snapshot；部位词表来自 /api/packs/regions，部位修改走 /api/region，
+  // 边界修改走 /api/cap —— 只有人类能改这些（D4 不变）。
+  /** 每个挂载点各自的重绘签名；大厅与右轨互不影响。 */
+  const setupSignatures = new Map()
+
+  function setupMounts() {
+    return [el.softCapsLobby, el.devices].filter(mount => mount !== null)
+  }
+
+  /** 部位存储键，与 /api/region 返回的 regions 字段一致。 */
+  function regionKey(deviceId, channelId) {
+    return `${deviceId}:${channelId}`
+  }
+
+  /** 词表里是否有这个部位 id；加载完成前 `regionVocabulary` 为 null。 */
+  function vocabularyHas(id) {
+    return Array.isArray(regionVocabulary) && regionVocabulary.some(entry => entry.id === id)
+  }
+
+  /**
+   * 合并卡的渲染签名。
+   *
+   * 只要设备/通道/部位/边界/词表/锁定有一处变化就重建；两个挂载点各自记住
+   * 自己的签名，互不牵连。
+   */
+  function setupSignatureOf(snap) {
     if (snap === null || !Array.isArray(snap.devices)) return 'none'
     return JSON.stringify({
       locked: snap.locked === true,
+      vocabularyPackId,
+      vocabulary: Array.isArray(regionVocabulary)
+        ? regionVocabulary.map(entry => [entry.id, entry.label])
+        : null,
       devices: snap.devices.map(device => ({
         id: device.id,
         name: device.name,
         lifecycle: device.lifecycle,
-        channels: (Array.isArray(device.channels) ? device.channels : []).map(channel => ({
-          id: channel.id,
-          label: channel.label,
-          region: channel.region ?? regionMap[`${device.id}:${channel.id}`] ?? null,
-        })),
+        channels: (Array.isArray(device.channels) ? device.channels : []).map(channel => {
+          const caps = capsOf(channel)
+          return {
+            id: channel.id,
+            label: channel.label,
+            kind: channel.kind,
+            supportsWaveform: channel.supportsWaveform === true,
+            region: channel.region ?? regions[regionKey(device.id, channel.id)] ?? null,
+            minPercent: caps.minPercent,
+            maxPercent: caps.maxPercent,
+            minFreqHz: caps.minFreqHz,
+            maxFreqHz: caps.maxFreqHz,
+            intensityUnit: caps.intensityUnit,
+            intensityMax: caps.intensityMax,
+          }
+        }),
       })),
     })
   }
 
-  function renderDevices() {
-    const snap = snapshot
-    if (snap === null || !Array.isArray(snap.devices) || snap.devices.length === 0) {
-      el.devices.replaceChildren(hintNode('还没有设备'))
+  function renderSetup() {
+    const mounts = setupMounts()
+    if (mounts.length === 0) return
+    const signature = setupSignatureOf(snapshot)
+    const active = document.activeElement
+    for (const mount of mounts) {
+      if (setupSignatures.get(mount) === signature) continue
+      // 正在这个容器里编辑（拖滑杆/选部位）时不要重建；失焦或下一轮轮询再补。
+      if (active !== null && mount.contains(active)
+        && (active.tagName === 'INPUT' || active.tagName === 'SELECT')) continue
+      setupSignatures.set(mount, signature)
+      mount.replaceChildren(...setupNodes(snapshot))
+    }
+  }
+
+  function setupNodes(snap) {
+    if (snap === null) return [hintNode('正在读取…')]
+    const devices = Array.isArray(snap.devices) ? snap.devices : []
+    if (devices.length === 0) return [hintNode('还没有设备')]
+    const nodes = []
+    for (const device of devices) {
+      const channels = Array.isArray(device.channels) ? device.channels : []
+      // 一台设备一张卡，卡里再按通道分段：重复设备名读起来像列表被复制了两遍。
+      if (channels.length > 0) nodes.push(setupCard(device, channels, snap.locked === true))
+    }
+    if (nodes.length === 0) return [hintNode('还没有通道')]
+    return nodes
+  }
+
+  function setupCard(device, channels, locked) {
+    const card = document.createElement('div')
+    card.className = 'soft-cap'
+    const head = document.createElement('div')
+    head.className = 'soft-cap-head'
+    const name = document.createElement('span')
+    name.className = 'soft-cap-name'
+    name.textContent = device.name ?? device.id ?? '设备'
+    const state = document.createElement('span')
+    const lifecycle = typeof device.lifecycle === 'string' ? device.lifecycle : ''
+    state.className = lifecycle === '' ? 'soft-cap-state' : `soft-cap-state ${lifecycle}`
+    state.textContent = LIFECYCLE_TEXT[device.lifecycle] ?? String(device.lifecycle ?? '—')
+    head.append(name, state)
+    card.append(head)
+    for (const channel of channels) card.append(setupChannel(device, channel, locked))
+    return card
+  }
+
+  /** 一个通道块：部位选择 + 强度范围 +（波形通道）频率范围。 */
+  function setupChannel(device, channel, locked) {
+    const block = document.createElement('div')
+    block.className = 'soft-cap-channel'
+    const head = document.createElement('div')
+    head.className = 'soft-cap-channel-head'
+    const tag = document.createElement('span')
+    tag.className = 'tag'
+    tag.textContent = channel.label ?? channel.id ?? '通道'
+    head.append(tag)
+
+    const deviceName = device.name ?? device.id ?? '设备'
+    const channelName = channel.label ?? channel.id ?? '通道'
+    const current = currentRegionOf(device.id, channel)
+    const pick = regionPicker(device.id, channel.id, deviceName, channelName, current)
+    pick.addEventListener('change', () => { void applyRegion(device, channel, pick, head) })
+    head.append(pick)
+    if (regionNeedsWarning(current)) head.append(regionWarningNode())
+    block.append(head)
+
+    const caps = capsOf(channel)
+    const names = { device: deviceName, channel: channelName }
+    block.append(softCapRow(device.id, channel.id, 'intensity', caps, locked, names))
+    // 频率范围只有波形通道（郊狼）才有意义；其它后端的滑杆不生效，不显示。
+    if (channel.supportsWaveform === true) {
+      block.append(softCapRow(device.id, channel.id, 'frequency', caps, locked, names))
+    }
+    return block
+  }
+
+  /** 通道当前的部位值；快照值优先，其次是人类设置的 regions 映射。 */
+  function currentRegionOf(deviceId, channel) {
+    const stored = channel.region ?? regions[regionKey(deviceId, channel.id)]
+    return typeof stored === 'string' ? stored : ''
+  }
+
+  /** 部位不是词表里的 id（旧包/后端声明的值）时提示，但别把原始 id 露给玩家。 */
+  function regionNeedsWarning(value) {
+    if (!Array.isArray(regionVocabulary)) return false
+    return value !== '' && !vocabularyHas(value)
+  }
+
+  function regionWarningNode() {
+    const warn = document.createElement('span')
+    warn.className = 'region-warn'
+    warn.textContent = '内容包未声明'
+    return warn
+  }
+
+  /** 部位下拉：词表里的 label 给玩家看，提交的是稳定 id。 */
+  function regionPicker(deviceId, channelId, deviceName, channelName, current) {
+    const pick = document.createElement('select')
+    pick.className = 'region-pick'
+    pick.setAttribute('aria-label', `${deviceName} ${channelName} 部位`)
+    const options = []
+    const none = document.createElement('option')
+    none.value = ''
+    none.textContent = '未指定'
+    options.push(none)
+    const vocabulary = Array.isArray(regionVocabulary) ? regionVocabulary : []
+    for (const entry of vocabulary) {
+      const option = document.createElement('option')
+      option.value = entry.id
+      option.textContent = entry.label
+      options.push(option)
+    }
+    // 存档里可能是旧包/后端声明的部位：给一个不带原始 id 的已选项。
+    if (current !== '' && !vocabularyHas(current)) {
+      const stale = document.createElement('option')
+      stale.value = current
+      stale.textContent = '已设置的部位'
+      options.push(stale)
+    }
+    pick.replaceChildren(...options)
+    pick.value = current
+    // 部位不是安全边界：锁定时仍可编辑（后端接受）。
+    return pick
+  }
+
+  /** 就地同步部位下拉旁边的「内容包未声明」提示。 */
+  function updateRegionWarning(head, value) {
+    const existing = head.querySelector('.region-warn')
+    if (regionNeedsWarning(value)) {
+      if (existing === null) head.append(regionWarningNode())
       return
     }
-    el.devices.replaceChildren(...snap.devices.map(device => {
-      const card = document.createElement('div')
-      card.className = 'device-card'
-      const head = document.createElement('div')
-      head.className = 'device-head'
-      const name = document.createElement('span')
-      name.className = 'name'
-      name.textContent = device.name ?? device.id
-      const life = document.createElement('span')
-      const lifecycle = typeof device.lifecycle === 'string' ? device.lifecycle : ''
-      life.className = lifecycle === '' ? 'life' : `life ${lifecycle}`
-      life.textContent = LIFECYCLE_TEXT[device.lifecycle] ?? String(device.lifecycle ?? '—')
-      head.append(name, life)
-      card.append(head)
-
-      const channels = Array.isArray(device.channels) ? device.channels : []
-      if (channels.length === 0) {
-        card.append(hintNode('无可用通道'))
-        return card
-      }
-      for (const channel of channels) card.append(regionRow(device.id, channel))
-      return card
-    }))
+    if (existing !== null) existing.remove()
   }
 
-  function regionRow(deviceId, channel) {
-    const row = document.createElement('div')
-    row.className = 'region-row'
-    const label = document.createElement('label')
-    label.className = 'label'
-    label.textContent = channel.label ?? channel.id ?? '通道'
-    const input = document.createElement('input')
-    input.type = 'text'
-    input.value = channel.region ?? regions[`${deviceId}:${channel.id}`] ?? ''
-    input.placeholder = '部位'
-    input.addEventListener('change', () => { void applyRegion(deviceId, channel.id, input) })
-    input.addEventListener('keydown', event => {
-      if (event.isComposing || event.keyCode === 229) return
-      if (event.key === 'Enter') {
-        event.preventDefault()
-        input.blur()
-      }
-    })
-    label.append(input)
-    row.append(label)
-    return row
-  }
-
-  async function applyRegion(deviceId, channelId, input) {
-    const value = input.value.trim()
+  async function applyRegion(device, channel, pick, head) {
+    const deviceId = device.id
+    const channelId = channel.id
+    const key = regionKey(deviceId, channelId)
+    const wanted = pick.value === '' ? null : pick.value
     try {
       const body = await api('/api/region', {
         method: 'POST',
-        body: JSON.stringify({ deviceId, channelId, region: value === '' ? null : value }),
+        body: JSON.stringify({ deviceId, channelId, region: wanted }),
       })
+      clearError('region')
       if (body !== null && typeof body === 'object' && body.regions !== null && typeof body.regions === 'object') {
         regions = body.regions
       }
-      input.value = regions[`${deviceId}:${channelId}`] ?? ''
+      const applied = regions[key] ?? ''
+      // 快照要等下一轮才更新；先把本地这份的 region 改成服务端生效值，避免
+      // 「失焦后立刻重画」把刚选的部位画回旧值。
+      channel.region = applied === '' ? undefined : applied
+      pick.value = applied
+      updateRegionWarning(head, applied)
       // 让下一次快照轮询重画（被跳过的这次渲染不算数）。
-      deviceSignature = ''
+      setupSignatures.clear()
+      if (document.activeElement !== pick) renderSetup()
     } catch (error) {
       noteError('region', `修改部位失败：${describe(error)}`)
+      pick.value = regions[key] ?? ''
+      updateRegionWarning(head, pick.value)
     }
   }
 
@@ -576,8 +726,6 @@
   const PERCENT_MAX = 100
   /** 正在拖动/聚焦的软上限控件（key = device:channel:kind）。 */
   const capEditing = new Set()
-  /** 每个挂载点各自的重绘签名；大厅与右轨互不影响。 */
-  const capSignatures = new Map()
 
   function finite(value) {
     return typeof value === 'number' && Number.isFinite(value) ? value : undefined
@@ -635,94 +783,6 @@
       frequency: minFreqHz !== undefined && maxFreqHz !== undefined
         && minFreqHz >= MIN_FREQ_HZ && maxFreqHz <= MAX_FREQ_HZ && maxFreqHz > minFreqHz,
     }
-  }
-
-  function capSignatureOf(snap) {
-    if (snap === null || !Array.isArray(snap.devices)) return 'none'
-    return JSON.stringify({
-      locked: snap.locked === true,
-      devices: snap.devices.map(device => ({
-        id: device.id,
-        name: device.name,
-        channels: (Array.isArray(device.channels) ? device.channels : []).map(channel => {
-          const caps = capsOf(channel)
-          return [
-            channel.id,
-            channel.label,
-            caps.minPercent,
-            caps.maxPercent,
-            caps.minFreqHz,
-            caps.maxFreqHz,
-            caps.intensityUnit,
-            caps.intensityMax,
-          ]
-        }),
-      })),
-    })
-  }
-
-  function softCapMounts() {
-    return [el.softCapsLobby, el.softCapsRail].filter(mount => mount !== null)
-  }
-
-  function renderSoftCaps() {
-    const mounts = softCapMounts()
-    if (mounts.length === 0) return
-    const signature = capSignatureOf(snapshot)
-    const active = document.activeElement
-    for (const mount of mounts) {
-      if (capSignatures.get(mount) === signature) continue
-      // 正在这个容器里操作表单控件时不要重建；下一轮轮询会补上。
-      if (active !== null && mount.contains(active) && active.tagName === 'INPUT') continue
-      capSignatures.set(mount, signature)
-      mount.replaceChildren(...softCapNodes(snapshot))
-    }
-  }
-
-  function softCapNodes(snap) {
-    if (snap === null) return [hintNode('正在读取…')]
-    const devices = Array.isArray(snap.devices) ? snap.devices : []
-    if (devices.length === 0) return [hintNode('还没有设备')]
-    const nodes = []
-    for (const device of devices) {
-      const channels = Array.isArray(device.channels) ? device.channels : []
-      // 一台设备一张卡，卡里再按通道分段：重复设备名读起来像列表被复制了两遍。
-      if (channels.length > 0) nodes.push(softCapCard(device, channels, snap.locked === true))
-    }
-    if (nodes.length === 0) return [hintNode('还没有通道')]
-    return nodes
-  }
-
-  function softCapCard(device, channels, locked) {
-    const card = document.createElement('div')
-    card.className = 'soft-cap'
-    const head = document.createElement('div')
-    head.className = 'soft-cap-head'
-    const name = document.createElement('span')
-    name.className = 'soft-cap-name'
-    name.textContent = device.name ?? device.id ?? '设备'
-    head.append(name)
-    card.append(head)
-    for (const channel of channels) {
-      const block = document.createElement('div')
-      block.className = 'soft-cap-channel'
-      const label = document.createElement('span')
-      label.className = 'tag'
-      label.textContent = channel.label ?? channel.id ?? '通道'
-      block.append(label)
-      const caps = capsOf(channel)
-      const names = {
-        device: device.name ?? device.id ?? '设备',
-        channel: channel.label ?? channel.id ?? '通道',
-      }
-      block.append(softCapRow(device.id, channel.id, 'intensity', caps, locked, names))
-      // 频率范围只有波形通道（郊狼）才有意义；其它后端的滑杆不生效，不显示。
-      if (channel.supportsWaveform === true) {
-        block.append(softCapRow(device.id, channel.id, 'frequency', caps, locked, names))
-      }
-      card.append(block)
-    }
-    return card
   }
 
   function softCapRow(deviceId, channelId, kind, caps, locked, names) {
@@ -839,7 +899,7 @@
       noteError('cap', `修改软上限失败：${describe(error)}`)
       // 失败时把界面拉回服务端的真实值（本地滑杆可能已经先动了）；清掉
       // 签名才能保证即使服务端值没变也会重画。
-      capSignatures.clear()
+      setupSignatures.clear()
       await refreshSnapshot()
     }
   }
@@ -888,17 +948,11 @@
     }
   }
 
-  /** 采纳一份快照：设备/部位、软上限、锁定状态与按钮可用性一起更新。 */
+  /** 采纳一份快照：设备/部位/软上限、锁定状态与按钮可用性一起更新。 */
   function applySnapshot(snap) {
     if (snap === null || typeof snap !== 'object') return
     snapshot = snap
-    const signature = deviceSignatureOf(snapshot, regions)
-    if (signature !== deviceSignature) {
-      deviceSignature = signature
-      // 正在编辑部位时不重画，避免把输入框从光标下拿走。
-      if (!el.devices.contains(document.activeElement)) renderDevices()
-    }
-    renderSoftCaps()
+    renderSetup()
     renderLock()
     renderControls()
   }
@@ -960,6 +1014,61 @@
       el.packSelect.selectedIndex = 0
     }
     renderControls()
+    // 内容包列表/active 版本变了：同一 id 换版本也可能改 `regions`，所以这里
+    // 强制重拉词表；列表没变时上面的签名检查会提前返回，不会每 30s 重读包。
+    void refreshVocabulary(currentSetupPackId(), true)
+  }
+
+  // ── 部位词表（随内容包变化，不进 500ms 轮询） ───────────────────────────
+  /** 当前设置用的内容包：有会话时用会话的包，否则用大厅下拉框的选择。 */
+  function currentSetupPackId() {
+    if (session !== null && typeof session.packId === 'string' && session.packId !== '') {
+      return session.packId
+    }
+    const picked = el.packSelect.value
+    return typeof picked === 'string' ? picked : ''
+  }
+
+  /**
+   * 拉取当前内容包声明的部位词表。
+   *
+   * 词表只随内容包变化：同一包已加载过就跳过（`force` 除外），请求进行中也
+   * 跳过。404 = 包没装/没有 active 版本，按空词表处理，不打扰玩家；其它失败
+   * 显示可读错误并存空词表（picker 至少还能选「未指定」）。
+   */
+  async function refreshVocabulary(packId = currentSetupPackId(), force = false) {
+    const id = typeof packId === 'string' ? packId : ''
+    if (!force && regionVocabulary !== null && vocabularyPackId === id) return
+    if (vocabularyLoading !== null && vocabularyLoading === id) return
+    vocabularyLoading = id
+    let next = []
+    try {
+      if (id !== '') {
+        const body = await api(`/api/packs/regions?packId=${encodeURIComponent(id)}`)
+        const list = body !== null && typeof body === 'object' && Array.isArray(body.regions)
+          ? body.regions
+          : []
+        next = list
+          .filter(entry => entry !== null && typeof entry === 'object'
+            && typeof entry.id === 'string' && entry.id !== '')
+          .map(entry => ({
+            id: entry.id,
+            label: typeof entry.label === 'string' && entry.label !== '' ? entry.label : entry.id,
+          }))
+        clearError('vocabulary')
+      }
+    } catch (error) {
+      if (error.status === 404) clearError('vocabulary')
+      else noteError('vocabulary', `读取部位失败：${describe(error)}`)
+      next = []
+    }
+    // 期间又换了包：这次结果作废，别把旧包的词表盖上去。
+    if (vocabularyLoading !== id) return
+    vocabularyLoading = null
+    vocabularyPackId = id
+    regionVocabulary = next
+    setupSignatures.clear()
+    renderSetup()
   }
 
   /** 游玩视图是否可见；设备/设置视图打开或标签页隐藏时本视图停止高频轮询。 */
@@ -976,6 +1085,7 @@
     // viewchange handler refreshes the play view as soon as it is opened.
     await Promise.all([
       refreshPacks(),
+      refreshVocabulary(),
       ...(playVisible() ? [refreshSession(), refreshTranscript(), refreshSnapshot()] : []),
     ])
   }
@@ -1212,14 +1322,29 @@
     }
   })
 
-  el.devices.addEventListener('focusout', () => {
-    // 输入框失焦后再补一次快照，避免“编辑期间跳过的渲染”一直不补。
-    setTimeout(() => {
-      if (el.devices.contains(document.activeElement)) return
-      deviceSignature = ''
-      void refreshSnapshot()
-    }, 0)
-  })
+  el.packSelect.addEventListener('change', () => { void refreshVocabulary() })
+
+  /**
+   * 合并卡的焦点处理。
+   *
+   * 编辑期间 renderSetup 不会重建该挂载点；焦点完全离开两个挂载点后补一次
+   * 快照，并清掉签名让下一次渲染落地。
+   */
+  let setupFocusTimer
+  function attachSetupFocusOut(mount) {
+    if (mount === null) return
+    mount.addEventListener('focusout', () => {
+      if (setupFocusTimer !== undefined) clearTimeout(setupFocusTimer)
+      setupFocusTimer = setTimeout(() => {
+        setupFocusTimer = undefined
+        if (setupMounts().some(entry => entry.contains(document.activeElement))) return
+        setupSignatures.clear()
+        void refreshSnapshot()
+      }, 0)
+    })
+  }
+  attachSetupFocusOut(el.softCapsLobby)
+  attachSetupFocusOut(el.devices)
 
   window.addEventListener('keydown', event => {
     if (event.code !== 'Space' || event.repeat) return
@@ -1241,8 +1366,7 @@
   window.addEventListener('viewchange', event => {
     const view = event.detail !== undefined && event.detail !== null ? event.detail.view : undefined
     if (view !== 'play') return
-    deviceSignature = ''
-    capSignatures.clear()
+    setupSignatures.clear()
     void refreshAll()
   })
 
@@ -1262,6 +1386,8 @@
       refreshTranscript(),
       refreshSnapshot(),
     ])
+    // 开局前先拿到当前内容包的部位词表；之后只在换包时重新拉。不阻塞轮询启动。
+    void refreshVocabulary()
     window.setInterval(() => { void poll() }, POLL_MS)
   }
 

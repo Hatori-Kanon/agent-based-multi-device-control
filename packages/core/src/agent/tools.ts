@@ -19,11 +19,14 @@
  *
  * Tool schemas are plain JSON Schema objects — no SDK type, no dependency. The
  * static part deliberately carries no `intentId`/`regions` enum: those are
- * injected at runtime from the loaded pack (§4.9.2 note).
+ * injected at runtime from the loaded pack through {@link withPlayableEnums}
+ * (§4.9.2 note). That helper clones `apply_plan` before adding the enums, so
+ * one turn's playable menu can never mutate the shared static definitions.
  *
  * @module
  */
 
+import { WHOLE_BODY_REGION } from '../scenario/beat-plan.ts'
 import type { ToolDefinition } from './model.ts'
 
 /** The nine tools the model may call, in prompt order. */
@@ -356,4 +359,105 @@ export const M2_TOOL_SCHEMAS_BY_NAME: Readonly<Record<M2ToolName, ToolDefinition
  */
 export function isModelTool(name: string): name is M2ModelToolName {
   return (M2_MODEL_TOOL_NAMES as readonly string[]).includes(name)
+}
+
+/**
+ * Deep-copy a JSON-schema-shaped value, so a decorated copy can be edited
+ * without touching the static definition (schemas are plain JSON: objects,
+ * arrays, strings, numbers, booleans and null only).
+ */
+function cloneSchemaValue<T>(value: T): T {
+  if (Array.isArray(value)) return value.map(entry => cloneSchemaValue(entry)) as unknown as T
+  if (typeof value === 'object' && value !== null) {
+    const copy: Record<string, unknown> = {}
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      copy[key] = cloneSchemaValue(entry)
+    }
+    return copy as T
+  }
+  return value
+}
+
+/** Narrow a schema node, or `undefined` when the shape is not an object. */
+function asSchemaObject(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+/** Trimmed, non-empty, first occurrence wins — the enum values a provider sees. */
+function uniqueNonEmpty(values: readonly string[]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const value of values) {
+    const trimmed = value.trim()
+    if (trimmed === '' || seen.has(trimmed)) continue
+    seen.add(trimmed)
+    out.push(trimmed)
+  }
+  return out
+}
+
+/**
+ * Inject the pack's playable `intentId`/`regions` enums into `apply_plan`.
+ *
+ * The static schema advertises the *contract*; the loaded pack decides the
+ * *values*. This helper is the runtime injection point (§4.9.2): it returns a
+ * new tool list whose `apply_plan` carries
+ *
+ * - `intentId.enum` — the trimmed, deduplicated intent ids in pack order,
+ *   omitted entirely when the list is empty (an empty enum is invalid JSON
+ *   Schema and would make the tool uncallable);
+ * - `regions.items.enum` — `whole-body` first, then the declared region ids,
+ *   because the wildcard is always legal for any pack.
+ *
+ * Only `apply_plan` is decorated; every other definition is returned by
+ * reference and the input array is never modified. The `parameters` tree of
+ * `apply_plan` is deep-cloned before the enums are written, so the shared
+ * {@link M2_TOOL_SCHEMAS} objects stay byte-identical across turns.
+ *
+ * @param tools - The model-visible tool list for this turn.
+ * @param intentIds - Intent ids declared by the loaded pack.
+ * @param regionIds - Region ids declared by the loaded pack (no wildcard
+ *   required; it is added here).
+ * @returns A new array with the decorated `apply_plan`, or `tools` unchanged
+ *   when no `apply_plan` definition is present.
+ */
+export function withPlayableEnums(
+  tools: readonly ToolDefinition[],
+  intentIds: readonly string[],
+  regionIds: readonly string[],
+): readonly ToolDefinition[] {
+  const index = tools.findIndex(tool => tool.name === 'apply_plan')
+  if (index < 0) return tools
+  const original = tools[index]
+  if (original === undefined) return tools
+  const parameters = cloneSchemaValue(original.parameters)
+  const properties = asSchemaObject(parameters['properties'])
+  const beats = properties === undefined ? undefined : asSchemaObject(properties['beats'])
+  const beatItems = beats === undefined ? undefined : asSchemaObject(beats['items'])
+  const beatProperties = beatItems === undefined ? undefined : asSchemaObject(beatItems['properties'])
+  if (beatItems === undefined || beatProperties === undefined) return tools
+
+  const intentEnum = uniqueNonEmpty(intentIds)
+  if (intentEnum.length > 0) {
+    const intentId = asSchemaObject(beatProperties['intentId'])
+    if (intentId !== undefined) intentId['enum'] = intentEnum
+  }
+  // Else: leave the property enum-free rather than emitting an empty enum.
+
+  const regionsSchema = asSchemaObject(beatProperties['regions'])
+  const regionItems = regionsSchema === undefined ? undefined : asSchemaObject(regionsSchema['items'])
+  if (regionItems !== undefined) {
+    const declared = uniqueNonEmpty(regionIds).filter(id => id !== WHOLE_BODY_REGION)
+    // `whole-body` is the wildcard every pack may use, so it is always legal.
+    regionItems['enum'] = [WHOLE_BODY_REGION, ...declared]
+  }
+
+  const decorated: ToolDefinition = {
+    name: original.name,
+    description: original.description,
+    parameters,
+  }
+  return tools.map((tool, toolIndex) => (toolIndex === index ? decorated : tool))
 }

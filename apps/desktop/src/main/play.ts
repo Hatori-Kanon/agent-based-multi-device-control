@@ -58,6 +58,7 @@ import { join } from 'node:path'
 import {
   buildSystemPrompt,
   buildTurnMessages,
+  buildWorldFacts,
   ContentPackError,
   DEFAULT_INTENTS,
   loadPack,
@@ -69,6 +70,7 @@ import {
   sensorPromptBlock,
   TurnEngine,
   WHOLE_BODY_REGION,
+  withPlayableEnums,
   type AuditLog,
   type AppendOnlyStore,
   type Clock,
@@ -796,20 +798,28 @@ export class PlaySession {
     }
 
     let wrote = false
+    // Freeze the registry facts once per turn: the prompt's device/region
+    // projection and the resolver must see the same snapshot, or the model
+    // could be told a region is ready and be resolved against one that is not.
+    const snapshot = this.env.registry.snapshot()
+    const resolveContext = resolveContextOf(snapshot, scenario, this.waveformLookup)
     // Build the prompt (the opening brief, when present, is part of it), then
     // consume the brief: it belongs to the opening turn only, even if that
     // request ends in a fallback.
-    const messages = this.messagesFor(request, phases, pack)
+    const messages = this.messagesFor(request, phases, pack, snapshot)
     this.openingBrief = undefined
     const result = await runTurn({
       runner: this.modelRunnerFor(),
-      tools: M2_MODEL_TOOLS,
+      // The pack's intent menu and region vocabulary are the only legal values
+      // for `apply_plan`; injecting them keeps the static tool schema free of
+      // content while stopping the model from inventing ids (§4.9.2).
+      tools: withPlayableEnums(M2_MODEL_TOOLS, [...resolveContext.intents.keys()], resolveContext.regions),
       executor,
       input: {
         turnId: request.turnId,
         phase: phases.current,
         messages,
-        resolveContext: resolveContextOf(this.env.registry.snapshot(), scenario, this.waveformLookup),
+        resolveContext,
       },
       clock: this.env.clock,
       signal: request.signal,
@@ -924,13 +934,22 @@ export class PlaySession {
     if (this.turnBeats.length > 2) this.turnBeats.shift()
   }
 
-  /** System prompt for the current turn: boundaries → host → persona → scene → facts. */
+  /**
+   * System prompt for the current turn: boundaries → host → persona → scene → facts.
+   *
+   * The facts block carries the director-ish facts a single-call model needs to
+   * produce a valid plan at all: the pack's intent menu, the declared region
+   * ids with their player-facing labels, and which regions currently have a
+   * ready channel. The frozen device snapshot is passed in so this projection
+   * and the resolver agree within one turn.
+   */
   private messagesFor(
     request: TurnRequest,
     phases: PhaseMachine,
     pack: LoadedPack,
+    snapshot: RegistrySnapshot,
   ): readonly LlmMessage[] {
-    const system = this.systemPrompt(phases, pack)
+    const system = this.systemPrompt(phases, pack, snapshot)
     const playerText = playerTextOf(request)
     return buildTurnMessages({
       ...(system === '' ? {} : { system }),
@@ -939,7 +958,7 @@ export class PlaySession {
     })
   }
 
-  private systemPrompt(phases: PhaseMachine, pack: LoadedPack): string {
+  private systemPrompt(phases: PhaseMachine, pack: LoadedPack, snapshot: RegistrySnapshot): string {
     const note = pack.phaseNotes.get(phases.current)
     const scene = [pack.setting, note, phases.currentPhase.goal]
       .filter((part): part is string => part !== undefined && part.trim() !== '')
@@ -948,13 +967,37 @@ export class PlaySession {
     // The cross-session opening brief (B2-T8) is a first-turn brief only: the
     // pack's `metaReactions.tone/firstIntent`, never a number or a device fact.
     const opening = this.openingBrief === undefined ? '' : openingBriefText(this.openingBrief)
-    const briefs = [opening, sensor].filter(part => part !== '')
+    // World facts come first so that, if the prompt budget forces briefs to be
+    // dropped from the end, the model keeps the intent/region menu it cannot
+    // plan without; the opening and sensor briefs are the nice-to-haves.
+    const facts = this.worldFacts(snapshot)
+    const briefs = [...facts, opening, sensor].filter(part => part !== '')
     return buildSystemPrompt({
       ...(pack.manifest.boundaries === undefined ? {} : { boundaries: pack.manifest.boundaries }),
       ...(pack.host === undefined ? {} : { host: pack.host }),
       persona: pack.persona,
       ...(scene === '' ? {} : { scene }),
       ...(briefs.length === 0 ? {} : { briefs }),
+    })
+  }
+
+  /**
+   * Compact, number-free projection of what the model may act on this turn.
+   *
+   * Only `level` channels count: a plan can never drive a motion channel, so a
+   * region with only that kind of channel is not "ready". Channel labels are
+   * not sent — a pack addresses body regions, never device/channel ids
+   * (`导演与写作上下文契约.md` §2: 设备能力 is a region list).
+   */
+  private worldFacts(snapshot: RegistrySnapshot): readonly string[] {
+    const scenario = this.scenario
+    if (scenario === undefined) return []
+    return buildWorldFacts({
+      intents: scenario.feedbackIntents,
+      regions: scenario.regions,
+      channels: snapshot.devices.flatMap(device => device.channels
+        .filter(channel => channel.kind === 'level')
+        .map(channel => ({ region: channel.region, ready: device.lifecycle === 'ready' }))),
     })
   }
 }
@@ -1261,6 +1304,19 @@ function scenarioFor(pack: LoadedPack, plannedMinutes: number): ScenarioDefiniti
     ],
     feedbackIntents: DEFAULT_INTENTS,
   }
+}
+
+/**
+ * The narrative body regions one pack offers the player.
+ *
+ * A `scenario` pack declares them in `scenario.regions`; a freeform pack gets
+ * the same synthetic `whole-body` region {@link scenarioFor} adds, so the
+ * console's per-channel picker never has to special-case the pack mode. This
+ * is a read-only projection: the human is the only writer of channel labels.
+ */
+export function regionVocabularyOf(pack: LoadedPack): readonly { id: string; label: string }[] {
+  const regions = pack.scenario?.regions ?? [{ id: WHOLE_BODY_REGION, label: '全身' }]
+  return regions.map(region => ({ id: region.id, label: region.label }))
 }
 
 /** Region labels from a registry snapshot, keyed `device:channel`. */

@@ -4,6 +4,7 @@ import { deflateRawSync } from 'node:zlib'
 import {
   FakeClock,
   M2_MODEL_TOOLS,
+  PackRegistryError,
   probeDirectorJson,
   probePromptBlock,
   type AuditRecord,
@@ -871,7 +872,12 @@ function packZipOf(
   id: string,
   version: string,
   name: string,
-  options: { readonly deflate?: boolean } = {},
+  options: {
+    readonly deflate?: boolean
+    readonly mode?: 'freeform' | 'scenario'
+    /** Extra/replacement files (e.g. a `scenario.json`). */
+    readonly files?: Readonly<Record<string, string>>
+  } = {},
 ): Uint8Array {
   return packZip({
     'pack.json': JSON.stringify({
@@ -879,11 +885,12 @@ function packZipOf(
       name,
       version,
       engine: '>=0.2 <1.0',
-      mode: 'freeform',
+      mode: options.mode ?? 'freeform',
       rating: 'all',
       boundaries: ['不做真实伤害'],
     }),
     'persona.md': `# ${name}\n\n## 导演摘要\n\n测试用角色，先观察再靠近。\n`,
+    ...options.files,
   }, options)
 }
 
@@ -945,6 +952,106 @@ describe('content pack API (B2-T14)', () => {
     const switched = await response.json() as PacksResponse
     expect(switched.packs[0]?.activeVersion).toBe('1.0.0')
     expect(switched.packs[0]?.versions.find(version => version.active)?.version).toBe('1.0.0')
+  })
+
+  it('serves the declared body regions of one installed pack', async () => {
+    const host = await start()
+    const token = host.dashboardToken
+    const url = base(host)
+    const scenario = JSON.stringify({
+      session: { plannedMinutes: 30, phaseWindows: [], aftercareMin: 0 },
+      regions: [
+        { id: 'hands', label: '手' },
+        { id: 'shoulders', label: '肩背' },
+        { id: 'whole-body', label: '全身' },
+      ],
+      phases: [{ id: 'scene', goal: '自由互动', next: [] }],
+      feedbackIntents: [{ id: 'probe-touch', meaning: '短促试探', regions: ['hands'] }],
+    })
+    const response = await fetch(`${url}/api/packs/import`, {
+      method: 'POST',
+      headers: headers(token),
+      body: packUpload(packZipOf('region-pack', '1.0.0', '部位包', {
+        mode: 'scenario',
+        files: { 'scenario.json': scenario },
+      })),
+    })
+    expect(response.status).toBe(200)
+
+    const regions = await fetch(`${url}/api/packs/regions?packId=region-pack`, {
+      headers: headers(token),
+    })
+    expect(regions.status).toBe(200)
+    expect(await regions.json()).toEqual({
+      packId: 'region-pack',
+      regions: [
+        { id: 'hands', label: '手' },
+        { id: 'shoulders', label: '肩背' },
+        { id: 'whole-body', label: '全身' },
+      ],
+    })
+
+    // A freeform pack has no scenario.json: the synthetic whole-body region is
+    // exactly what the play view's picker must offer.
+    await fetch(`${url}/api/packs/import`, {
+      method: 'POST',
+      headers: headers(token),
+      body: packUpload(packZipOf('free-pack', '1.0.0', '自由包')),
+    })
+    const free = await fetch(`${url}/api/packs/regions?packId=free-pack`, {
+      headers: headers(token),
+    })
+    expect(free.status).toBe(200)
+    expect(await free.json()).toEqual({
+      packId: 'free-pack',
+      regions: [{ id: 'whole-body', label: '全身' }],
+    })
+
+    // Unknown pack → the registry's not-found maps to 404; a missing query is
+    // a caller error, and the route is behind the same token as everything else.
+    const unknown = await fetch(`${url}/api/packs/regions?packId=ghost`, {
+      headers: headers(token),
+    })
+    expect(unknown.status).toBe(404)
+    expect(((await unknown.json()) as { error: string }).error).toContain('ghost')
+    expect((await fetch(`${url}/api/packs/regions`, { headers: headers(token) })).status).toBe(400)
+    expect((await fetch(`${url}/api/packs/regions?packId=region-pack`)).status).toBe(401)
+  })
+
+  it('answers 404 for the region vocabulary when the host has no pack registry', async () => {
+    // The route is optional for console-only test doubles: a caller must see a
+    // clean 404, not a crash from an undefined dependency.
+    const deps = debugDeps([])
+    const server = new DashboardServer({ deps, token: DEBUG_TOKEN })
+    const address = await server.start()
+    const url = `http://${address.host}:${address.port}`
+    try {
+      const response = await fetch(`${url}/api/packs/regions?packId=demo`, { headers: headers(DEBUG_TOKEN) })
+      expect(response.status).toBe(404)
+    } finally {
+      await server.stop()
+    }
+  })
+
+  it('answers 404 for the region vocabulary when a pack has no active version', async () => {
+    // "Not installed" and "no active version" are the same player-facing state
+    // (nothing to show); the generic pack-failure map would answer 400 here.
+    const deps: DashboardDeps = {
+      ...debugDeps([]),
+      packRegions: async () => {
+        throw new PackRegistryError('no-active-version', 'demo has no active version')
+      },
+    }
+    const server = new DashboardServer({ deps, token: DEBUG_TOKEN })
+    const address = await server.start()
+    const url = `http://${address.host}:${address.port}`
+    try {
+      const response = await fetch(`${url}/api/packs/regions?packId=demo`, { headers: headers(DEBUG_TOKEN) })
+      expect(response.status).toBe(404)
+      expect(((await response.json()) as { code?: string }).code).toBe('no-active-version')
+    } finally {
+      await server.stop()
+    }
   })
 
   it('answers 400 for a corrupt zip and 404 for an unknown pack or version', async () => {
@@ -1196,6 +1303,12 @@ describe('play page (B2-T12)', () => {
     // output per device/channel instead (软上限).
     expect(html).not.toContain('id="ceiling"')
     expect(html).toContain('软上限')
+    // 部位与软上限 are one per-device/per-channel list, mounted in the lobby
+    // and in the session rail; the old separate 连接与部位 / 软上限 cards
+    // (and their `softCapsRail` mount) are gone.
+    expect(html).toContain('id="softCapsLobby"')
+    expect(html).toContain('id="devices"')
+    expect(html).not.toContain('id="softCapsRail"')
     // The product console shows no telemetry surface at all: no log/audit/debug
     // panels and no probe field name or probe number on the default page.
     expect(html).not.toContain('id="debugToggle"')
@@ -1224,6 +1337,10 @@ describe('play page (B2-T12)', () => {
     expect(js).toContain('/api/session/transcript')
     expect(js).toContain('/api/panic')
     expect(js).toContain('/api/cap')
+    // The per-channel region picker reads the pack vocabulary and writes the
+    // human label through the same endpoint the old text input used.
+    expect(js).toContain('/api/region')
+    expect(js).toContain('/api/packs/regions')
     // The global ceiling route and the debug/probe surface are gone from this view.
     expect(js).not.toContain('/api/session/ceiling')
     expect(js).not.toContain('/api/debug')

@@ -52,6 +52,17 @@ const MAX_BODY_BYTES = 256 * 1024
  */
 const ADDABLE_PROTOCOLS: readonly string[] = ['coyote', 'xhtkj', 'ankni']
 
+/**
+ * One body region a pack declares (`scenario.regions[]`).
+ *
+ * The console shows `label`; `id` is the stable key the plan and the resolver
+ * speak. A freeform pack declares only `{ id: 'whole-body', label: '全身' }`.
+ */
+export interface PackRegionOption {
+  readonly id: string
+  readonly label: string
+}
+
 /** 一次导入的结果，只含 UI 需要的小字段（`LoadedPack` 不可序列化）。 */
 export interface PackImportSummary {
   readonly id: string
@@ -70,6 +81,13 @@ export interface DashboardDeps {
   readonly session?: DashboardSession
   /** 已安装内容包与 active 版本（B2-T14）；`GET /api/packs`。 */
   listPacks(): Promise<readonly PackRegistryEntry[]>
+  /**
+   * 一个已安装内容包声明的叙事部位（`scenario.regions`，freeform 为
+   * `whole-body`）；`GET /api/packs/regions`。
+   *
+   * 可选：控制台测试替身没有包仓库时，路由回答 404 即可。
+   */
+  readonly packRegions?: (packId: string) => Promise<readonly PackRegionOption[]>
   /** 校验并安装一个 zip；成功后返回被安装的版本（通常同时激活）。 */
   importPack(bytes: Uint8Array): Promise<PackImportSummary>
   /** 切换下一次会话使用的 active 版本；会话中途不生效。 */
@@ -1112,6 +1130,36 @@ export class DashboardServer {
     // zip 字节而不是 JSON；鉴权仍走统一的 x-control-token。
     if (request.method === 'GET' && pathname === '/api/packs') {
       sendJson(response, 200, { packs: await this.options.deps.listPacks() })
+      return
+    }
+
+    // Narrative region vocabulary of one installed pack. The play view renders
+    // it as the per-channel "部位" picker: the player chooses a label the pack
+    // author wrote, never a slug, and the id is what the plan/resolver speak.
+    if (request.method === 'GET' && pathname === '/api/packs/regions') {
+      const packId = asOptionalString(url.searchParams.get('packId'))
+      if (packId === undefined) {
+        sendError(response, 400, 'packId is required')
+        return
+      }
+      const packRegions = this.options.deps.packRegions
+      if (packRegions === undefined) {
+        sendError(response, 404, 'pack regions are not available')
+        return
+      }
+      try {
+        sendJson(response, 200, { packId, regions: await packRegions(packId) })
+      } catch (error) {
+        // "No active version" is the same player-facing situation as "not
+        // installed": there is no vocabulary to show. The generic pack-failure
+        // map answers 400 for it (a write-side input error), which would make
+        // the picker toast instead of degrading to its empty state.
+        if (error instanceof PackRegistryError && error.code === 'no-active-version') {
+          sendJson(response, 404, { ok: false, error: error.message, code: error.code })
+          return
+        }
+        sendPackFailure(response, error)
+      }
       return
     }
 

@@ -122,8 +122,9 @@ freeform 不需要 `scenario.json`；引擎会自动给一个「自由沙盒」�
 - `pack.json#mode` 改成 `"scenario"`。
 
 **注意（重要）**：当前 M2 实现里，阶段图能通过校验，但**不会自动推进**；`phaseWindows`、
-`advanceWhen` 目前不参与运行。因此完整包现在实际能测到的是：意图表、部位降级、包内波形、
-开场/收尾时长、跨会话记忆（`history` + `metaReactions`）。详见格式要求 §7。
+`advanceWhen` 目前不参与运行。因此完整包现在实际能测到的是：意图菜单与部位定点（两者都进入
+提示词并作为 `apply_plan` 的运行时枚举）、部位降级、包内波形、开场/收尾时长、跨会话记忆
+（`history` + `metaReactions`）。详见格式要求 §7。
 第一次测试建议先用 `templates/freeform/` 跑通链路，再做 scenario 包。
 
 ---

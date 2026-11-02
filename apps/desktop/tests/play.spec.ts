@@ -109,6 +109,39 @@ function freeformPack(): Promise<LoadedPack> {
   return cachedPack
 }
 
+let cachedScenarioPack: Promise<LoadedPack> | undefined
+
+/** A scenario pack with a real body-region vocabulary and intent menu. */
+function narrativePack(): Promise<LoadedPack> {
+  cachedScenarioPack ??= loadPack(new MemoryContentSource({
+    'pack.json': JSON.stringify({
+      id: 'narrative',
+      name: '叙事包',
+      version: '1.0.0',
+      engine: '>=0.2 <1.0',
+      mode: 'scenario',
+      rating: 'all',
+      boundaries: ['不做真实伤害'],
+    }),
+    'persona.md': '# 阿岚\n\n## 导演摘要\n\n温柔的试探者，先观察再靠近。\n',
+    'setting.md': '一间只有台灯的书房。\n',
+    'scenario.json': JSON.stringify({
+      session: { plannedMinutes: 30, phaseWindows: [], aftercareMin: 0 },
+      regions: [
+        { id: 'hands', label: '手' },
+        { id: 'shoulders', label: '肩背' },
+        { id: 'whole-body', label: '全身' },
+      ],
+      phases: [{ id: 'scene', goal: '自由互动', next: [] }],
+      feedbackIntents: [
+        { id: 'probe-touch', meaning: '短促试探', regions: ['hands'] },
+        { id: 'soothe', meaning: '安抚或降档', regions: ['whole-body'] },
+      ],
+    }),
+  }))
+  return cachedScenarioPack
+}
+
 interface Harness {
   readonly session: PlaySession
   readonly host: PlayHost
@@ -124,7 +157,10 @@ interface Harness {
 }
 
 /** Build a real registry (mock devices) + scripted model + in-memory audit. */
-async function createHarness(turns: readonly ModelTurnResult[]): Promise<Harness> {
+async function createHarness(
+  turns: readonly ModelTurnResult[],
+  pack?: LoadedPack,
+): Promise<Harness> {
   const clock = new FakeClock()
   const store = new MemoryAppendOnlyStore()
   const audit = new AuditLog(store, clock, () => {})
@@ -167,7 +203,7 @@ async function createHarness(turns: readonly ModelTurnResult[]): Promise<Harness
     },
   }
   const session = new PlaySession(env)
-  const host = new PlayHost({ ...env, packs: { load: async () => await freeformPack() } })
+  const host = new PlayHost({ ...env, packs: { load: async () => pack ?? await freeformPack() } })
   return {
     session,
     host,
@@ -851,6 +887,49 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
 
     await h.host.setRegion('mock-pulse', 'a', undefined)
     expect(h.host.regions()['mock-pulse:a']).toBeUndefined()
+  })
+
+  it('projects the intent menu and the ready body regions into the single-call prompt', async () => {
+    const h = await createHarness([scriptedTurn('好。', [planCall()])], await narrativePack())
+    // Channel A is placed on 手; B stays unlabelled, so only 手 is "ready".
+    await h.host.setRegion('mock-pulse', 'a', 'hands')
+    await h.host.start({ packId: 'narrative', plannedMinutes: 30 })
+
+    const request = h.runner.requests[0]
+    expect(request).toBeDefined()
+    const system = request!.messages.find(message => message.role === 'system')?.content ?? ''
+    // The model cannot plan without the pack's menu; the labels are what the
+    // player sees in the per-channel region picker.
+    expect(system).toContain('可用意图')
+    expect(system).toContain('probe-touch=短促试探')
+    expect(system).toContain('soothe=安抚或降档')
+    expect(system).toContain('可用部位')
+    expect(system).toContain('hands=手')
+    expect(system).toContain('shoulders=肩背')
+    expect(system).toContain('whole-body=全身')
+    expect(system).toContain('已就位部位：hands')
+    // B carries no label: the model must not be told 肩背 is addressable.
+    expect(system).not.toContain('已就位部位：hands、shoulders')
+
+    // The runtime enums are the same vocabulary: a hallucinated id is rejected
+    // before it reaches parseBeatPlan.
+    const applyPlan = request!.tools.find(tool => tool.name === 'apply_plan')
+    const beat = (applyPlan!.parameters as {
+      properties: {
+        beats: {
+          items: {
+            properties: {
+              intentId: { enum: readonly string[] }
+              regions: { items: { enum: readonly string[] } }
+            }
+          }
+        }
+      }
+    }).properties.beats.items.properties
+    expect(beat.intentId.enum).toEqual(['probe-touch', 'soothe'])
+    expect(beat.regions.items.enum).toEqual(['whole-body', 'hands', 'shoulders'])
+
+    await h.host.end('stop')
   })
 })
 

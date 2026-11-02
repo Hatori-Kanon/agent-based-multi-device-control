@@ -1045,7 +1045,8 @@ input[type="range"]:disabled {
 
 .lobby-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+  /* 设备与软上限合并后，右列承担整套设备/通道设置，给它更多横向空间。 */
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
   gap: 16px;
   align-items: start;
 }
@@ -1054,7 +1055,8 @@ input[type="range"]:disabled {
   padding: 20px 22px;
 }
 
-.lobby-card select {
+/* 大厅里的内容包下拉占满整行；软上限卡里的部位下拉有自己的宽度规则。 */
+.lobby-card select:not(.region-pick) {
   max-width: none;
   flex: 1;
 }
@@ -1367,61 +1369,6 @@ input[type="range"]:disabled {
   color: var(--text);
   word-break: break-word;
   font-variant-numeric: tabular-nums;
-}
-
-.region-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 0;
-}
-
-.region-row .label {
-  display: flex;
-  flex: 1;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.region-row input {
-  width: 128px;
-  padding: 4px 8px;
-  /* 默认像一枚标签，而不是控制台输入框；悬停/聚焦才显出可编辑 */
-  background: transparent;
-  border-color: transparent;
-  color: var(--muted);
-}
-
-.region-row input:hover,
-.region-row input:focus {
-  border-color: var(--line-2);
-  background: var(--field);
-  color: var(--text);
-}
-
-.device-card {
-  padding: 10px 0;
-  border-top: 1px dashed var(--line);
-}
-
-.device-card:first-child {
-  border-top: 0;
-  padding-top: 0;
-}
-
-.device-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 6px;
-}
-
-.device-head .name {
-  font-size: 12.5px;
-  font-weight: 650;
 }
 
 /* ── 11. 覆盖层：锁定横幅 / 提示 / 急停长按 / 弹窗 ──────────────────────── */
@@ -1850,6 +1797,30 @@ input[type="range"]:disabled {
   font-weight: 650;
 }
 
+/* 设备生命周期：纯文字小标签，只染语义色，不抢滑杆的视觉权重。 */
+.soft-cap-state {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+.soft-cap-state.ready {
+  color: var(--ok);
+}
+
+.soft-cap-state.connecting {
+  color: var(--warn);
+}
+
+.soft-cap-state.disconnected {
+  color: var(--faint);
+}
+
+.soft-cap-state.failed {
+  color: var(--bad);
+}
+
 .soft-cap-row {
   display: flex;
   align-items: center;
@@ -1927,7 +1898,8 @@ input[type="range"]:disabled {
   flex: 0 0 64px;
 }
 
-.lobby-card select {
+/* v2 搬过来的大厅微调：内容包下拉占满整行（部位下拉除外，见 §15.5）。 */
+.lobby-card select:not(.region-pick) {
   flex: 1;
   width: 100%;
   max-width: none;
@@ -2117,9 +2089,39 @@ input[type="range"]:disabled {
   padding-top: 0;
 }
 
-.soft-cap-channel > .tag {
-  align-self: flex-start;
-  margin-bottom: 4px;
+/* 通道头：标签 + 部位下拉（+可选的警告）。344px 的右轨里允许整行换行，
+   下拉自己收缩，任何宽度下都不会把卡片撑出横向滚动条。 */
+.soft-cap-channel-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.region-pick {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 190px;
+  height: 26px;
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
+.region-warn {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--warn);
+  white-space: nowrap;
+}
+
+/* 手机上部位下拉独占一行，避免和通道标签/警告挤在一起。
+   放在基础规则之后，媒体查询才能覆盖上面的 flex/max-width。 */
+@media (max-width: 760px) {
+  .region-pick {
+    flex: 1 1 100%;
+    max-width: none;
+  }
 }
 
 /* ── 16. 设置视图：模型 / 摄像头 / 麦克风 ───────────────────────────────── */

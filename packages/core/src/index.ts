@@ -412,6 +412,7 @@ export {
   M2_MODEL_TOOLS,
   M2_TOOL_SCHEMAS,
   M2_TOOL_SCHEMAS_BY_NAME,
+  withPlayableEnums,
 } from './agent/tools.ts'
 export type { M2HumanOnlyToolName, M2ModelToolName, M2ToolName } from './agent/tools.ts'
 export {
@@ -468,6 +469,13 @@ export type {
   WriterContextInput,
   WriterMustMention,
 } from './agent/context/writer.ts'
+export { buildWorldFacts, DEFAULT_WORLD_FACTS_BUDGET } from './agent/context/world.ts'
+export type {
+  WorldFactsChannel,
+  WorldFactsInput,
+  WorldFactsIntent,
+  WorldFactsRegion,
+} from './agent/context/world.ts'
 
 export { APPLY_PLAN_TOOL, DEFAULT_TURN_TIMEOUT_MS, LOOK_TOOL, runTurn } from './agent/loop.ts'
 export type { TurnExecutor, TurnLoopInput, TurnLoopOptions, TurnResult } from './agent/loop.ts'

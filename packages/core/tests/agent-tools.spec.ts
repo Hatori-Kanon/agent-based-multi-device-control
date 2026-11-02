@@ -8,6 +8,7 @@ import {
   M2_MODEL_TOOLS,
   M2_TOOL_SCHEMAS,
   M2_TOOL_SCHEMAS_BY_NAME,
+  withPlayableEnums,
 } from '../src/agent/tools.ts'
 import { parseBeatPlan } from '../src/scenario/beat-plan.ts'
 import type { PlanContext } from '../src/scenario/beat-plan.ts'
@@ -279,5 +280,83 @@ describe('M2 model tool surface', () => {
     }, ctx)
     expect(unknownIntent.plan.beats).toEqual([])
     expect(unknownIntent.dropped.some(drop => drop.rule === 'intent')).toBe(true)
+  })
+})
+
+/** The single apply_plan definition in a tool list. */
+function applyPlanOf(tools: readonly ToolDefinition[]): ToolDefinition {
+  const tool = tools.find(entry => entry.name === 'apply_plan')
+  if (tool === undefined) throw new Error('apply_plan is missing from the tool list')
+  return tool
+}
+
+/** `apply_plan.beats.items.properties`, the schema node the enums live in. */
+function beatPropertiesOf(tools: readonly ToolDefinition[]): Record<string, unknown> {
+  const parameters = parametersOf(applyPlanOf(tools))
+  const properties = asRecord(parameters['properties'])
+  const beats = asRecord(properties['beats'])
+  const beatItems = asRecord(beats['items'])
+  return asRecord(beatItems['properties'])
+}
+
+describe('withPlayableEnums', () => {
+  it('injects the pack intent and region enums into apply_plan', () => {
+    const decorated = withPlayableEnums(M2_MODEL_TOOLS, ['probe-touch', 'soothe'], ['chest'])
+    expect(decorated).not.toBe(M2_MODEL_TOOLS)
+    expect(decorated).toHaveLength(M2_MODEL_TOOLS.length)
+
+    const properties = beatPropertiesOf(decorated)
+    expect(asRecord(properties['intentId'])['enum']).toEqual(['probe-touch', 'soothe'])
+    expect(asRecord(asRecord(properties['regions'])['items'])['enum']).toEqual(['whole-body', 'chest'])
+    // The rest of the property objects stays byte-identical.
+    expect(asRecord(properties['intentId'])['type']).toBe('string')
+    expect(asRecord(properties['regions'])['minItems']).toBe(1)
+    expect(asRecord(asRecord(properties['regions'])['items'])['type']).toBe('string')
+
+    // Every other definition is the same object, not a copy.
+    const byName = new Map(decorated.map(tool => [tool.name, tool]))
+    for (const tool of M2_MODEL_TOOLS) {
+      if (tool.name === 'apply_plan') continue
+      expect(byName.get(tool.name)).toBe(tool)
+    }
+    // The decorated apply_plan is a new object with a cloned parameters tree.
+    expect(applyPlanOf(decorated)).not.toBe(applyPlanOf(M2_MODEL_TOOLS))
+    expect(applyPlanOf(decorated).parameters).not.toBe(applyPlanOf(M2_MODEL_TOOLS).parameters)
+  })
+
+  it('deduplicates and trims ids, and always keeps whole-body first', () => {
+    const decorated = withPlayableEnums(
+      M2_MODEL_TOOLS,
+      [' probe-touch ', 'probe-touch', '', '   ', 'soothe'],
+      ['', ' chest ', 'chest'],
+    )
+    const properties = beatPropertiesOf(decorated)
+    expect(asRecord(properties['intentId'])['enum']).toEqual(['probe-touch', 'soothe'])
+    expect(asRecord(asRecord(properties['regions'])['items'])['enum']).toEqual(['whole-body', 'chest'])
+  })
+
+  it('omits the intent enum when the pack declares none', () => {
+    const decorated = withPlayableEnums(M2_MODEL_TOOLS, [], [])
+    const properties = beatPropertiesOf(decorated)
+    // An empty enum is invalid JSON Schema, so the property stays plain.
+    expect(asRecord(properties['intentId'])['enum']).toBeUndefined()
+    // The wildcard is never empty: every pack may target every channel.
+    expect(asRecord(asRecord(properties['regions'])['items'])['enum']).toEqual(['whole-body'])
+  })
+
+  it('never mutates the input tools or the static schemas', () => {
+    const before = JSON.stringify(M2_TOOL_SCHEMAS)
+    withPlayableEnums(M2_MODEL_TOOLS, ['probe-touch'], ['chest'])
+    expect(JSON.stringify(M2_TOOL_SCHEMAS)).toBe(before)
+
+    // Guards the "static schema + runtime injection" contract (§4.9.2).
+    const staticProperties = beatPropertiesOf([M2_TOOL_SCHEMAS_BY_NAME.apply_plan])
+    expect(asRecord(staticProperties['intentId'])['enum']).toBeUndefined()
+    expect(asRecord(asRecord(staticProperties['regions'])['items'])['enum']).toBeUndefined()
+  })
+
+  it('returns the original list when apply_plan is absent', () => {
+    const withoutPlan = M2_MODEL_TOOLS.filter(tool => tool.name !== 'apply_plan')
+    expect(withPlayableEnums(withoutPlan, ['probe-touch'], ['chest'])).toBe(withoutPlan)
   })
 })

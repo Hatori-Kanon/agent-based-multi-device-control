@@ -54,7 +54,7 @@ import { FileAppendOnlyStore, FileDocumentStore, readAuditTail } from './node-st
 import { FsPackStore } from './pack-store.ts'
 import { RegistryPackSource } from './pack-source.ts'
 import { PanicServer } from './panic-server.ts'
-import { PlayHost } from './play.ts'
+import { PlayHost, regionVocabularyOf } from './play.ts'
 import { audioSensorSource, type AudioHost } from './sensors/audio-host.ts'
 import { cameraSensorSource, DEFAULT_CAMERA_FPS, type CameraHost } from './sensors/camera-host.ts'
 import {
@@ -1359,6 +1359,12 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     // 内容包管理（B2-T14）：导入即激活，版本切换走 activatePack。每次调用都
     // 经过 `runPackOp`，避免并发的 read-modify-write 覆盖 registry.json。
     listPacks: async () => await runPackOp(async () => await packRegistry.list()),
+    // 部位词表只读：把 active 版本的内容包加载一遍，取 scenario.regions；
+    // freeform 包由 `regionVocabularyOf` 补上合成的 whole-body。走同一个
+    // `runPackOp` 队列，避免与安装/激活的 read-modify-write 交叠。
+    packRegions: async packId => await runPackOp(
+      async () => regionVocabularyOf(await packRegistry.load(packId)),
+    ),
     importPack: async bytes => {
       const installed = await runPackOp(async () => await packRegistry.install(bytes, { activate: true }))
       return { id: installed.id, version: installed.version, active: installed.active }
