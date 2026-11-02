@@ -966,19 +966,29 @@ export class PlaySession {
     const sensor = sensorPromptBlock(this.env.sensors.statuses())
     // The cross-session opening brief (B2-T8) is a first-turn brief only: the
     // pack's `metaReactions.tone/firstIntent`, never a number or a device fact.
-    const opening = this.openingBrief === undefined ? '' : openingBriefText(this.openingBrief)
-    // World facts come first so that, if the prompt budget forces briefs to be
-    // dropped from the end, the model keeps the intent/region menu it cannot
-    // plan without; the opening and sensor briefs are the nice-to-haves.
+    // `firstIntent` is filtered against the effective intent table: validation
+    // only warns when it is unknown (and freeform packs are unchecked), so a
+    // stale id must not contradict the `apply_plan` enum the model is given.
+    const opening = this.openingBrief === undefined ? '' : openingBriefText(this.openingBrief, this.intentIds())
+    // The world facts are the mandatory playable menu: buildSystemPrompt keeps
+    // them even when persona/scene/briefs consume the whole budget, because a
+    // plan without intent/region ids would be dropped by the parser. They are
+    // appended after the budgeted blocks, keeping the cacheable prefix stable.
     const facts = this.worldFacts(snapshot)
-    const briefs = [...facts, opening, sensor].filter(part => part !== '')
+    const briefs = [opening, sensor].filter(part => part !== '')
     return buildSystemPrompt({
       ...(pack.manifest.boundaries === undefined ? {} : { boundaries: pack.manifest.boundaries }),
       ...(pack.host === undefined ? {} : { host: pack.host }),
       persona: pack.persona,
       ...(scene === '' ? {} : { scene }),
+      ...(facts.length === 0 ? {} : { world: facts }),
       ...(briefs.length === 0 ? {} : { briefs }),
     })
+  }
+
+  /** Ids in the effective intent table (the only `apply_plan` values). */
+  private intentIds(): ReadonlySet<string> {
+    return new Set((this.scenario?.feedbackIntents ?? []).map(intent => intent.id))
   }
 
   /**
@@ -1311,12 +1321,24 @@ function scenarioFor(pack: LoadedPack, plannedMinutes: number): ScenarioDefiniti
  *
  * A `scenario` pack declares them in `scenario.regions`; a freeform pack gets
  * the same synthetic `whole-body` region {@link scenarioFor} adds, so the
- * console's per-channel picker never has to special-case the pack mode. This
- * is a read-only projection: the human is the only writer of channel labels.
+ * console's per-channel picker never has to special-case the pack mode.
+ *
+ * `whole-body` always comes first, even when the pack omits it: the wildcard is
+ * accepted by the resolver, world facts and the runtime enum for every pack, so
+ * hiding it from the picker would make the UI contradict the engine. A declared
+ * `whole-body` entry keeps its authored label; otherwise the default is 全身.
+ * This is a read-only projection: the human is the only writer of channel
+ * labels.
  */
 export function regionVocabularyOf(pack: LoadedPack): readonly { id: string; label: string }[] {
-  const regions = pack.scenario?.regions ?? [{ id: WHOLE_BODY_REGION, label: '全身' }]
-  return regions.map(region => ({ id: region.id, label: region.label }))
+  const declared = pack.scenario?.regions ?? [{ id: WHOLE_BODY_REGION, label: '全身' }]
+  const wholeBody = declared.find(region => region.id === WHOLE_BODY_REGION)
+  return [
+    { id: WHOLE_BODY_REGION, label: wholeBody?.label ?? '全身' },
+    ...declared
+      .filter(region => region.id !== WHOLE_BODY_REGION)
+      .map(region => ({ id: region.id, label: region.label })),
+  ]
 }
 
 /** Region labels from a registry snapshot, keyed `device:channel`. */
@@ -1354,10 +1376,24 @@ function playerTextOf(request: TurnRequest): string | undefined {
 }
 
 /** Render a `metaReactions` brief as a prompt line; an empty brief renders nothing. */
-function openingBriefText(brief: OpeningBrief): string {
+/**
+ * Render a `metaReactions` opening brief as a prompt line.
+ *
+ * `firstIntent` is only rendered when the id is in the effective intent table:
+ * the scenario validator only warns about an unknown default (and a freeform
+ * pack is not checked against `DEFAULT_INTENTS` at all), while the model's
+ * `apply_plan` enum would reject it. Tone is always safe to render.
+ */
+export function openingBriefText(
+  brief: OpeningBrief,
+  allowedIntentIds?: ReadonlySet<string>,
+): string {
   const parts: string[] = []
   if (brief.tone !== undefined) parts.push(`语气「${brief.tone}」`)
-  if (brief.firstIntent !== undefined) parts.push(`首个意图「${brief.firstIntent}」`)
+  if (brief.firstIntent !== undefined
+    && (allowedIntentIds === undefined || allowedIntentIds.has(brief.firstIntent))) {
+    parts.push(`首个意图「${brief.firstIntent}」`)
+  }
   return parts.length === 0 ? '' : `开场指引：${parts.join('，')}。`
 }
 

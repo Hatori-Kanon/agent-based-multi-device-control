@@ -99,12 +99,18 @@
   不 mutate 输入/静态 `M2_TOOL_SCHEMAS`；其它工具原引用返回。
 - `apps/desktop/src/main/play.ts`：
   - `runOneTurn` 冻结本回合 `snapshot` 并只算一次 `resolveContext`；prompt 与 executor 用同一份；
-  - `systemPrompt` 的 briefs = `[...worldFacts, openingBrief, sensorBlock]`（facts 在前，预算截断
-    时优先保留）；
+  - `systemPrompt` 把 world facts 作为**强制 `world` 段**传给 `buildSystemPrompt`（不再混进
+    briefs）；opening/sensor 仍是 briefs。`world` 段由 prompt 层在可选块之后无条件追加，长人设
+    吃满 4000 字预算也保留，且动态内容在末尾不破坏可缓存前缀；
+  - `openingBriefText` 用有效意图表过滤 `metaReactions.opening.firstIntent`；
   - `tools: withPlayableEnums(M2_MODEL_TOOLS, intentIds, regions)`；
   - `worldFacts` 只把 `kind==='level'` 通道的 `region`+`device.lifecycle==='ready'` 交给投影。
+- `packages/core/src/agent/prompt.ts`：`PromptSectionKey` 增加 `world`，`PROMPT_SECTION_ORDER`
+  末位；`boundaries` 与 `world` 永不参与预算牺牲，`buildSystemPrompt` 在预算循环之外追加 world。
 - `apps/desktop/src/main/dashboard.ts` / `bootstrap.ts`：新增可选依赖 `packRegions`、路由与
-  `regionVocabularyOf`。
+  `regionVocabularyOf`；路由接受可选 `version`（缺省 active 版本）并返回解析后的
+  `{packId, version, regions}`；bootstrap 按 `id@version` 缓存词表，安装时清缓存；
+  `regionVocabularyOf` 恒把 `whole-body` 放第一项（包没声明也补上）。
 
 ## 4. 不一致时的行为矩阵
 
@@ -123,12 +129,13 @@
 ## 5. 验证
 
 - 单测/类型：
-  - core：52 files / **673 tests** 全过；`tsc --noEmit` 0 error；新增 `agent-world-facts` 8 条、
-    `agent-tools` 扩到 12 条（枚举注入、去重、静态 schema 不变、输入不 mutate）。
-  - desktop：17 files / **209 tests** 全过；`tsc --noEmit` 0 error；新增
-    `/api/packs/regions` 正常/400/404/token 路径、「无 packRegions 依赖 404」与
-    「包无 active 版本 404」（`no-active-version` 不走通用 400）；
-    `play.spec` 新增「单调用提示词含意图菜单 + 已就位部位 + 工具枚举」。
+  - core：52 files / **674 tests** 全过；`tsc --noEmit` 0 error；新增 `agent-world-facts` 8 条、
+    `agent-tools` 扩到 12 条（枚举注入、去重、静态 schema 不变、输入不 mutate）、
+    `agent-prompt` 增加「长人设下强制 world 段仍保留」。
+  - desktop：17 files / **210 tests** 全过；`tsc --noEmit` 0 error；新增
+    `/api/packs/regions` 正常/400/404/token/显式版本/未知版本路径、无 `packRegions` 依赖 404、
+    包无 active 版本 404；`play.spec` 新增「单调用提示词含意图菜单 + 已就位部位 + 工具枚举 +
+    world 段位置」与 `openingBriefText` 的无效 firstIntent 过滤。
   - esbuild：`main.ts`、`dev-server.ts`（含 UI 文本 loader）构建通过；`node --check play.js` 通过。
 - 真实浏览器（headless Chrome + 真实 dev-server + mock 设备 + 已安装 kit 的 `lighthouse-night`
   scenario 包，`EMBODIED_UI_FROM_DISK=1`）：
@@ -151,8 +158,9 @@
 
 - **阶段图仍不推进**（既有 M2 限制）；`phaseWindows`/`advanceWhen`/`next`、`corpus.md`、
   `pack.aftercare.text`、`scenario.opening|npcs|secrets`、`## 导演摘要` 的接线状态未变。
-- 部位词表取自「当前设置用的包」：会话中途不能换包；大厅换包会重新拉词表；同一 id 换 active
-  版本由包列表签名变化触发强制刷新。内容包导入/卸载/版本切换仍无 UI（API/脚本）。
+- 部位词表取自「当前设置用的包」：会话中途不能换包；大厅换包/换 active 版本会重拉；运行中的
+  会话用 `session.packVersion` 固定词表，后台激活别的版本不会改 picker。内容包导入/卸载/版本
+  切换仍无 UI（API/脚本）。
 - 设备页仍保留直控和软上限（硬件调试/直控用途），与游玩卡的软上限写同一 policy；如果产品上
   要求「软上限只在一处」，下一步可把设备页的范围滑杆移除、只留直控与波形。
 - 玩家若想使用内容包未声明的部位名（例如「左胸」），当前设计是让**内容包声明更细的部位**
@@ -161,23 +169,47 @@
 - 真实 LLM key 下尚未跑回合（本环境没有 key）；单调用提示词/枚举由 scripted runner 单测覆盖，
   仍需真 key smoke test 观察 plan 合法率。
 - `## 导演摘要`/split 模式未接线：如果将来启用 `TurnPipeline`，世界事实应改由
-  `buildDirectorContext` 提供，而不是继续放在单调用 briefs。
+  `buildDirectorContext` 提供，而不是继续放在单调用 `world` 段；`pipeline.ts` 里已加注释，
+  提醒接线时对 director 的 `apply_plan` 也调用 `withPlayableEnums`。
 
 ## 7. 复核记录
+
+### 7.1 独立 adversarial review（HEAD 73f4a07）与修复
+
+复核结论：**无 BLOCKER**；安全面（只读词表路由、facts 无上限/输出、LOCKED 与 cap 夹紧不变）
+通过。以下问题已全部修复：
+
+| # | 级别 | 问题 | 修复 |
+| --- | --- | --- | --- |
+| 1 | MAJOR | 词表失败被缓存成 `[]` 且标记已加载，永久空 picker；force 失败清掉好词表 | `vocabularyRetry`/`vocabularyRetryAt`；失败不标记已加载、同 key 保留好词表、15s 最小重试间隔，force 立即重试 |
+| 2 | MAJOR | world facts 只在 briefs，长人设吃满预算会被整体丢掉 | prompt 新增强制 `world` 段（`PROMPT_SECTION_ORDER` 末位、预算循环外追加）；新增长人设测试 |
+| 3 | MINOR | 包省略 `whole-body` 时 picker 没有「全身」，与 facts/enum 不一致 | `regionVocabularyOf` 恒把 whole-body 放第一项；测试改为包不声明它也返回 |
+| 4 | MINOR | 词表只按 packId、只读 active 版本；会话中途激活别的版本会漂移 | 路由接受 `version` 并返回解析版本；UI 用 `${id}@${version}` 缓存，会话用 `session.packVersion` |
+| 5 | MINOR | 无效 `metaReactions.firstIntent` 仍被渲染，与 apply_plan 枚举冲突 | `openingBriefText` 按有效意图表过滤（freeform 也覆盖）；单测 |
+| 6 | MINOR | 快速改部位时乱序响应可能把标签拨回，失败回滚用 `regions` 映射会清空后端声明值 | 每通道请求序号，只采纳最新响应；失败回滚到提交前值 `before` |
+| 7 | MINOR | 缺 DOM/重试/版本/长 prompt 测试 | 补 dashboard 版本/404 测试、prompt 长人设测试、play 的 firstIntent 测试；pick DOM 由真实浏览器验证 |
+| 8 | NIT | 数字只出现在 id 中（可接受），测试断言太窄 | 测试改为先把所有已知 id 去掉再断言无数字 |
+| 9 | NIT | `capEditing` 死代码 | 删除 Set 与 focus/pointer 监听 |
+| 10 | NIT | split 管线会绕过 `withPlayableEnums` | `pipeline.ts` 加接线注释（split 尚未启用） |
+| 11 | NIT | 每次词表请求都完整加载/校验包 | bootstrap 按 `id@version` 缓存，安装时清缓存 |
+| 12 | NIT | — | 同 8 |
+
+### 7.2 其余复核
 
 - **Lead 自审**（逐文件 diff）：route 鉴权/400/404 映射、freeform 合成词表、`packRegions` 与
   安装/激活共用 `runPackOp` 串行队列、`refreshVocabulary` 的 in-flight/换包竞态、渲染跳过条件
   （INPUT/SELECT）、`applyRegion` 失败回滚、world facts 只含部位/意图且无百分比/上限/输出、
-  `withPlayableEnums` 不 mutate 静态 schema、facts 在 briefs 首位（预算截断优先保留）。
+  `withPlayableEnums` 不 mutate 静态 schema、world 段在预算循环外追加。
 - **独立交叉验证**（团队成员，不同环境）：
   - ui-shell：真实 dev-server + CDP，1600/1024/760 三档下 `#softCapsRail` 不在 DOM、右轨恰好
     「状态 / 设备与软上限」两张卡、两个挂载点同源渲染、344px 轨道与窄屏横向溢出为 0、
     生命周期/焦点颜色取 token；页面无 console error。
   - play-ui：临时 DOM stub 真实执行 play.js 的 52 条断言（词表只请求一次、两个挂载点各渲染、
     部位 POST 载荷与回写、警告出现/消失、未指定/词表外占位、锁定只禁滑杆、编辑中不重建、
-    失焦补渲染）。
-  - core：全量 52 files / 673 tests 与类型检查通过；desktop：17 files / 209 tests 通过。
+    失焦补渲染）；复核修复后的 23 条断言（版本化 URL、同 key 去重、失败恢复、force 保留好词表、
+    乱序响应、回滚语义）。
+  - core：全量 52 files / 674 tests 与类型检查通过；desktop：17 files / 210 tests 通过。
   - Lead：真实 dev-server + mock 设备 + 已安装 kit scenario 包的浏览器验证（§5），以及
     「页面先打开、后装包」的 30s 词表自动出现路径。
-- 仍未覆盖：真实 LLM key 下的plan 合法率 smoke test、真实郊狼硬件、Electron 真机
+- 仍未覆盖：真实 LLM key 下的 plan 合法率 smoke test、真实郊狼硬件、Electron 真机
   （均为既有的人工验收项，不属于本次改动引入）。

@@ -57,10 +57,19 @@ const ADDABLE_PROTOCOLS: readonly string[] = ['coyote', 'xhtkj', 'ankni']
  *
  * The console shows `label`; `id` is the stable key the plan and the resolver
  * speak. A freeform pack declares only `{ id: 'whole-body', label: '全身' }`.
+ * `whole-body` is always returned first by the host, even when the pack file
+ * omits it, because the resolver treats it as a universal wildcard.
  */
 export interface PackRegionOption {
   readonly id: string
   readonly label: string
+}
+
+/** One pack version's region vocabulary, resolved for the play view. */
+export interface PackRegionVocabulary {
+  /** Concrete installed version the vocabulary was read from. */
+  readonly version: string
+  readonly regions: readonly PackRegionOption[]
 }
 
 /** 一次导入的结果，只含 UI 需要的小字段（`LoadedPack` 不可序列化）。 */
@@ -85,9 +94,13 @@ export interface DashboardDeps {
    * 一个已安装内容包声明的叙事部位（`scenario.regions`，freeform 为
    * `whole-body`）；`GET /api/packs/regions`。
    *
+   * `version` 缺省时读取 active 版本；显式传入时读取该版本（会话中途激活了
+   * 别的版本时，游玩页仍要用会话启动时那一版的词表）。返回值必须带上实际
+   * 解析到的版本，UI 用它做词表缓存键。
+   *
    * 可选：控制台测试替身没有包仓库时，路由回答 404 即可。
    */
-  readonly packRegions?: (packId: string) => Promise<readonly PackRegionOption[]>
+  readonly packRegions?: (packId: string, version?: string) => Promise<PackRegionVocabulary>
   /** 校验并安装一个 zip；成功后返回被安装的版本（通常同时激活）。 */
   importPack(bytes: Uint8Array): Promise<PackImportSummary>
   /** 切换下一次会话使用的 active 版本；会话中途不生效。 */
@@ -1142,13 +1155,21 @@ export class DashboardServer {
         sendError(response, 400, 'packId is required')
         return
       }
+      // Optional version pin: a running session must keep the vocabulary of the
+      // version it started with, even if the active version changed meanwhile.
+      const version = asOptionalString(url.searchParams.get('version'))
       const packRegions = this.options.deps.packRegions
       if (packRegions === undefined) {
         sendError(response, 404, 'pack regions are not available')
         return
       }
       try {
-        sendJson(response, 200, { packId, regions: await packRegions(packId) })
+        const vocabulary = await packRegions(packId, version)
+        sendJson(response, 200, {
+          packId,
+          version: vocabulary.version,
+          regions: vocabulary.regions,
+        })
       } catch (error) {
         // "No active version" is the same player-facing situation as "not
         // installed": there is no vocabulary to show. The generic pack-failure

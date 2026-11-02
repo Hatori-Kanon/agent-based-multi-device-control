@@ -21,6 +21,7 @@ import {
   MockBackend,
   MonsterPartyBackend,
   PackRegistry,
+  PackRegistryError,
   parsePolicySnapshot,
   PolicyStore,
   RegionStore,
@@ -47,7 +48,7 @@ import {
   type Snapshot,
 } from '@embodied/core'
 import { IntifaceProcess, type IntifaceAvailability } from './intiface.ts'
-import { DashboardServer, type DashboardDeps } from './dashboard.ts'
+import { DashboardServer, type DashboardDeps, type PackRegionVocabulary } from './dashboard.ts'
 import { log, recentLogs } from './log.ts'
 import { NodeTextSocketTransport } from './node-socket.ts'
 import { FileAppendOnlyStore, FileDocumentStore, readAuditTail } from './node-storage.ts'
@@ -1034,6 +1035,8 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     packOps = next.catch(() => {})
     return next
   }
+  /** Region vocabulary per `packId@version`; loading a pack validates every file. */
+  const regionCache = new Map<string, PackRegionVocabulary>()
 
   // ── Host session service (B1-T16) ───────────────────────────────────────
   // One session per process. Packs resolve through the installed-pack registry
@@ -1359,14 +1362,31 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     // 内容包管理（B2-T14）：导入即激活，版本切换走 activatePack。每次调用都
     // 经过 `runPackOp`，避免并发的 read-modify-write 覆盖 registry.json。
     listPacks: async () => await runPackOp(async () => await packRegistry.list()),
-    // 部位词表只读：把 active 版本的内容包加载一遍，取 scenario.regions；
-    // freeform 包由 `regionVocabularyOf` 补上合成的 whole-body。走同一个
-    // `runPackOp` 队列，避免与安装/激活的 read-modify-write 交叠。
-    packRegions: async packId => await runPackOp(
-      async () => regionVocabularyOf(await packRegistry.load(packId)),
-    ),
+    // 部位词表只读：加载目标版本的内容包，取 scenario.regions（freeform 由
+    // `regionVocabularyOf` 补上 whole-body）。显式 version 用于运行中的会话：
+    // 后台激活别的版本不能改变它正在用的词表。走同一个 `runPackOp` 队列，
+    // 避免与安装/激活的 read-modify-write 交叠；按 id@version 缓存，因为一次
+    // 加载会校验 pack.json/scenario/波形等全部文件。
+    packRegions: async (packId, version) => await runPackOp(async () => {
+      const resolved = version ?? await packRegistry.activeVersion(packId)
+      if (resolved === undefined) {
+        throw new PackRegistryError('no-active-version', `content pack "${packId}" has no active version`)
+      }
+      const key = `${packId}@${resolved}`
+      const cached = regionCache.get(key)
+      if (cached !== undefined) return cached
+      const vocabulary: PackRegionVocabulary = {
+        version: resolved,
+        regions: regionVocabularyOf(await packRegistry.load(packId, resolved)),
+      }
+      regionCache.set(key, vocabulary)
+      return vocabulary
+    }),
     importPack: async bytes => {
       const installed = await runPackOp(async () => await packRegistry.install(bytes, { activate: true }))
+      // A reinstall of the same id@version is rejected, but an uninstall +
+      // reinstall could in principle change the files behind a cache key.
+      regionCache.clear()
       return { id: installed.id, version: installed.version, active: installed.active }
     },
     activatePack: async (id, version) => {

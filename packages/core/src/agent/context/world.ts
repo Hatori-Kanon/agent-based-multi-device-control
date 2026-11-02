@@ -15,8 +15,11 @@
  *    them right now (`已就位部位：`), so the model does not aim at hardware
  *    that is not there.
  *
- * The host passes these lines verbatim as `briefs`; `prompt.ts` renders each
- * as `- item`. Every line is a plain fact, never an instruction paragraph.
+ * The host passes these lines as the prompt's mandatory `world` block;
+ * `prompt.ts` renders each as `- item`. Every line is a plain fact, never an
+ * instruction paragraph. The block is appended after the budgeted sections and
+ * is never sacrificed, because the intent/region ids are what `apply_plan`
+ * requires.
  *
  * Properties the callers rely on:
  *
@@ -177,7 +180,8 @@ function resolveBudget(budgetChars: number | undefined): number {
  * Build the three world-fact lines (or fewer when the budget is tight).
  *
  * @param input - Pack vocabulary plus the current channel readiness.
- * @returns 0–3 short Chinese lines, safe to pass as prompt `briefs` verbatim.
+ * @returns 0–3 short Chinese lines, safe to pass as the prompt `world` block
+ *   verbatim.
  */
 export function buildWorldFacts(input: WorldFactsInput): readonly string[] {
   const budget = resolveBudget(input.budgetChars)

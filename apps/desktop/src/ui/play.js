@@ -6,14 +6,15 @@
 // 台词、选项、阶段、时间。v5 把「部位」并入「软上限」：大厅的 #softCapsLobby
 // 与舞台右轨的 #devices 用同一个渲染器，每台设备一张卡、每个通道一块 ——
 // 部位选择 + 强度范围 + 频率范围放在一起（`设备范围与单窗口界面-设计说明.md`
-// §3.3）。部位词表来自当前内容包（GET /api/packs/regions），只显示内容包
-// 作者写的 label，提交的是稳定 id。
+// §3.3）。部位词表按「内容包 + 版本」拉取（GET /api/packs/regions），只显示
+// 内容包作者写的 label，提交的是稳定 id；同一个包换版本会重拉，加载失败不
+// 缓存成「已加载」，下一次刷新会自动重试。
 // 强度按通道的原生单位显示（Coyote 0-200，其它 0-100%），频率显示物理 Hz；
 // 单位元数据由宿主快照给出，缺强度元数据时按百分比降级，读不到 Hz 则该行
 // 显示「—」并禁用。
 //
 // 轮询 2Hz：会话与台词每 500ms，设备/部位/软上限每 2s，内容包每 30s；部位
-// 词表只随内容包变化单独拉取，不进 500ms 轮询。设备/设置视图打开时
+// 词表只随内容包/版本变化单独拉取，不进 500ms 轮询。设备/设置视图打开时
 // （document.body.dataset.view !== 'play'）本视图停止轮询；切回时 `viewchange`
 // 监听器立即刷新一次。所有失败都在页面上显示可读错误，不往 console 裸奔。
 
@@ -63,12 +64,23 @@
   let snapshot = null
   /** Region labels keyed `device:channel` (`GET /api/region`). */
   let regions = {}
-  /** 当前内容包声明的部位词表；`null` = 还没加载（picker 只给「未指定」）。 */
+  /**
+   * 当前内容包版本声明的部位词表；`null` = 还没成功加载（picker 只给「未指定」
+   * 与通道当前值）。
+   */
   let regionVocabulary = null
-  /** 词表对应的内容包 id；与设置用的包不同就重新拉。 */
-  let vocabularyPackId = ''
-  /** 词表请求进行中的包 id；`null` = 空闲（避免轮询重复发请求）。 */
+  /** 已加载词表对应的 `${packId}@${version}`；与设置用的包不同就重新拉。 */
+  let vocabularyPackKey = ''
+  /** 词表请求进行中的 pack key；`null` = 空闲（避免重复发请求）。 */
   let vocabularyLoading = null
+  /** 上次加载失败：置 true 让下一次 boot/refreshAll/viewchange 等自动重试。 */
+  let vocabularyRetry = false
+  /** 上次失败的时间戳（`Date.now()`）；限制自动重试频率，避免 2Hz 轮询打爆宿主。 */
+  let vocabularyRetryAt = 0
+  /** 自动重试的最小间隔；`force`（换包/包列表变化）不受此限制。 */
+  const VOCABULARY_RETRY_MS = 15_000
+  /** 大厅下拉框里每个内容包的 active 版本；`renderPacks` 从 versions/activeVersion 取。 */
+  const packVersions = new Map()
   /** Newest settled assistant turn already appended to the feed. */
   let lastTurnId = 0
   /** Newest `at` already seen; sent back as `?since=` (forward compatible). */
@@ -244,10 +256,9 @@
     sessionId = nextId
     session = next
     renderSession()
-    // 会话的包决定部位词表；与已加载的包不同就换词表。
-    const sessionPackId = typeof next.packId === 'string' ? next.packId : ''
-    if (sessionPackId !== '' && sessionPackId !== vocabularyPackId) {
-      void refreshVocabulary(sessionPackId)
+    // 会话的包与版本决定部位词表；与已加载的 key 不同（或还没加载成功）就换。
+    if (setupPackKey() !== vocabularyPackKey || regionVocabulary === null) {
+      void refreshVocabulary()
     }
   }
 
@@ -258,8 +269,8 @@
       resetStream()
     }
     renderSession()
-    // 回到大厅：设置用的包变回下拉框的选择，词表不一致就换回来。
-    if (currentSetupPackId() !== vocabularyPackId) void refreshVocabulary()
+    // 回到大厅：设置用的包变回下拉框的选择，词表不一致就换回来（失败时重试）。
+    if (setupPackKey() !== vocabularyPackKey || regionVocabulary === null) void refreshVocabulary()
   }
 
   function renderSession() {
@@ -501,6 +512,9 @@
     return `${deviceId}:${channelId}`
   }
 
+  /** 每个通道最近一次部位提交的序号；乱序响应据此丢弃。 */
+  const regionRequests = new Map()
+
   /** 词表里是否有这个部位 id；加载完成前 `regionVocabulary` 为 null。 */
   function vocabularyHas(id) {
     return Array.isArray(regionVocabulary) && regionVocabulary.some(entry => entry.id === id)
@@ -516,7 +530,7 @@
     if (snap === null || !Array.isArray(snap.devices)) return 'none'
     return JSON.stringify({
       locked: snap.locked === true,
-      vocabularyPackId,
+      vocabularyPackKey,
       vocabulary: Array.isArray(regionVocabulary)
         ? regionVocabulary.map(entry => [entry.id, entry.label])
         : null,
@@ -684,12 +698,19 @@
     const deviceId = device.id
     const channelId = channel.id
     const key = regionKey(deviceId, channelId)
+    // 提交前的值：失败时回滚到它（而不是可能已被旧响应改过的 regions 映射）。
+    const before = currentRegionOf(deviceId, channel)
     const wanted = pick.value === '' ? null : pick.value
+    // 每个通道一个请求序号：只有最新一次提交的响应有权改 UI/回滚，快速连续
+    // 修改时旧响应直接丢弃，避免标签被乱序响应拨回去。
+    const seq = (regionRequests.get(key) ?? 0) + 1
+    regionRequests.set(key, seq)
     try {
       const body = await api('/api/region', {
         method: 'POST',
         body: JSON.stringify({ deviceId, channelId, region: wanted }),
       })
+      if (regionRequests.get(key) !== seq) return
       clearError('region')
       if (body !== null && typeof body === 'object' && body.regions !== null && typeof body.regions === 'object') {
         regions = body.regions
@@ -704,8 +725,10 @@
       setupSignatures.clear()
       if (document.activeElement !== pick) renderSetup()
     } catch (error) {
+      if (regionRequests.get(key) !== seq) return
       noteError('region', `修改部位失败：${describe(error)}`)
-      pick.value = regions[key] ?? ''
+      pick.value = before
+      channel.region = before === '' ? undefined : before
       updateRegionWarning(head, pick.value)
     }
   }
@@ -724,8 +747,6 @@
   const MAX_FREQ_HZ = 100
   /** 百分比的满量程：/api/level 与 /api/cap 的 percent 域。 */
   const PERCENT_MAX = 100
-  /** 正在拖动/聚焦的软上限控件（key = device:channel:kind）。 */
-  const capEditing = new Set()
 
   function finite(value) {
     return typeof value === 'number' && Number.isFinite(value) ? value : undefined
@@ -836,7 +857,6 @@
     const readout = document.createElement('span')
     readout.className = 'val soft-cap-val'
 
-    const key = `${deviceId}:${channelId}:${kind}`
     /** 原生强度 → 线上的 percent（strength 0-200 → 0-100）。 */
     const toPercent = value => Math.round(value / scale)
     const sync = () => {
@@ -853,27 +873,15 @@
             : `${lo.value}%–${hi.value}%`)
         : `${lo.value}–${hi.value} Hz`
     }
-    const begin = () => capEditing.add(key)
-    const finish = () => capEditing.delete(key)
-    lo.addEventListener('focus', begin)
-    lo.addEventListener('pointerdown', begin)
-    lo.addEventListener('blur', finish)
-    lo.addEventListener('pointerup', finish)
     lo.addEventListener('input', sync)
-    hi.addEventListener('focus', begin)
-    hi.addEventListener('pointerdown', begin)
-    hi.addEventListener('blur', finish)
-    hi.addEventListener('pointerup', finish)
     hi.addEventListener('input', sync)
     lo.addEventListener('change', () => {
-      finish()
       sync()
       void postCap(deviceId, channelId, intensity
         ? { minPercent: toPercent(Number(lo.value)) }
         : { minFreqHz: Number(lo.value) })
     })
     hi.addEventListener('change', () => {
-      finish()
       sync()
       void postCap(deviceId, channelId, intensity
         ? { maxPercent: toPercent(Number(hi.value)) }
@@ -985,6 +993,20 @@
     const signature = packs.map(pack => `${pack.id ?? ''}@${pack.activeVersion ?? ''}`).join('|')
     if (signature === packSignature) return
     packSignature = signature
+    // 词表按 `${packId}@${version}` 缓存，所以先把每个包的 active 版本记下来。
+    // `activeVersion` 是注册表给下一次会话用的版本；`versions[].active` 是同一
+    // 信息的明细，两者都兼容。
+    packVersions.clear()
+    for (const pack of packs) {
+      if (pack === null || typeof pack !== 'object' || typeof pack.id !== 'string') continue
+      let activeVersion = typeof pack.activeVersion === 'string' ? pack.activeVersion : ''
+      if (activeVersion === '' && Array.isArray(pack.versions)) {
+        const active = pack.versions.find(entry => entry !== null && typeof entry === 'object'
+          && entry.active === true && typeof entry.version === 'string' && entry.version !== '')
+        if (active !== undefined) activeVersion = active.version
+      }
+      if (activeVersion !== '') packVersions.set(pack.id, activeVersion)
+    }
     const previous = el.packSelect.value
     const options = []
     for (const pack of packs) {
@@ -1016,38 +1038,62 @@
     renderControls()
     // 内容包列表/active 版本变了：同一 id 换版本也可能改 `regions`，所以这里
     // 强制重拉词表；列表没变时上面的签名检查会提前返回，不会每 30s 重读包。
-    void refreshVocabulary(currentSetupPackId(), true)
+    void refreshVocabulary(currentSetupPack(), true)
   }
 
-  // ── 部位词表（随内容包变化，不进 500ms 轮询） ───────────────────────────
-  /** 当前设置用的内容包：有会话时用会话的包，否则用大厅下拉框的选择。 */
-  function currentSetupPackId() {
+  // ── 部位词表（随内容包版本变化，不进 500ms 轮询） ───────────────────────
+  /**
+   * 当前设置用的内容包：有会话时用会话的包与版本（避免会话中途后台激活了
+   * 别的版本导致 picker 标签漂移），否则用大厅下拉框的选择。
+   */
+  function currentSetupPack() {
     if (session !== null && typeof session.packId === 'string' && session.packId !== '') {
-      return session.packId
+      return {
+        id: session.packId,
+        version: typeof session.packVersion === 'string' ? session.packVersion : '',
+      }
     }
     const picked = el.packSelect.value
-    return typeof picked === 'string' ? picked : ''
+    const id = typeof picked === 'string' ? picked : ''
+    return { id, version: packVersions.get(id) ?? '' }
+  }
+
+  /** 词表缓存键：同一包的不同版本也要重拉（包内 regions 可能变）。 */
+  function setupPackKey(pack = currentSetupPack()) {
+    return `${pack.id}@${pack.version}`
   }
 
   /**
-   * 拉取当前内容包声明的部位词表。
+   * 拉取某个内容包版本声明的部位词表。
    *
-   * 词表只随内容包变化：同一包已加载过就跳过（`force` 除外），请求进行中也
-   * 跳过。404 = 包没装/没有 active 版本，按空词表处理，不打扰玩家；其它失败
-   * 显示可读错误并存空词表（picker 至少还能选「未指定」）。
+   * 缓存键是 `${packId}@${version}`：同一版本已加载成功就跳过（`force` 除外），
+   * 同一版本的请求进行中也跳过（防止重复发请求）。404 = 包没装/没有 active
+   * 版本，是确定的「没有词表」，缓存空数组且不打扰玩家；500/超时/断网不算
+   * 已加载：置 `vocabularyRetry`，让下一次 boot/refreshAll/viewchange/
+   * applySession/applyNoSession 的调用重试。失败期间如果同 key 已有一份好
+   * 词表就继续用（force 失败不会清掉好数据），否则退回 null（picker 只剩
+   * 「未指定」与通道当前值）。
    */
-  async function refreshVocabulary(packId = currentSetupPackId(), force = false) {
-    const id = typeof packId === 'string' ? packId : ''
-    if (!force && regionVocabulary !== null && vocabularyPackId === id) return
-    if (vocabularyLoading !== null && vocabularyLoading === id) return
-    vocabularyLoading = id
+  async function refreshVocabulary(pack = currentSetupPack(), force = false) {
+    const wanted = pack !== null && typeof pack === 'object' ? pack : { id: '', version: '' }
+    const id = typeof wanted.id === 'string' ? wanted.id : ''
+    const version = typeof wanted.version === 'string' ? wanted.version : ''
+    const key = `${id}@${version}`
+    // applySession/applyNoSession 由 500ms 轮询驱动；失败后不要每 500ms 重试。
+    if (!force && vocabularyRetry && Date.now() - vocabularyRetryAt < VOCABULARY_RETRY_MS) return
+    if (!force && !vocabularyRetry && regionVocabulary !== null && vocabularyPackKey === key) return
+    if (vocabularyLoading !== null && vocabularyLoading === key) return
+    vocabularyLoading = key
     let next = []
+    let loadedKey = key
     try {
       if (id !== '') {
-        const body = await api(`/api/packs/regions?packId=${encodeURIComponent(id)}`)
-        const list = body !== null && typeof body === 'object' && Array.isArray(body.regions)
-          ? body.regions
-          : []
+        const query = version === ''
+          ? `?packId=${encodeURIComponent(id)}`
+          : `?packId=${encodeURIComponent(id)}&version=${encodeURIComponent(version)}`
+        const body = await api(`/api/packs/regions${query}`)
+        const payload = body !== null && typeof body === 'object' ? body : {}
+        const list = Array.isArray(payload.regions) ? payload.regions : []
         next = list
           .filter(entry => entry !== null && typeof entry === 'object'
             && typeof entry.id === 'string' && entry.id !== '')
@@ -1055,18 +1101,45 @@
             id: entry.id,
             label: typeof entry.label === 'string' && entry.label !== '' ? entry.label : entry.id,
           }))
-        clearError('vocabulary')
+        // 响应会带上服务端实际解析到的版本（不传 version 时补 active 版本），
+        // 用它做缓存键，避免同一版本被重复请求。
+        const resolvedId = typeof payload.packId === 'string' && payload.packId !== ''
+          ? payload.packId
+          : id
+        const resolvedVersion = typeof payload.version === 'string' ? payload.version : version
+        loadedKey = `${resolvedId}@${resolvedVersion}`
       }
     } catch (error) {
-      if (error.status === 404) clearError('vocabulary')
-      else noteError('vocabulary', `读取部位失败：${describe(error)}`)
-      next = []
+      // 期间又换了包：这次结果作废（新请求会负责更新）。
+      if (vocabularyLoading !== key) return
+      vocabularyLoading = null
+      if (error.status === 404) {
+        clearError('vocabulary')
+        vocabularyRetry = false
+        vocabularyRetryAt = 0
+        regionVocabulary = []
+        vocabularyPackKey = key
+      } else {
+        // 500/超时/断网：不缓存为“已加载”，留待下一次调用重试。
+        vocabularyRetry = true
+        vocabularyRetryAt = Date.now()
+        noteError('vocabulary', `读取部位失败：${describe(error)}`)
+        if (vocabularyPackKey !== key || !Array.isArray(regionVocabulary)) {
+          regionVocabulary = null
+        }
+      }
+      setupSignatures.clear()
+      renderSetup()
+      return
     }
     // 期间又换了包：这次结果作废，别把旧包的词表盖上去。
-    if (vocabularyLoading !== id) return
+    if (vocabularyLoading !== key) return
     vocabularyLoading = null
-    vocabularyPackId = id
+    vocabularyRetry = false
+    vocabularyRetryAt = 0
     regionVocabulary = next
+    vocabularyPackKey = loadedKey
+    clearError('vocabulary')
     setupSignatures.clear()
     renderSetup()
   }

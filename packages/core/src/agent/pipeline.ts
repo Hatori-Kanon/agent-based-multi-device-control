@@ -284,6 +284,10 @@ export class TurnPipeline implements TurnRunner {
       ),
     }
     this.context = options.context
+    // Split mode currently hands the director the static apply_plan schema.
+    // When the desktop host wires split mode it must decorate this tool with
+    // `withPlayableEnums(tools, intentIds, regionIds)` from the same pack menu
+    // the single-call path uses, otherwise the director sees no enum values.
     this.directorTool = this.tools.find(tool => tool.name === APPLY_PLAN_TOOL)
       ?? M2_TOOL_SCHEMAS_BY_NAME.apply_plan
   }

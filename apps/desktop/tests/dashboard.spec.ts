@@ -960,10 +960,11 @@ describe('content pack API (B2-T14)', () => {
     const url = base(host)
     const scenario = JSON.stringify({
       session: { plannedMinutes: 30, phaseWindows: [], aftercareMin: 0 },
+      // `whole-body` deliberately omitted: the host must still offer it first,
+      // because the resolver/world facts/apply_plan enum always accept it.
       regions: [
         { id: 'hands', label: '手' },
         { id: 'shoulders', label: '肩背' },
-        { id: 'whole-body', label: '全身' },
       ],
       phases: [{ id: 'scene', goal: '自由互动', next: [] }],
       feedbackIntents: [{ id: 'probe-touch', meaning: '短促试探', regions: ['hands'] }],
@@ -984,12 +985,25 @@ describe('content pack API (B2-T14)', () => {
     expect(regions.status).toBe(200)
     expect(await regions.json()).toEqual({
       packId: 'region-pack',
+      version: '1.0.0',
       regions: [
+        { id: 'whole-body', label: '全身' },
         { id: 'hands', label: '手' },
         { id: 'shoulders', label: '肩背' },
-        { id: 'whole-body', label: '全身' },
       ],
     })
+
+    // An explicit version pins the vocabulary to the version a running session
+    // started with; an unknown version is the registry's 404, not a 400.
+    const pinned = await fetch(`${url}/api/packs/regions?packId=region-pack&version=1.0.0`, {
+      headers: headers(token),
+    })
+    expect(pinned.status).toBe(200)
+    expect(((await pinned.json()) as { version: string }).version).toBe('1.0.0')
+    const missingVersion = await fetch(`${url}/api/packs/regions?packId=region-pack&version=9.9.9`, {
+      headers: headers(token),
+    })
+    expect(missingVersion.status).toBe(404)
 
     // A freeform pack has no scenario.json: the synthetic whole-body region is
     // exactly what the play view's picker must offer.
@@ -1004,6 +1018,7 @@ describe('content pack API (B2-T14)', () => {
     expect(free.status).toBe(200)
     expect(await free.json()).toEqual({
       packId: 'free-pack',
+      version: '1.0.0',
       regions: [{ id: 'whole-body', label: '全身' }],
     })
 

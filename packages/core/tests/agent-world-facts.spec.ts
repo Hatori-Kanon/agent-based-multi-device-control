@@ -99,9 +99,11 @@ describe('world facts projection', () => {
     })
     expect(lines[0]).toBe('可用意图：probe-touch=第档 %；silent=silent；sensation2=触及')
     expect(lines[1]).toBe('可用部位：whole-body=全身（作用于全部通道）；chest=左胸')
-    // Labels/meanings are digit-free; the id is the only digit carrier and it
-    // must match the pack vocabulary byte for byte.
-    expect(lines.join('\n').replaceAll('sensation2', '')).not.toMatch(/\p{Nd}/u)
+    // Labels/meanings are digit-free; the only digits are inside the id tokens,
+    // which must match the pack vocabulary byte for byte.
+    const ids = ['probe-touch', 'silent', 'sensation2', 'whole-body', 'chest']
+    const withoutIds = ids.reduce((text, id) => text.replaceAll(id, ''), lines.join('\n'))
+    expect(withoutIds).not.toMatch(/\p{Nd}/u)
     expect(lines.join('\n')).toContain('sensation2=触及')
   })
 

@@ -13,6 +13,7 @@ const HOST = '主持风格：短句、克制、不解释规则。'
 const PERSONA = '人设：嘴硬心软，称呼玩家为「你」。'
 const SCENE = '场景：深夜的房间，只有台灯亮着。'
 const BRIEFS = ['刚才的短促试探有明显反应。', '对方呼吸变快了一点。']
+const WORLD = ['可用意图：probe-touch=短促试探；soothe=安抚', '可用部位：whole-body=全身；chest=胸口', '已就位部位：chest']
 
 /** Render a prompt with only the requested blocks, at a budget that never cuts. */
 function promptFor(
@@ -21,6 +22,7 @@ function promptFor(
     readonly persona?: string
     readonly scene?: string
     readonly briefs?: readonly string[]
+    readonly world?: readonly string[]
   },
   budgetChars = 100_000,
 ): string {
@@ -30,6 +32,7 @@ function promptFor(
     ...(parts.persona === undefined ? {} : { persona: parts.persona }),
     ...(parts.scene === undefined ? {} : { scene: parts.scene }),
     ...(parts.briefs === undefined ? {} : { briefs: parts.briefs }),
+    ...(parts.world === undefined ? {} : { world: parts.world }),
     budgetChars,
   })
 }
@@ -48,12 +51,12 @@ describe('buildSystemPrompt', () => {
   })
 
   it('assembles every block in the documented order', () => {
-    const prompt = promptFor({ host: HOST, persona: PERSONA, scene: SCENE, briefs: BRIEFS })
-    const anchors = [BOUNDARIES[0] ?? '', HOST, PERSONA, SCENE, BRIEFS[0] ?? '']
+    const prompt = promptFor({ host: HOST, persona: PERSONA, scene: SCENE, briefs: BRIEFS, world: WORLD })
+    const anchors = [BOUNDARIES[0] ?? '', HOST, PERSONA, SCENE, BRIEFS[0] ?? '', WORLD[0] ?? '']
     const indexes = anchors.map(anchor => prompt.indexOf(anchor))
     expect(indexes.every(index => index >= 0)).toBe(true)
     expect([...indexes].sort((a, b) => a - b)).toEqual(indexes)
-    expect(PROMPT_SECTION_ORDER).toEqual(['boundaries', 'host', 'persona', 'scene', 'briefs'])
+    expect(PROMPT_SECTION_ORDER).toEqual(['boundaries', 'host', 'persona', 'scene', 'briefs', 'world'])
     expect(PROMPT_SACRIFICE_ORDER).toEqual(['briefs', 'scene', 'persona', 'host'])
   })
 
@@ -131,6 +134,29 @@ describe('buildSystemPrompt', () => {
     for (const boundary of BOUNDARIES) expect(tiny).toContain(boundary)
     // The documented exception: a cut boundary is worse than an over-budget prompt.
     expect(tiny.length).toBeGreaterThan(5)
+  })
+
+  it('keeps the mandatory world menu when a long persona fills the budget', () => {
+    // The single-call model cannot produce a valid `apply_plan` without the
+    // intent/region menu. Even when persona/scene/briefs consume the whole
+    // budget (the loop breaks before `world` in document order), the menu must
+    // still be appended — an over-budget prompt is the intended trade-off.
+    const longPersona = '长'.repeat(5_000)
+    const prompt = buildSystemPrompt({
+      boundaries: BOUNDARIES,
+      host: HOST,
+      persona: longPersona,
+      scene: SCENE,
+      briefs: BRIEFS,
+      world: WORLD,
+      budgetChars: 120,
+    })
+    for (const line of WORLD) expect(prompt).toContain(line)
+    expect(prompt).toContain('## 本回合可用（意图与部位）')
+    expect(prompt.endsWith(WORLD[WORLD.length - 1] ?? '')).toBe(true)
+    expect(prompt.length).toBeGreaterThan(120)
+    // The budgeted narrative blocks lost the sacrifice race, not the menu.
+    expect(prompt).not.toContain(BRIEFS[0] ?? '')
   })
 
   it('keeps whole briefs and drops the tail ones first', () => {

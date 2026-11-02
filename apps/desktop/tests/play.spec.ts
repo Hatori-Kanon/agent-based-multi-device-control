@@ -24,6 +24,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createHostRuntime, type HostRuntime } from '../src/main/bootstrap.ts'
 import {
   DirectoryPackSource,
+  openingBriefText,
   PlayHost,
   PlaySession,
   SessionError,
@@ -908,6 +909,10 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
     expect(system).toContain('shoulders=肩背')
     expect(system).toContain('whole-body=全身')
     expect(system).toContain('已就位部位：hands')
+    // The facts live in the mandatory `world` section, not in the budgeted
+    // narrative briefs: a long persona can never hide the menu.
+    expect(system).toContain('## 本回合可用（意图与部位）')
+    expect(system.indexOf('## 本回合可用（意图与部位）')).toBeGreaterThan(system.indexOf('## 人设'))
     // B carries no label: the model must not be told 肩背 is addressable.
     expect(system).not.toContain('已就位部位：hands、shoulders')
 
@@ -1105,6 +1110,20 @@ describe('session controls (B2-T11)', () => {
   })
 })
 
+
+describe('opening brief intent filter', () => {
+  it('renders firstIntent only when it is in the effective intent table', () => {
+    // Scenario validation only warns about an unknown metaReactions default,
+    // and freeform packs are not checked against DEFAULT_INTENTS at all. The
+    // rendered brief must agree with the apply_plan enum the host injects.
+    const all = new Set(['probe-touch', 'soothe'])
+    expect(openingBriefText({ tone: '冷', firstIntent: 'soothe' }, all)).toContain('首个意图「soothe」')
+    const unknown = openingBriefText({ tone: '冷', firstIntent: 'ghost' }, all)
+    expect(unknown).not.toContain('首个意图')
+    expect(unknown).toContain('语气「冷」')
+    expect(openingBriefText({ firstIntent: 'ghost' }, all)).toBe('')
+  })
+})
 
 describe('narrative-only session with no sensors and no devices (F-6)', () => {
   it('runs a whole session without any sensor source or connected device', async () => {
