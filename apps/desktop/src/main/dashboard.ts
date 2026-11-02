@@ -18,8 +18,9 @@ import { fileURLToPath } from 'node:url'
 import type { ChannelPolicy, PackRegistryEntry } from '@embodied/core'
 import {
   ContentPackError,
+  codeToHz,
   frequencyBandToHz,
-  hzBandToCode,
+  hzToCode,
   isSafetyError,
   isSensorError,
   MAX_FREQ_CODE,
@@ -427,17 +428,20 @@ function decorateWaveform(waveform: unknown): unknown {
 }
 
 /**
- * The stored frequency band of one channel, in whole Hz.
+ * The stored frequency band of one channel, in protocol codes.
  *
- * Read from the raw snapshot before a one-sided Hz patch is converted: the
- * dashboard does not own the policy store, so the other end of the band can
- * only come from what the registry just published.
+ * A one-sided Hz patch must leave the other end **exactly** where it is. The
+ * snapshot publishes the band in rounded Hz for display, and re-encoding a
+ * rounded Hz value can land on a different code (the fast end is ~9 Hz per
+ * code), so this reads the raw `minFreq`/`maxFreq` codes instead of the Hz
+ * decoration. The dashboard does not own the policy store, so the registry
+ * snapshot is the only source.
  */
-function storedFrequencyBand(
+function storedFrequencyCodes(
   snapshot: unknown,
   deviceId: unknown,
   channelId: unknown,
-): { minHz: number; maxHz: number } | undefined {
+): { minCode: number; maxCode: number } | undefined {
   const wantedDevice = asOptionalString(deviceId)
   const wantedChannel = asOptionalString(channelId)
   if (wantedDevice === undefined || wantedChannel === undefined) return undefined
@@ -449,10 +453,21 @@ function storedFrequencyBand(
     for (const rawChannel of device.channels) {
       const channel = asJsonObject(rawChannel)
       if (channel?.id !== wantedChannel) continue
-      return hzBandFields(channel.minFreq, channel.maxFreq)
+      const minCode = channel.minFreq
+      const maxCode = channel.maxFreq
+      if (typeof minCode !== 'number' || !Number.isInteger(minCode)) return undefined
+      if (typeof maxCode !== 'number' || !Number.isInteger(maxCode)) return undefined
+      if (minCode < MIN_FREQ_CODE || minCode >= maxCode || maxCode > MAX_FREQ_CODE) return undefined
+      return { minCode, maxCode }
     }
   }
   return undefined
+}
+
+/** Clamp a protocol code into `[low, high]`; a degenerate window returns `low`. */
+function clampCode(value: number, low: number, high: number): number {
+  if (low > high) return low
+  return Math.min(high, Math.max(low, value))
 }
 
 /** Every field `/api/cap` accepts; all are whole numbers. */
@@ -537,22 +552,58 @@ function capPatchFromBody(body: Record<string, unknown>, currentSnapshot: unknow
         throw new Error(`patch.${key} must be a whole number from ${MIN_FREQ_HZ} to ${MAX_FREQ_HZ} Hz`)
       }
     }
-    const needsStoredBand = numbers.minFreqHz === undefined || numbers.maxFreqHz === undefined
-    const stored = needsStoredBand
-      ? storedFrequencyBand(currentSnapshot, body.deviceId, body.channelId)
-      : undefined
-    const minHz = numbers.minFreqHz ?? stored?.minHz
-    const maxHz = numbers.maxFreqHz ?? stored?.maxHz
-    if (minHz === undefined || maxHz === undefined) {
-      throw new Error('cannot resolve the other frequency endpoint: unknown device or channel')
-    }
-    if (minHz >= maxHz) {
+    // Physical mapping: `minFreqHz` is the slow end of the band and becomes the
+    // *larger* protocol code; `maxFreqHz` is the fast end and becomes the
+    // smaller code. A one-sided patch keeps the untouched endpoint's code
+    // exactly, then clamps the changed end into a legal ordered pair; the clamp
+    // only matters at protocol granularity (the code space is ~9 Hz per step at
+    // the fast end), where the exact Hz value is not representable.
+    //
+    // This intentionally does not call `hzBandToCode`: that helper quantises
+    // *both* ends from Hz, which would move the endpoint the client did not
+    // touch (a rounded display value can re-encode to a neighbouring code).
+    // Two-sided patches are covered by a parity test against `hzBandToCode`.
+    const hasMinHz = numbers.minFreqHz !== undefined
+    const hasMaxHz = numbers.maxFreqHz !== undefined
+    if (hasMinHz && hasMaxHz && (numbers.minFreqHz as number) >= (numbers.maxFreqHz as number)) {
       throw new Error('minFreqHz must be less than maxFreqHz')
     }
-    const codes = hzBandToCode({ minHz, maxHz })
-    // The complete pair, never a single converted endpoint.
-    patch.minFreq = codes.minCode
-    patch.maxFreq = codes.maxCode
+    if (hasMinHz && hasMaxHz) {
+      const minCode = clampCode(hzToCode(numbers.maxFreqHz as number), MIN_FREQ_CODE, MAX_FREQ_CODE - 1)
+      const maxCode = clampCode(hzToCode(numbers.minFreqHz as number), minCode + 1, MAX_FREQ_CODE)
+      patch.minFreq = minCode
+      patch.maxFreq = maxCode
+    } else {
+      const stored = storedFrequencyCodes(currentSnapshot, body.deviceId, body.channelId)
+      if (stored === undefined) {
+        throw new Error('cannot resolve the other frequency endpoint: unknown device or channel')
+      }
+      if (hasMaxHz) {
+        // Fast end: keep the stored slow code, move only the fast code. Asking
+        // for a value at/below the untouched slow end is a crossing request, not
+        // something to silently clamp into a nonsense band.
+        const requested = numbers.maxFreqHz as number
+        const currentMinHz = codeToHz(stored.maxCode)
+        if (requested <= currentMinHz) {
+          throw new Error(
+            `maxFreqHz must be greater than the current minimum frequency (${currentMinHz.toFixed(1)} Hz)`,
+          )
+        }
+        patch.minFreq = clampCode(hzToCode(requested), MIN_FREQ_CODE, stored.maxCode - 1)
+        patch.maxFreq = stored.maxCode
+      } else {
+        // Slow end: keep the stored fast code, move only the slow code.
+        const requested = numbers.minFreqHz as number
+        const currentMaxHz = codeToHz(stored.minCode)
+        if (requested >= currentMaxHz) {
+          throw new Error(
+            `minFreqHz must be less than the current maximum frequency (${currentMaxHz.toFixed(1)} Hz)`,
+          )
+        }
+        patch.minFreq = stored.minCode
+        patch.maxFreq = clampCode(hzToCode(requested), stored.minCode + 1, MAX_FREQ_CODE)
+      }
+    }
   }
   if (Object.keys(patch).length === 0) {
     throw new Error('patch must set minPercent, maxPercent, minFreq, maxFreq, minFreqHz, maxFreqHz, or maxDurationSec')

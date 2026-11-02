@@ -65,23 +65,31 @@ interface FakeCamera {
 }
 
 /** Camera host that records start/stop and can fail one chosen device. */
-function fakeCameraHost(options: { readonly failDeviceId?: string } = {}): FakeCamera {
+function fakeCameraHost(
+  options: { readonly failDeviceId?: string; readonly failStop?: boolean; readonly failList?: boolean } = {},
+): FakeCamera {
   const starts: string[] = []
   let stops = 0
   const host: CameraHost = {
     sourceId: 'usb-cam-1',
     label: 'USB 摄像头',
-    listDevices: async () => [
-      { deviceId: 'cam-1', label: 'USB Camera' },
-      { deviceId: 'cam-2', label: '第二摄像头' },
-    ],
+    listDevices: async () => {
+      if (options.failList === true) throw new Error('enumerateDevices failed: NotFoundError')
+      return [
+        { deviceId: 'cam-1', label: 'USB Camera' },
+        { deviceId: 'cam-2', label: '第二摄像头' },
+      ]
+    },
     start: async deviceId => {
       if (deviceId === options.failDeviceId) {
         throw new Error('getUserMedia failed: NotAllowedError: Permission denied')
       }
       starts.push(deviceId)
     },
-    stop: async () => { stops += 1 },
+    stop: async () => {
+      stops += 1
+      if (options.failStop === true) throw new Error('bridge stop failed')
+    },
     latestJpeg: async () => undefined,
     onFeatures: () => () => {},
   }
@@ -116,6 +124,8 @@ interface SettingsBody {
     apiKeySource: 'env' | 'file' | 'none'
     apiKeyEnv: string
     hasApiKey: boolean
+    split: boolean
+    warning: string | null
   }
   sensors: {
     camera: {
@@ -174,11 +184,14 @@ describe('settings API', () => {
       apiKeySource: 'none',
       apiKeyEnv: 'EMBODIED_LLM_API_KEY',
       hasApiKey: false,
+      split: false,
+      warning: null,
     })
     expect(body.sensors.camera).toMatchObject({
       supported: true,
       enabled: true,
-      deviceId: null,
+      // The first device was auto-opened, so that is the device in use.
+      deviceId: 'cam-1',
       status: 'running',
     })
     expect(body.sensors.camera.devices.map(device => device.deviceId)).toEqual(['cam-1', 'cam-2'])
@@ -234,6 +247,8 @@ describe('settings API', () => {
       apiKeySource: 'file',
       apiKeyEnv: 'EMBODIED_LLM_API_KEY',
       hasApiKey: true,
+      split: false,
+      warning: null,
     })
     expect(JSON.stringify(body)).not.toContain('sk-test-secret')
     const first = await readJsonFile(join(root, 'state', 'llm.json'))
@@ -356,7 +371,8 @@ describe('settings API', () => {
     expect(body.error).toContain('ghost-cam')
 
     const settings = await clientOf(host).json<SettingsBody>(await clientOf(host).get('/api/settings'))
-    expect(settings.sensors.camera.deviceId).toBeNull()
+    // The camera is still running its original device; the bad patch changed nothing.
+    expect(settings.sensors.camera.deviceId).toBe('cam-1')
     // The failed patch did not start anything new.
     expect(camera.starts).toEqual(['cam-1'])
   })
@@ -425,7 +441,7 @@ describe('settings API', () => {
     const saved = await client.post('/api/settings/llm', {
       provider: 'fixture',
       model: 'fixture-model-next',
-      baseUrl: 'http://fixture.invalid/v1',
+      baseUrl: 'https://fixture.invalid/v1',
       apiKey: 'sk-fixture',
     })
     expect(saved.status).toBe(200)
@@ -437,6 +453,247 @@ describe('settings API', () => {
     expect(gateway.calls).toHaveLength(1)
     expect(gateway.calls[0]?.url).toContain('fixture.invalid')
     expect(gateway.calls[0]?.body.model).toBe('fixture-model-next')
+  })
+
+  it('refuses a model config the gateway cannot construct and writes nothing', async () => {
+    const host = await start({ llmEnv: {} })
+    const client = clientOf(host)
+    const before = await client.json<SettingsBody>(await client.get('/api/settings'))
+
+    // No default endpoint for this provider and no baseUrl: the runner throws
+    // on construction, so persisting it would make every later boot fail.
+    const response = await client.post('/api/settings/llm', { provider: 'acme' })
+    expect(response.status).toBe(400)
+    const body = await client.json<{ ok: boolean; error: string; code: string }>(response)
+    expect(body.ok).toBe(false)
+    expect(body.code).toBe('INVALID_LLM')
+    expect(body.error).toContain('baseUrl')
+    // The rejection happened before the write: no file, no host change.
+    expect(await readJsonFile(join(root, 'state', 'llm.json'))).toBeUndefined()
+    const after = await client.json<SettingsBody>(await client.get('/api/settings'))
+    expect(after.llm).toEqual(before.llm)
+    expect(host.llm.default).toMatchObject({ provider: 'deepseek', model: 'deepseek-chat' })
+  })
+
+  it('boots on the built-in default when state/llm.json names an unrunnable model', async () => {
+    await mkdir(join(root, 'state'), { recursive: true })
+    await writeFile(join(root, 'state', 'llm.json'), JSON.stringify({
+      version: 1,
+      default: { provider: 'acme', model: 'no-endpoint' },
+      director: null,
+      writer: null,
+    }))
+    // A hand-edited file must never make the console unbootable.
+    const host = await start({ llmEnv: {} })
+    expect(host.llm.default).toMatchObject({ provider: 'deepseek', model: 'deepseek-chat' })
+    const body = await clientOf(host).json<SettingsBody>(await clientOf(host).get('/api/settings'))
+    expect(body.llm).toMatchObject({ provider: 'deepseek', model: 'deepseek-chat', apiKeySource: 'none' })
+    // The operator's file is left alone so they can see and fix what they wrote.
+    expect((await readJsonFile(join(root, 'state', 'llm.json')))?.default).toMatchObject({
+      provider: 'acme',
+      model: 'no-endpoint',
+    })
+    // A valid save recovers the model without a restart.
+    const saved = await clientOf(host).post('/api/settings/llm', { provider: 'deepseek', model: 'deepseek-chat' })
+    expect(saved.status).toBe(200)
+    expect((await readJsonFile(join(root, 'state', 'llm.json')))?.default).toMatchObject({
+      provider: 'deepseek',
+      model: 'deepseek-chat',
+    })
+  })
+
+  it('keeps the file key when an environment key shadows it and apiKey is omitted', async () => {
+    const host = await start({ llmEnv: { EMBODIED_LLM_API_KEY: 'env-secret' } })
+    const client = clientOf(host)
+    expect((await client.post('/api/settings/llm', { apiKey: 'file-secret' })).status).toBe(200)
+    // A save that does not mention the key must not delete the file copy just
+    // because the resolved key currently comes from the environment.
+    expect((await client.post('/api/settings/llm', { model: 'deepseek-chat' })).status).toBe(200)
+    expect((await readJsonFile(join(root, 'state', 'llm.json')))?.apiKey).toBe('file-secret')
+    const body = await client.json<SettingsBody>(await client.get('/api/settings'))
+    expect(body.llm).toMatchObject({ apiKeySource: 'env', hasApiKey: true })
+  })
+
+  it('serialises concurrent settings writes instead of dropping one side', async () => {
+    const camera = fakeCameraHost()
+    const audio = fakeAudioHost()
+    const host = await start({ cameraHost: camera.host, audioHost: audio.host })
+    const client = clientOf(host)
+    const [cameraOff, micOn] = await Promise.all([
+      client.post('/api/settings/sensors', { camera: { enabled: false } }),
+      client.post('/api/settings/sensors', { microphone: { enabled: true } }),
+    ])
+    expect(cameraOff.status).toBe(200)
+    expect(micOn.status).toBe(200)
+    const file = await readJsonFile(join(root, 'state', 'settings.json'))
+    expect(file?.sensors.camera.enabled).toBe(false)
+    expect(file?.sensors.microphone.enabled).toBe(true)
+    const body = await client.json<SettingsBody>(await client.get('/api/settings'))
+    expect(body.sensors.camera).toMatchObject({ enabled: false, status: 'stopped' })
+    expect(body.sensors.microphone).toMatchObject({ enabled: true, status: 'running' })
+  })
+
+  it('stops capture on shutdown', async () => {
+    const camera = fakeCameraHost()
+    const audio = fakeAudioHost()
+    const host = await start({ cameraHost: camera.host, audioHost: audio.host })
+    const client = clientOf(host)
+    expect((await client.post('/api/settings/sensors', { microphone: { enabled: true } })).status).toBe(200)
+    expect(camera.stops()).toBe(0)
+    expect(audio.stops()).toBe(0)
+    await host.shutdown()
+    runtime = undefined
+    // Both capture streams must be released by the graceful quit path.
+    expect(camera.stops()).toBe(1)
+    expect(audio.stops()).toBe(1)
+  })
+
+  it('refuses cleartext remote endpoints and accepts loopback http', async () => {
+    const host = await start({ llmEnv: {} })
+    const client = clientOf(host)
+
+    // Remote http would send the bearer key in clear text.
+    expect((await client.post('/api/settings/llm', { baseUrl: 'http://example.com/v1' })).status).toBe(400)
+    // Userinfo would put a password in a URL that is echoed and audited.
+    expect((await client.post('/api/settings/llm', {
+      baseUrl: 'https://user:pass@example.com/v1',
+    })).status).toBe(400)
+    // A local model server may stay on http.
+    const local = await client.post('/api/settings/llm', {
+      provider: 'ollama',
+      model: 'llama3',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+    })
+    expect(local.status).toBe(200)
+    expect((await client.json<SettingsBody>(local)).llm).toMatchObject({
+      provider: 'ollama',
+      model: 'llama3',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+    })
+  })
+
+  it('reports a failed capture stop as an error state instead of "stopped"', async () => {
+    const camera = fakeCameraHost({ failStop: true })
+    const host = await start({ cameraHost: camera.host })
+    const client = clientOf(host)
+
+    const off = await client.post('/api/settings/sensors', { camera: { enabled: false } })
+    expect(off.status).toBe(200)
+    const body = await client.json<SettingsBody>(off)
+    expect(body.sensors.camera).toMatchObject({ supported: true, enabled: false, status: 'error' })
+    expect(body.sensors.camera.error).toContain('stop failed')
+    expect(camera.stops()).toBe(1)
+  })
+
+  it('reports a capture-enumeration failure instead of an empty device list', async () => {
+    const camera = fakeCameraHost({ failList: true })
+    const host = await start({ cameraHost: camera.host })
+    const body = await clientOf(host).json<SettingsBody>(await clientOf(host).get('/api/settings'))
+    expect(body.sensors.camera.supported).toBe(true)
+    expect(body.sensors.camera.status).toBe('error')
+    expect(body.sensors.camera.error).toContain('enumerateDevices')
+    // Boot could not start capture either; the source must not claim to run.
+    expect(camera.starts).toEqual([])
+  })
+
+  it('sanitises an invalid director so the settings page can repair the file', async () => {
+    await mkdir(join(root, 'state'), { recursive: true })
+    await writeFile(join(root, 'state', 'llm.json'), JSON.stringify({
+      version: 1,
+      default: { provider: 'deepseek', model: 'deepseek-chat' },
+      // The single-call lane resolves the director first; this role is
+      // unrunnable (unknown provider, no baseUrl) and used to brick saves.
+      director: { provider: 'acme', model: 'no-endpoint' },
+      writer: null,
+    }))
+    const host = await start({ llmEnv: {} })
+    const client = clientOf(host)
+    const before = await client.json<SettingsBody>(await client.get('/api/settings'))
+    expect(before.llm.warning).toContain('director')
+    expect(before.llm.split).toBe(false)
+
+    // Saving the default model now succeeds and drops the invalid role from the
+    // file, so the page can repair a hand-edited configuration.
+    const saved = await client.post('/api/settings/llm', { model: 'deepseek-reasoner' })
+    expect(saved.status).toBe(200)
+    const file = await readJsonFile(join(root, 'state', 'llm.json'))
+    expect(file?.default.model).toBe('deepseek-reasoner')
+    expect(file?.director).toBeNull()
+    const after = await client.json<SettingsBody>(await client.get('/api/settings'))
+    expect(after.llm.warning).toBeNull()
+    expect(after.llm.split).toBe(false)
+  })
+
+  it('keeps a valid director/writer configuration and says so', async () => {
+    await mkdir(join(root, 'state'), { recursive: true })
+    await writeFile(join(root, 'state', 'llm.json'), JSON.stringify({
+      version: 1,
+      default: { provider: 'deepseek', model: 'deepseek-chat' },
+      director: { provider: 'deepseek', model: 'deepseek-reasoner' },
+      writer: null,
+    }))
+    const host = await start({ llmEnv: {} })
+    const client = clientOf(host)
+    const before = await client.json<SettingsBody>(await client.get('/api/settings'))
+    expect(before.llm.split).toBe(true)
+    expect(before.llm.warning).toContain('director')
+
+    expect((await client.post('/api/settings/llm', { model: 'deepseek-chat' })).status).toBe(200)
+    const file = await readJsonFile(join(root, 'state', 'llm.json'))
+    expect(file?.director).toMatchObject({ provider: 'deepseek', model: 'deepseek-reasoner' })
+  })
+
+  it('drops simulated devices left in an upgraded device manifest', async () => {
+    await mkdir(join(root, 'state'), { recursive: true })
+    await writeFile(join(root, 'state', 'devices.json'), JSON.stringify({
+      version: 3,
+      devices: [
+        { key: 'mock', protocol: 'mock' },
+        { key: 'coyote', protocol: 'coyote' },
+      ],
+    }))
+    const host = await start({ llmEnv: {} })
+    // No manifest entry may resurrect fake hardware; the file is rewritten.
+    expect(host.listDevices().map(device => device.key)).not.toContain('mock')
+    const file = await readJsonFile(join(root, 'state', 'devices.json'))
+    expect((file?.devices as Array<{ key: string }>).map(entry => entry.key)).not.toContain('mock')
+    expect(host.listDevices().map(device => device.key)).toContain('coyote')
+  })
+
+  it('applies a model change to the next turn of a running session', async () => {
+    await installDemoPack(root)
+    const gateway = new FixtureGateway([
+      { text: '第一回合。', plan: simplePlan() },
+      { text: '第二回合。' },
+    ])
+    const host = await start({ llmFetch: gateway.fetch, llmEnv: {} })
+    const client = clientOf(host)
+    await host.registry.connect('mock-pulse', new AbortController().signal)
+    // A constructible model + key must exist before the first turn (otherwise
+    // the opening turn fails before reaching the network boundary).
+    expect((await client.post('/api/settings/llm', {
+      provider: 'fixture',
+      model: 'fixture-model-first',
+      baseUrl: 'https://first.invalid/v1',
+      apiKey: 'sk-fixture',
+    })).status).toBe(200)
+    expect((await client.post('/api/session/start', { packId: 'demo', plannedMinutes: 20 })).status).toBe(200)
+    expect(gateway.calls).toHaveLength(1)
+    expect(gateway.calls[0]?.url).toContain('first.invalid')
+
+    // Save a different endpoint while the session is still open.
+    const saved = await client.post('/api/settings/llm', {
+      provider: 'fixture',
+      model: 'fixture-model-swapped',
+      baseUrl: 'https://swapped.invalid/v1',
+    })
+    expect(saved.status).toBe(200)
+    expect((await client.post('/api/session/message', { text: '继续' })).status).toBe(200)
+
+    // The second turn resolved the swapped runner without a host restart.
+    expect(gateway.calls).toHaveLength(2)
+    expect(gateway.calls[1]?.url).toContain('swapped.invalid')
+    expect(gateway.calls[1]?.body.model).toBe('fixture-model-swapped')
   })
 })
 

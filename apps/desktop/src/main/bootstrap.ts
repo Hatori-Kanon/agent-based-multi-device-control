@@ -74,8 +74,19 @@ import {
   type SettingsDeps,
   type SettingsPayload,
 } from './host-settings.ts'
-import { createModelRunner, llmSummaryOf, loadLlmSettings, saveLlmConfig, settingsFromConfig, singleCallModel } from './llm.ts'
+import {
+  createModelRunner,
+  DEFAULT_LLM_CONFIG,
+  LLM_SETTINGS_KEY,
+  llmSummaryOf,
+  loadLlmSettings,
+  saveLlmConfig,
+  settingsFromConfig,
+  singleCallModel,
+  storedApiKeyOf,
+} from './llm.ts'
 import type { LlmSettings } from './llm.ts'
+import { resolveApiKey } from './settings.ts'
 import type { LlmSummary, SettingsEnv } from './settings.ts'
 
 export interface HostRuntimeOptions {
@@ -514,7 +525,96 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     clock,
     env: llmEnv,
   })
-  let modelRunner: ModelRunner = buildModelRunner(llmSettings)
+  /** Can the gateway construct a runner for this model? Constructor only — no IO. */
+  const runnerBuilds = (model: ModelConfig): boolean => {
+    try {
+      createModelRunner({
+        model,
+        fetch: options.llmFetch ?? globalThis.fetch,
+        clock,
+        env: llmEnv,
+      })
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Drop `director`/`writer` roles the gateway cannot construct.
+   *
+   * A hand-edited split-mode file can name an unrunnable role; the single-call
+   * lane resolves `director` first, so keeping such a role would either fail
+   * boot or make every later settings save fail. The invalid role is ignored in
+   * memory (and dropped on the next save, which repairs the file) instead.
+   */
+  const sanitizeLlmConfig = (config: LlmConfig): {
+    readonly config: LlmConfig
+    readonly dropped: ReadonlyArray<'director' | 'writer'>
+  } => {
+    const dropped: Array<'director' | 'writer'> = []
+    let director = config.director ?? null
+    if (director !== null && !runnerBuilds(director)) {
+      dropped.push('director')
+      director = null
+    }
+    let writer = config.writer ?? null
+    if (writer !== null && !runnerBuilds(writer)) {
+      dropped.push('writer')
+      writer = null
+    }
+    return { config: { default: config.default, director, writer }, dropped }
+  }
+
+  /** Terse, key-free reasons shown by the settings page after a degraded boot. */
+  let llmWarning: string[] = []
+
+  // A hand-edited `state/llm.json` can name a provider with no default endpoint
+  // (e.g. provider "acme" and no `baseUrl`): the runner constructor throws, and
+  // failing here would make the whole console unbootable. The host falls back to
+  // the built-in default **in memory**, leaves the operator's file untouched (so
+  // they can see what they wrote), records the degradation and surfaces a
+  // warning in the settings payload.
+  let modelRunner: ModelRunner
+  try {
+    modelRunner = buildModelRunner(llmSettings)
+  } catch (error) {
+    recordError(error)
+    const reason = error instanceof Error ? error.message : String(error)
+    log(`[llm] configured model is unusable (${reason}); falling back in memory`)
+    const configuredDefault = llmSettings.config.default
+    const nextDefault = runnerBuilds(configuredDefault) ? configuredDefault : DEFAULT_LLM_CONFIG.default
+    const sanitized = sanitizeLlmConfig({
+      default: nextDefault,
+      director: llmSettings.config.director ?? null,
+      writer: llmSettings.config.writer ?? null,
+    })
+    const rawFile = await documents.read(LLM_SETTINGS_KEY)
+    const resolved = resolveApiKey(llmEnv, sanitized.config.default, storedApiKeyOf(rawFile))
+    llmSettings = {
+      config: sanitized.config,
+      apiKey: resolved.apiKey,
+      apiKeySource: resolved.source,
+    }
+    llm = llmSettings.config
+    modelRunner = buildModelRunner(llmSettings)
+    llmWarning = [
+      ...(nextDefault === configuredDefault ? [] : ['当前模型配置无效，已临时使用内置默认模型']),
+      ...(sanitized.dropped.length === 0 ? [] : [`已忽略无效的 ${sanitized.dropped.join('/')} 配置`]),
+      '在设置页保存一次即可修复',
+    ]
+    await audit.record({
+      actor: 'system',
+      action: 'settings_change',
+      result: 'ok',
+      detail: {
+        scope: 'llm-boot-fallback',
+        reason,
+        droppedRoles: sanitized.dropped,
+        usedDefaultModel: nextDefault !== configuredDefault,
+      },
+    })
+  }
   const llmSummary = (): LlmSummary => llmSummaryOf(llmSettings)
 
   // Region labels: manifest defaults live in the registry snapshot; the
@@ -554,13 +654,18 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     const message = error instanceof Error ? error.message : String(error)
     return message.length > 120 ? `${message.slice(0, 117)}…` : message
   }
-  const listCaptureDevices = async (host: CaptureHostLike | undefined): Promise<SensorDeviceInfo[]> => {
-    if (host === undefined) return []
+  interface CaptureDeviceList {
+    readonly devices: SensorDeviceInfo[]
+    /** Short reason when enumeration itself failed (distinct from "no hardware"). */
+    readonly error?: string
+  }
+  const listCaptureDevices = async (host: CaptureHostLike | undefined): Promise<CaptureDeviceList> => {
+    if (host === undefined) return { devices: [] }
     try {
-      return [...await host.listDevices()]
+      return { devices: [...await host.listDevices()] }
     } catch (error) {
       recordError(error)
-      return []
+      return { devices: [], error: shortError(error) }
     }
   }
   /**
@@ -577,7 +682,15 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       control.status = 'unavailable'
       return
     }
-    control.devices = await listCaptureDevices(host)
+    const listed = await listCaptureDevices(host)
+    control.devices = listed.devices
+    if (listed.error !== undefined) {
+      control.runningDeviceId = null
+      control.status = 'error'
+      control.error = listed.error
+      pushUnavailableSample(host.sourceId)
+      return
+    }
     const stored = preferred !== null && control.devices.some(device => device.deviceId === preferred)
       ? preferred
       : undefined
@@ -616,17 +729,20 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       control.status = 'unavailable'
       return
     }
+    let stopError: unknown
     if (control.runningDeviceId !== null) {
       try {
         await host.stop()
       } catch (error) {
-        // A failing bridge stop must not block disabling the source.
+        // A failing bridge stop must not block disabling the source, but the
+        // status must not claim a clean stop either.
+        stopError = error
         recordError(error)
       }
     }
     control.runningDeviceId = null
-    control.status = 'stopped'
-    control.error = undefined
+    control.status = stopError === undefined ? 'stopped' : 'error'
+    control.error = stopError === undefined ? undefined : shortError(stopError)
     pushUnavailableSample(host.sourceId)
   }
   /** Apply one persisted preference to a live capture host. */
@@ -645,7 +761,9 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     return {
       supported: true,
       enabled: control.preference.enabled,
-      deviceId: control.preference.deviceId,
+      // What capture is using right now, falling back to the stored preference
+      // when nothing is running (stopped/disabled/error).
+      deviceId: control.runningDeviceId ?? control.preference.deviceId,
       devices: control.devices,
       status: control.status,
       ...(control.error === undefined ? {} : { error: control.error }),
@@ -709,66 +827,130 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
   // The console's 设置 view is a thin client of these three operations. The API
   // key never crosses this boundary: `LlmSettings` is its only carrier and it
   // goes straight into the runner's auth header.
+  /** Degraded-config warnings the settings page shows (terse, key-free). */
+  const llmWarnings = (): string[] => [
+    ...llmWarning,
+    ...(llm.director !== null || llm.writer !== null
+      ? ['文件里另有 director/writer 配置；设置页只修改默认模型']
+      : []),
+  ]
+  /** Base URL safe for the audit trail: query/hash may carry operator secrets. */
+  const redactBaseUrl = (value: string | undefined): string | null =>
+    value === undefined ? null : value.replace(/[?#].*$/u, '')
+
   const settingsSnapshot = async (): Promise<SettingsPayload> => {
     // The page's refresh buttons re-list devices by calling this again.
-    cameraControl.devices = await listCaptureDevices(options.cameraHost)
-    microphoneControl.devices = await listCaptureDevices(options.audioHost)
+    const cameraDevices = await listCaptureDevices(options.cameraHost)
+    const microphoneDevices = await listCaptureDevices(options.audioHost)
+    cameraControl.devices = cameraDevices.devices
+    microphoneControl.devices = microphoneDevices.devices
+    // An enumeration fault is not "no hardware": show it instead of turning it
+    // into an empty dropdown with a misleading 没有可用的设备.
+    if (cameraDevices.error !== undefined && cameraControl.status !== 'running') {
+      cameraControl.status = 'error'
+      cameraControl.error = cameraDevices.error
+    }
+    if (microphoneDevices.error !== undefined && microphoneControl.status !== 'running') {
+      microphoneControl.status = 'error'
+      microphoneControl.error = microphoneDevices.error
+    }
     return buildSettingsPayload({
-      llm: buildLlmSettingsPayload(llmSummary(), llm),
+      llm: buildLlmSettingsPayload(llmSummary(), llm, { warning: llmWarnings() }),
       sensors: { camera: captureState(cameraControl), microphone: captureState(microphoneControl) },
     })
   }
 
-  const saveLlmSettings = async (patch: LlmSettingsPatch): Promise<SettingsPayload> => {
-    if (options.llmConfig !== undefined) {
-      throw new SettingsError(
-        'FIXED_LLM_CONFIG',
-        'this host was started with an in-memory model config; start it from state/llm.json to change the model here',
-      )
-    }
-    // Re-read the file: a hand-edit between boot and save must not be silently
-    // dropped from the fields this patch does not mention.
-    const before = await loadLlmSettings(options.dataDir, llmEnv)
-    const previousDefault = before.config.default
-    const baseUrl = patch.baseUrl === undefined ? previousDefault.baseUrl : (patch.baseUrl ?? undefined)
-    const { baseUrl: _previousBaseUrl, ...restDefault } = previousDefault
-    const nextDefault: ModelConfig = {
-      ...restDefault,
-      ...(patch.provider === undefined ? {} : { provider: patch.provider }),
-      ...(patch.model === undefined ? {} : { model: patch.model }),
-      ...(baseUrl === undefined ? {} : { baseUrl }),
-    }
-    const nextConfig: LlmConfig = {
-      default: nextDefault,
-      director: before.config.director ?? null,
-      writer: before.config.writer ?? null,
-    }
-    // Key semantics: omitted = keep the stored key, `''` = clear, else replace.
-    // An env-resolved key is never copied into the file.
-    const storedKey = patch.apiKey === undefined
-      ? (before.apiKeySource === 'file' ? before.apiKey : undefined)
-      : (patch.apiKey.trim() === '' ? undefined : patch.apiKey.trim())
-    await saveLlmConfig(options.dataDir, nextConfig, storedKey === undefined ? {} : { apiKey: storedKey })
-    const next = await loadLlmSettings(options.dataDir, llmEnv)
-    llmSettings = next
-    llm = next.config
-    // Swap the runner: the next turn resolves it through the session provider.
-    modelRunner = buildModelRunner(next)
-    await audit.record({
-      actor: 'human',
-      action: 'settings_change',
-      result: 'ok',
-      detail: {
-        scope: 'llm',
-        provider: next.config.default.provider,
-        model: next.config.default.model,
-        baseUrl: next.config.default.baseUrl ?? null,
-        apiKeySource: next.apiKeySource,
-        apiKeyChanged: patch.apiKey !== undefined,
-      },
-    })
-    return settingsSnapshot()
+  /**
+   * Serialise settings read-modify-write operations.
+   *
+   * Each operation reads the persisted state, applies a patch and writes it
+   * back. Two quick toggles — or a model save racing a sensor save — must not
+   * interleave, or one side would be silently dropped.
+   */
+  let settingsOps: Promise<unknown> = Promise.resolve()
+  const runSettingsOp = <T>(operation: () => Promise<T>): Promise<T> => {
+    const next = settingsOps.then(operation, operation)
+    settingsOps = next.catch(() => {})
+    return next
   }
+
+  const saveLlmSettings = (patch: LlmSettingsPatch): Promise<SettingsPayload> =>
+    runSettingsOp(async () => {
+      if (options.llmConfig !== undefined) {
+        throw new SettingsError(
+          'FIXED_LLM_CONFIG',
+          'this host was started with an in-memory model config; start it from state/llm.json to change the model here',
+        )
+      }
+      // Re-read the file: a hand-edit between boot and save must not be silently
+      // dropped from the fields this patch does not mention.
+      const before = await loadLlmSettings(options.dataDir, llmEnv)
+      const previousDefault = before.config.default
+      const baseUrl = patch.baseUrl === undefined ? previousDefault.baseUrl : (patch.baseUrl ?? undefined)
+      const { baseUrl: _previousBaseUrl, ...restDefault } = previousDefault
+      const nextDefault: ModelConfig = {
+        ...restDefault,
+        ...(patch.provider === undefined ? {} : { provider: patch.provider }),
+        ...(patch.model === undefined ? {} : { model: patch.model }),
+        ...(baseUrl === undefined ? {} : { baseUrl }),
+      }
+      const nextConfig: LlmConfig = {
+        default: nextDefault,
+        director: before.config.director ?? null,
+        writer: before.config.writer ?? null,
+      }
+      // Key semantics: omitted = keep the key already *in the file* (the
+      // resolved value can be an environment variable that shadows it), `''` =
+      // clear, anything else = replace. An env-resolved key is never copied in.
+      const rawBefore = await documents.read(LLM_SETTINGS_KEY)
+      const storedKey = patch.apiKey === undefined
+        ? storedApiKeyOf(rawBefore)
+        : (patch.apiKey.trim() === '' ? undefined : patch.apiKey.trim())
+      // The default model is what this page edits: it must be constructible
+      // exactly as typed (an unknown provider without a `baseUrl` is a 400
+      // here, not a file that bricks every later boot).
+      try {
+        createModelRunner({
+          model: nextDefault,
+          fetch: options.llmFetch ?? globalThis.fetch,
+          clock,
+          env: llmEnv,
+        })
+      } catch (error) {
+        throw new SettingsError('INVALID_LLM', shortError(error))
+      }
+      // `director`/`writer` are file-level configuration. Drop an unrunnable
+      // one so this save succeeds *and* repairs the file instead of preserving
+      // a config that makes the UI unable to save anything later.
+      const sanitized = sanitizeLlmConfig(nextConfig)
+      const savedConfig = sanitized.config
+      await saveLlmConfig(options.dataDir, savedConfig, storedKey === undefined ? {} : { apiKey: storedKey })
+      const next = await loadLlmSettings(options.dataDir, llmEnv)
+      // Build the real runner before publishing the new settings: a failure
+      // would otherwise leave the host showing a config it cannot run.
+      const nextRunner = buildModelRunner(next)
+      llmSettings = next
+      llm = next.config
+      modelRunner = nextRunner
+      // A successful save has just repaired the file (invalid roles are
+      // dropped above), so the degraded-boot warning no longer applies.
+      llmWarning = []
+      await audit.record({
+        actor: 'human',
+        action: 'settings_change',
+        result: 'ok',
+        detail: {
+          scope: 'llm',
+          provider: next.config.default.provider,
+          model: next.config.default.model,
+          // Audit is a durable file: never copy a query/hash that may be secret.
+          baseUrl: redactBaseUrl(next.config.default.baseUrl),
+          apiKeySource: next.apiKeySource,
+          apiKeyChanged: patch.apiKey !== undefined,
+        },
+      })
+      return settingsSnapshot()
+    })
 
   /** A mentioned device id must exist on that capture host right now. */
   const assertKnownCaptureDevice = async (
@@ -778,34 +960,39 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     const deviceId = designation.deviceId
     if (deviceId === undefined || deviceId === null) return
     // Re-list before judging: a device plugged in after boot is selectable.
-    control.devices = await listCaptureDevices(control.host)
+    const listed = await listCaptureDevices(control.host)
+    control.devices = listed.devices
+    if (listed.error !== undefined) {
+      throw new SettingsError('INVALID_SENSOR', `could not list capture devices: ${listed.error}`)
+    }
     if (!control.devices.some(device => device.deviceId === deviceId)) {
       throw new SettingsError('INVALID_SENSOR', `unknown capture device "${deviceId}"`)
     }
   }
 
-  const saveSensorSettings = async (patch: SensorPreferencesPatch): Promise<SettingsPayload> => {
-    if (patch.camera !== undefined) await assertKnownCaptureDevice(cameraControl, patch.camera)
-    if (patch.microphone !== undefined) await assertKnownCaptureDevice(microphoneControl, patch.microphone)
-    const nextPreferences = mergeSensorPreferences(sensorPreferences, patch)
-    sensorPreferences = nextPreferences
-    // Capture failures are reported, never thrown: the preference is saved and
-    // the payload carries `status: 'error'` plus a short reason.
-    if (patch.camera !== undefined) await applyCapturePreference(cameraControl, nextPreferences.camera)
-    if (patch.microphone !== undefined) await applyCapturePreference(microphoneControl, nextPreferences.microphone)
-    await saveSensorPreferences(documents, nextPreferences)
-    await audit.record({
-      actor: 'human',
-      action: 'settings_change',
-      result: 'ok',
-      detail: {
-        scope: 'sensors',
-        camera: { enabled: nextPreferences.camera.enabled, deviceId: nextPreferences.camera.deviceId },
-        microphone: { enabled: nextPreferences.microphone.enabled, deviceId: nextPreferences.microphone.deviceId },
-      },
+  const saveSensorSettings = (patch: SensorPreferencesPatch): Promise<SettingsPayload> =>
+    runSettingsOp(async () => {
+      if (patch.camera !== undefined) await assertKnownCaptureDevice(cameraControl, patch.camera)
+      if (patch.microphone !== undefined) await assertKnownCaptureDevice(microphoneControl, patch.microphone)
+      const nextPreferences = mergeSensorPreferences(sensorPreferences, patch)
+      sensorPreferences = nextPreferences
+      // Capture failures are reported, never thrown: the preference is saved and
+      // the payload carries `status: 'error'` plus a short reason.
+      if (patch.camera !== undefined) await applyCapturePreference(cameraControl, nextPreferences.camera)
+      if (patch.microphone !== undefined) await applyCapturePreference(microphoneControl, nextPreferences.microphone)
+      await saveSensorPreferences(documents, nextPreferences)
+      await audit.record({
+        actor: 'human',
+        action: 'settings_change',
+        result: 'ok',
+        detail: {
+          scope: 'sensors',
+          camera: { enabled: nextPreferences.camera.enabled, deviceId: nextPreferences.camera.deviceId },
+          microphone: { enabled: nextPreferences.microphone.enabled, deviceId: nextPreferences.microphone.deviceId },
+        },
+      })
+      return settingsSnapshot()
     })
-    return settingsSnapshot()
-  }
 
   /** The seam the console's settings routes are driven through. */
   const settingsDeps: SettingsDeps = {
@@ -908,6 +1095,21 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
         recordError(error)
       }
     }
+    // The v3 console let operators add "模拟设备"; those entries are not part
+    // of the product any more. Drop them from the loaded manifest (and rewrite
+    // the file) instead of registering fake hardware again on an upgraded data
+    // directory.
+    const mockEntries = manifest.filter(entry => entry.protocol === 'mock')
+    const cleanedMockManifest = mockEntries.length > 0
+    if (cleanedMockManifest) {
+      manifest = manifest.filter(entry => entry.protocol !== 'mock')
+      await audit.record({
+        actor: 'system',
+        action: 'settings_change',
+        result: 'ok',
+        detail: { scope: 'mock-manifest-cleanup', removed: mockEntries.map(entry => entry.key) },
+      })
+    }
     if (options.bleTransport !== undefined) {
       if (manifest.length === 0) {
         manifest = [...WELL_KNOWN_DEVICES]
@@ -925,6 +1127,9 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
         await saveManifest()
       }
     }
+    // Persist the mock removal even when no BLE transport runs (dev-server), so
+    // the upgrade happens once instead of on every boot.
+    if (cleanedMockManifest && options.bleTransport === undefined) await saveManifest()
   }
 
   // Tests and fixtures keep the two simulated devices; product entry points
@@ -1309,6 +1514,19 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       play.dispose()
       await panicServer?.stop()
       await dashboardServer?.stop()
+      // Capture streams belong to the hidden worker window, not to the
+      // registry: stop them here so a graceful quit cannot leave the camera or
+      // the microphone light on after the console is gone.
+      try {
+        await cameraControl.host?.stop()
+      } catch (error) {
+        onError(error)
+      }
+      try {
+        await microphoneControl.host?.stop()
+      } catch (error) {
+        onError(error)
+      }
       // 注册表没有需要释放的句柄；等排队中的导入/切换写完（或回滚完），
       // 避免进程在“包文件已写、registry.json 未写”的中间态退出。
       await packOps.catch(() => {})

@@ -70,7 +70,7 @@
 | `packages/core` tsc | 0 error |
 | `apps/desktop` tsc | 0 error |
 | core vitest | 51 files / **660** tests 全过 |
-| desktop vitest | 17 files / **191** tests 全过 |
+| desktop vitest | 17 files / **205** tests 全过 |
 | esbuild：dev-server + Electron（main/preload/camera-renderer） | 构建通过 |
 | 无 mock 的 dev-server（默认） | `/api/snapshot` → `devices: []`，`/api/settings` 形状正确，`/settings`、`/settings.js` 200 |
 | 浏览器（无头 Chrome + CDP，真 dashboard + 真 coyote-over-mock-BLE 后端） | 大厅/舞台/设备/设置截图；郊狼通道 `0–40`（原生）、`1–100 Hz`、直控读数无 %；把强度上限拖到原生 100 → 服务端 `maxPercent=50`；频率拖到 60 Hz → 协议 `minFreq=17/maxFreq=240`，回读 59 Hz（协议粒度）；设置页保存模型 → `已保存`、密钥框清空、`GET /api/settings` 反映新值 |
@@ -78,7 +78,36 @@
 | 产品入口无 mock | Electron `index.ts` 与默认 dev-server 均 `withMockDevices: false`；添加设备弹窗无 Mock 项；`POST /api/devices {protocol:'mock'}` → 400 |
 | 文案清理 | grep 三个 UI 文件：遥测/审计/日志/调试/编码/安全边界/准备工作/EMBODIED ROLEPLAY/今晚，由你来决定分寸/全局会话上限/append-only 等 0 命中 |
 
-## 4. 已知取舍与遗留
+## 4. 独立审查与修复
+
+交付前做了两轮独立只读审查（核心/宿主流 + UI 流；后者自行在真实 dashboard 上跑 CDP
+截图/交互）。第一轮发现并修复了以下问题（对话轮次内的修复已包含在最终提交里）：
+
+| 来源 | 问题 | 修复 |
+| --- | --- | --- |
+| core 审查 · 阻塞 | 设置页保存模型时先把文件落盘再构建 runner；未知 provider 且无 baseUrl 会让 `state/llm.json` 变成**下次启动必崩**的配置（文件已写、内存已换、路由 500） | 保存前用候选配置构建 runner 做校验（失败 → 400 `INVALID_LLM` 且不写文件）；启动时若文件配置不可用，回退内置默认并写审计，不阻塞启动 |
+| core 审查 · 阻塞 | 环境变量覆盖文件密钥时，一次未提及 apiKey 的保存会删掉文件里的密钥 | 新增 `storedApiKeyOf(raw)`：保存时直接读原始文件的 key，环境变量解析值不再参与写回判断 |
+| core 审查 · major | `/api/cap` 单端 Hz 补丁会把未改动端点按四舍五入的显示 Hz 重新量化（91–100 Hz 带、改快端会把慢端带到 83 Hz） | 单端补丁保留未改动端的**原始协议码**，只转换改动端；并拒绝跨过未改动端的请求（400），新增回归测试 |
+| core 审查 · major | `director` 内联配置无效时：启动静默回退默认，之后所有保存都 400（UI 无法修复文件） | 启动/保存时对 `director`/`writer` 做可构建性检查，无效角色在内存中忽略、保存时从文件清除（可恢复）；设置 payload 增加 `split`/`warning` 字段，UI 显示降级提示 |
+| core 审查 · minor | 真实采集宿主 `stop()` 吞掉 bridge 停止失败，设置页仍报 `stopped` | `BridgedCameraHost/AudioHost.stop` 报告后重新抛出；采集控制把失败显示为 `error`（有测试） |
+| core 审查 · minor | 设备枚举失败被当成「没有设备」 | 区分枚举错误：设置页显示 `采集失败：<原因>`，不覆盖为「没有可用的设备」 |
+| core 审查 · minor | `captureState.deviceId` 返回偏好而非实际在用的设备 | 改为 `runningDeviceId ?? preference.deviceId` |
+| core 审查 · minor | 远程 `http://` baseUrl 会明文发送 Bearer key；userinfo/query 会回显与进审计 | baseUrl 要求 https（回环地址可用 http）、拒绝 userinfo；审计里的 baseUrl 去掉 query/hash |
+| core 审查 · minor | 升级数据目录里旧的 `protocol:'mock'` 清单条目仍会注册假设备 | 载入 manifest 时删除 mock 条目并重写文件（写审计），一次性迁移 |
+| core 审查 · minor | 并发设置 POST 可能互相覆盖 | 设置读写串行化（`runSettingsOp`） |
+| core 审查 · minor | 设置页无法清除已存密钥；刷新会清掉未保存的模型输入；pagehide 不 flush | 增加「清除密钥」按钮（`POST {apiKey:''}`）；刷新按钮只重绘设备区、模型表单有 dirty 保护；pagehide flush |
+| core 审查 · nit | 生产不再使用 `hzBandToCode`，与 dashboard 的映射实现可能漂移 | 双端补丁有与 `hzBandToCode` 的 parity 测试；代码注释说明为何单端路径必须自己保留原始码 |
+
+**已知保留项**（有意识不修）：
+
+- 原生强度步进 2（0–200 只到偶数）：内部安全语义是整数百分比，奇数原生值需要非整数百分比；
+  这是可解释的取舍，不是漏掉的需求。
+- 极窄/退化的历史协议码频带（显示四舍五入后 min==max）在界面上显示「—」并禁用，
+  用户可用整体范围重设；协议码在高速端每步约 9 Hz，这是硬件协议的分辨率。
+- `withMockDevices` 在 `createHostRuntime` 里默认 true（测试/fixture 默认），产品入口
+  （Electron 主进程、dev-server）全部显式传 false；已有 manifest 的 mock 条目会被迁移清除。
+
+## 5. 已知取舍与遗留
 
 - **频率控件可见性**：只有 `supportsWaveform` 的通道（当前只有郊狼）在设备页与软上限里显示频率滑杆；
   其他后端的策略里仍有 `minFreq/maxFreq` 字段（引擎与 API 不变），但界面上不提供不生效的旋钮。

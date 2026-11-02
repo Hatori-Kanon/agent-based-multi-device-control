@@ -148,6 +148,19 @@ export function parseLlmSettings(raw: string | undefined, env: SettingsEnv): Llm
 }
 
 /**
+ * The API key stored in a raw settings document, if any.
+ *
+ * `loadLlmSettings` resolves environment-first, so its `apiKey` field can be an
+ * environment variable while the file still holds a different key. A settings
+ * save that does not mention the key must preserve the *file* value, which is
+ * why the raw document is parsed here (the resolved value would silently drop
+ * it once an env var is present).
+ */
+export function storedApiKeyOf(raw: string | undefined): string | undefined {
+  return apiKeyFromFile(parseSettingsFile(raw))
+}
+
+/**
  * Resolve settings for an in-memory config override (tests, embedded hosts).
  *
  * No settings file is consulted: an explicit config is authoritative, and the

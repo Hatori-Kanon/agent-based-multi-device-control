@@ -163,7 +163,11 @@ export class BridgedAudioHost implements AudioHost {
     try {
       await this.bridge.stop()
     } catch (error) {
+      // Report the failure *and* propagate it: callers (the settings page and
+      // the shutdown path) must not record a clean stop while the renderer may
+      // still be capturing.
       this.report(error)
+      throw error
     }
   }
 

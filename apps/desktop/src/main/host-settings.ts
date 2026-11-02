@@ -111,6 +111,20 @@ export interface SettingsLlmPayload {
   /** Environment variable the host consults first (`EMBODIED_LLM_API_KEY`). */
   readonly apiKeyEnv: string
   readonly hasApiKey: boolean
+  /**
+   * True when `state/llm.json` also configures `director`/`writer`.
+   *
+   * The console edits the single-call *default* model only; a hand-configured
+   * split mode stays a file-level feature, and the page says so instead of
+   * pretending the default is the effective model.
+   */
+  readonly split: boolean
+  /**
+   * Non-null when the host had to ignore/sanitize part of the configured model
+   * (an invalid role, or a fallback to the built-in default). Terse copy meant
+   * for the settings page; never contains a key.
+   */
+  readonly warning: string | null
 }
 
 /** `GET /api/settings` and the two `POST` routes' success payload. */
@@ -265,7 +279,14 @@ export function mergeSensorPreferences(
 }
 
 /** Project the key-free LLM summary for the settings view. */
-export function buildLlmSettingsPayload(summary: LlmSummary, config: LlmConfig): SettingsLlmPayload {
+export function buildLlmSettingsPayload(
+  summary: LlmSummary,
+  config: LlmConfig,
+  options: { readonly warning?: readonly string[] } = {},
+): SettingsLlmPayload {
+  const warning = options.warning === undefined || options.warning.length === 0
+    ? null
+    : options.warning.join('；')
   return {
     provider: summary.default.provider,
     model: summary.default.model,
@@ -273,6 +294,8 @@ export function buildLlmSettingsPayload(summary: LlmSummary, config: LlmConfig):
     apiKeySource: summary.apiKeySource,
     apiKeyEnv: apiKeyEnvOf(config.default),
     hasApiKey: summary.hasApiKey,
+    split: config.director !== null || config.writer !== null,
+    warning,
   }
 }
 

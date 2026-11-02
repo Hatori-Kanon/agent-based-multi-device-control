@@ -101,21 +101,41 @@ function parseModelField(value: unknown, name: string): string {
   return text
 }
 
-/** `baseUrl`: absent/`null`/`''` means "provider default"; otherwise http(s). */
+/** Longest accepted endpoint URL. */
+const MAX_BASE_URL_TEXT = 2_000
+
+/** Hosts where plain http stays on the machine (local model servers). */
+function isLoopbackHost(hostname: string): boolean {
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1'
+}
+
+/**
+ * `baseUrl`: absent/`null`/`''` means "provider default"; otherwise an https
+ * endpoint (or http on loopback, for local model servers).
+ *
+ * Plain http to a remote host would send `Authorization: Bearer <key>`
+ * cleartext; userinfo is refused because it would put a password in a URL that
+ * is echoed back to the page and recorded in the audit trail.
+ */
 function parseBaseUrl(value: unknown): string | null {
   if (value === undefined || value === null || value === '') return null
   const text = asText(value)
   if (text === undefined) return null
+  if (text.length > MAX_BASE_URL_TEXT) {
+    throw new Error(`baseUrl must be at most ${MAX_BASE_URL_TEXT} characters`)
+  }
   let url: URL
   try {
     url = new URL(text)
   } catch {
-    throw new Error('baseUrl must be an http(s) URL')
+    throw new Error('baseUrl must be an https URL (http is allowed for localhost only)')
   }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error('baseUrl must be an http(s) URL')
+  if (url.username !== '' || url.password !== '') {
+    throw new Error('baseUrl must not embed credentials; use the API key field instead')
   }
-  return text
+  if (url.protocol === 'https:') return text
+  if (url.protocol === 'http:' && isLoopbackHost(url.hostname)) return text
+  throw new Error('baseUrl must be an https URL (http is allowed for localhost only)')
 }
 
 /** Parse `POST /api/settings/llm`. Omitted fields keep their stored value. */

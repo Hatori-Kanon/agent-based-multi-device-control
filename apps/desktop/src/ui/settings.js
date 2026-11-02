@@ -25,7 +25,9 @@
     baseUrl: document.getElementById('setBaseUrl'),
     apiKey: document.getElementById('setApiKey'),
     llmSave: document.getElementById('setLlmSave'),
+    llmClearKey: document.getElementById('setLlmClearKey'),
     llmStatus: document.getElementById('setLlmStatus'),
+    llmWarning: document.getElementById('setLlmWarning'),
     camEnabled: document.getElementById('setCamEnabled'),
     camDevice: document.getElementById('setCamDevice'),
     camRefresh: document.getElementById('setCamRefresh'),
@@ -47,6 +49,8 @@
   let pendingSensor = null
   let errorTimer
   let llmBusy = false
+  /** True while the model form holds edits that a background refresh must not wipe. */
+  let llmDirty = false
 
   // ── 基础工具 ────────────────────────────────────────────────────────────
   function showError(message) {
@@ -125,6 +129,19 @@
     el.apiKey.value = ''
     el.apiKey.placeholder = payload.hasApiKey ? '已设置，填新值可替换' : 'sk-…'
     el.llmStatus.textContent = llmStatusText(payload)
+    // `hidden` alone loses to `.btn { display: inline-flex }`, so set display too.
+    if (el.llmClearKey !== null) {
+      el.llmClearKey.hidden = payload.hasApiKey !== true
+      el.llmClearKey.style.display = payload.hasApiKey === true ? '' : 'none'
+    }
+    llmDirty = false
+  }
+
+  /** 宿主降级/拆分模式的提示；没有就隐藏这一行。 */
+  function renderWarning(warning) {
+    if (el.llmWarning === null) return
+    el.llmWarning.textContent = typeof warning === 'string' ? warning : ''
+    el.llmWarning.hidden = typeof warning !== 'string' || warning === ''
   }
 
   /** Set one status line; `note` overrides the derived text (saving/error). */
@@ -178,10 +195,12 @@
     renderSensorStatus(el.micStatus, microphone)
   }
 
-  function render(payload) {
+  function render(payload, options = {}) {
     if (payload === null || typeof payload !== 'object' || payload.llm === undefined) return
     current = payload
-    renderLlm(payload.llm)
+    // 后台刷新（刷新按钮 / 切回视图）不得覆盖尚未保存的模型输入。
+    if (options.forceLlm === true || !llmDirty) renderLlm(payload.llm)
+    renderWarning(payload.llm.warning)
     renderSensors(payload)
   }
 
@@ -191,6 +210,23 @@
       render(await api('/api/settings'))
     } catch (error) {
       showError(`设置读取失败：${describe(error)}`)
+    }
+  }
+
+  /**
+   * Re-read device lists without touching the model form.
+   *
+   * The camera/mic Refresh buttons must not wipe provider/model/baseUrl edits
+   * the human has typed but not saved yet.
+   */
+  async function refreshSensors() {
+    try {
+      const payload = await api('/api/settings')
+      current = payload
+      renderWarning(payload.llm.warning)
+      renderSensors(payload)
+    } catch (error) {
+      showError(`设备读取失败：${describe(error)}`)
     }
   }
 
@@ -208,7 +244,8 @@
         ...(el.apiKey.value.trim() === '' ? {} : { apiKey: el.apiKey.value.trim() }),
       }
       const payload = await api('/api/settings/llm', { method: 'POST', body: JSON.stringify(body) })
-      render(payload)
+      llmDirty = false
+      render(payload, { forceLlm: true })
       el.llmStatus.textContent = '已保存'
     } catch (error) {
       // 失败时保留输入，方便人工修正；状态行给出宿主的原因。
@@ -218,6 +255,28 @@
       el.apiKey.value = ''
       llmBusy = false
       el.llmSave.disabled = false
+    }
+  }
+
+  /** Clear the stored file key (the API treats an empty string as "delete"). */
+  async function clearKey() {
+    if (llmBusy) return
+    llmBusy = true
+    el.llmSave.disabled = true
+    if (el.llmClearKey !== null) el.llmClearKey.disabled = true
+    try {
+      const payload = await api('/api/settings/llm', {
+        method: 'POST',
+        body: JSON.stringify({ apiKey: '' }),
+      })
+      render(payload, { forceLlm: true })
+      el.llmStatus.textContent = '密钥已清除'
+    } catch (error) {
+      showError(`清除密钥失败：${describe(error)}`)
+    } finally {
+      llmBusy = false
+      el.llmSave.disabled = false
+      if (el.llmClearKey !== null) el.llmClearKey.disabled = false
     }
   }
 
@@ -265,9 +324,15 @@
   el.micDevice.addEventListener('change', () => {
     queueSensor('microphone', { deviceId: deviceSelection(el.micDevice) })
   })
-  el.camRefresh.addEventListener('click', () => { void refresh() })
-  el.micRefresh.addEventListener('click', () => { void refresh() })
+  el.camRefresh.addEventListener('click', () => { void refreshSensors() })
+  el.micRefresh.addEventListener('click', () => { void refreshSensors() })
   el.llmSave.addEventListener('click', () => { void saveLlm() })
+  if (el.llmClearKey !== null) el.llmClearKey.addEventListener('click', () => { void clearKey() })
+
+  // Unsaved model edits survive a background refresh (Refresh buttons/viewchange).
+  for (const input of [el.provider, el.model, el.baseUrl, el.apiKey]) {
+    input.addEventListener('input', () => { llmDirty = true })
+  }
 
   // 回车提交模型配置（表单里唯一的多行输入是隐藏的，其余都是单行）。
   for (const input of [el.provider, el.model, el.baseUrl, el.apiKey]) {
@@ -288,6 +353,11 @@
       return
     }
     // 离开设置页时把还在 debounce 里的开关/下拉立刻落盘，避免切走后丢失。
+    if (pendingSensor !== null) void flushSensors()
+  })
+
+  // A page that is being closed/unloaded cannot wait for the debounce timer.
+  window.addEventListener('pagehide', () => {
     if (pendingSensor !== null) void flushSensors()
   })
   startIfVisible()

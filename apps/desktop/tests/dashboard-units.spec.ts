@@ -181,6 +181,62 @@ describe('dashboard native units', () => {
     expect(secondChannel?.maxFreq).toBe(hzBandToCode({ minHz: 5, maxHz: 20 }).maxCode)
   })
 
+  it('leaves the untouched frequency endpoint on its exact code for a one-sided patch', async () => {
+    const host = await start()
+    // Establish a narrow high band: 91-100 Hz. The protocol can only say
+    // "code 11 = 90.9 Hz" and "code 10 = 100 Hz", so the display rounds to
+    // 91-100 while the raw codes are 10 (fast) .. 11 (slow).
+    const set = await cap(host, { minFreqHz: 91, maxFreqHz: 100 })
+    expect(set.status).toBe(200)
+    const established = channel(await set.json() as SnapshotBody, 'coyote', 'a')
+    expect(established).toMatchObject({ minFreq: 10, maxFreq: 11, minFreqHz: 91, maxFreqHz: 100 })
+
+    // Move only the fast end. Re-quantising the untouched 91 Hz display value
+    // would collapse the band and push the slow end down to 83 Hz; the raw
+    // slow code must stay exactly where it was.
+    const moved = await cap(host, { maxFreqHz: 95 })
+    expect(moved.status).toBe(200)
+    const after = channel(await moved.json() as SnapshotBody, 'coyote', 'a')
+    expect(after?.minFreq).toBe(10)
+    expect(after?.maxFreq).toBe(11)
+    expect(after).toMatchObject({ minFreqHz: 91, maxFreqHz: 100 })
+
+    // The same rule for the slow end: it may not drag the fast code with it.
+    const slower = await cap(host, { minFreqHz: 95 })
+    expect(slower.status).toBe(200)
+    const slowerChannel = channel(await slower.json() as SnapshotBody, 'coyote', 'a')
+    expect(slowerChannel?.minFreq).toBe(10)
+    expect(slowerChannel?.maxFreq).toBe(11)
+  })
+
+  it('rejects a one-sided Hz patch that would cross the untouched endpoint', async () => {
+    const host = await start()
+    const established = await cap(host, { minFreqHz: 5, maxFreqHz: 50 })
+    expect(established.status).toBe(200)
+    const stored = hzBandToCode({ minHz: 5, maxHz: 50 })
+
+    // `minFreqHz` is the slow end and `maxFreqHz` the fast end: crossing or
+    // touching the other end must be a clean 400, not a clamped arbitrary band.
+    for (const patch of [
+      { minFreqHz: 60 },
+      { minFreqHz: 50 },
+      { maxFreqHz: 4 },
+      { maxFreqHz: 5 },
+    ]) {
+      const response = await cap(host, patch)
+      expect(response.status, JSON.stringify(patch)).toBe(400)
+      expect((await response.json() as { code?: string }).code).toBe('INVALID_POLICY')
+    }
+
+    // Every rejected patch left the stored band exactly where it was.
+    expect(channel(await snapshot(host), 'coyote', 'a')).toMatchObject({
+      minFreq: stored.minCode,
+      maxFreq: stored.maxCode,
+      minFreqHz: 5,
+      maxFreqHz: 50,
+    })
+  })
+
   it('accepts Hz fields together with percentage fields in one all-or-nothing patch', async () => {
     const host = await start()
     const response = await cap(host, { maxPercent: 55, minFreqHz: 5, maxFreqHz: 50 })
