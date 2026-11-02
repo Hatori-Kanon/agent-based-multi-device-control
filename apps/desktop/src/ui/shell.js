@@ -44,11 +44,15 @@
   }
 
   /**
-   * 上次视图优先于深链：两者冲突时以「用户刚刚在用的视图」为准；地址栏随后
-   * 会被 syncPath 改写，所以刷新仍然落在同一个视图上。
+   * 深链优先于上次视图。
+   *
+   * `/device`、`/settings` 是用户明确打开的地址，不能被 sessionStorage 里
+   * 上一次停留的视图悄悄改写（否则分享/收藏的深链会落到别处）；`/` 这种
+   * 没有视图信息的入口才回退到记忆。切换视图时 syncPath 已把地址栏同步成
+   * 当前视图，所以「刷新后回到刚才的视图」仍然成立。
    */
   function initialView() {
-    return rememberedView() ?? pathView() ?? DEFAULT_VIEW
+    return pathView() ?? rememberedView() ?? DEFAULT_VIEW
   }
 
   /** 记住当前视图；存不进去不影响切换。 */
@@ -113,7 +117,8 @@
 
   // 初始视图（不派发 viewchange：play.js/app.js 还没接线，它们会读
   // document.body.dataset.view 决定首次启动要不要立刻拉数据）。地址栏只在
-  // 它已经是 /play、/device 或 /settings 深链时才跟随，避免把 `/` 改写成 `/play`。
+  // 它已经是 /play、/device 或 /settings 深链时才跟随，避免把 `/` 改写成 `/play`；
+  // 深链本身已经在 pathView() 里赢得初始视图。
   const initial = initialView()
   paint(initial)
   if (pathView() !== undefined) syncPath(initial)

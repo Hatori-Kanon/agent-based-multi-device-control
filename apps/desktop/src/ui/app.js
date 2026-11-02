@@ -64,6 +64,15 @@
   const editing = new Set()
   /** 上一次快照的锁定状态，用于「刚锁上」时立即停掉直控 keepalive。 */
   let wasLocked = false
+  /**
+   * Last rendered device-state signature.
+   *
+   * The cards are otherwise rebuilt every 500ms even when nothing changed,
+   * which loses screen-reader virtual cursor / selection / hover state. The
+   * status bar and lock banner still update every tick; only the card DOM is
+   * skipped when the signature is identical.
+   */
+  let deviceSignature = ''
 
   // ── 视图 ────────────────────────────────────────────────────────────────
   function isDeviceView() {
@@ -518,7 +527,7 @@
     lo.step = String(step)
     lo.value = String(loMin)
     lo.disabled = locked
-    lo.title = isIntensity ? '强度下限' : '频率下限'
+    lo.title = isIntensity ? '强度下限' : '频率下限（协议码量化，回读可能差几 Hz）'
     lo.setAttribute('aria-label', `${rangeName}下限`)
     const hi = document.createElement('input')
     hi.type = 'range'
@@ -527,7 +536,7 @@
     hi.step = String(step)
     hi.value = String(hiMax)
     hi.disabled = locked
-    hi.title = isIntensity ? '强度上限' : '频率上限'
+    hi.title = isIntensity ? '强度上限' : '频率上限（协议码量化，回读可能差几 Hz）'
     hi.setAttribute('aria-label', `${rangeName}上限`)
 
     const readout = document.createElement('span')
@@ -619,9 +628,8 @@
     name.className = 'ch-name'
     const title = document.createElement('span')
     title.textContent = channel.label ?? channel.id ?? '通道'
-    const small = document.createElement('small')
-    small.textContent = `${channel.id ?? '—'} · ${channel.kind ?? '通道'}`
-    name.append(title, small)
+    // 不再显示 `a · level` 这类协议术语：产品界面只留人能读的通道名。
+    name.append(title)
 
     const middle = document.createElement('div')
     middle.className = 'ch-mid'
@@ -692,6 +700,14 @@
     return row
   }
 
+  /** Device lifecycle shown to a person; the CSS class keeps the machine state. */
+  const LIFECYCLE_TEXT = {
+    ready: '已连接',
+    connecting: '连接中',
+    disconnected: '未连接',
+    failed: '连接失败',
+  }
+
   // ── 设备卡 ──────────────────────────────────────────────────────────────
   function renderDevices() {
     if (snapshot === null) return
@@ -709,7 +725,7 @@
       0,
     )
     el.devStatChannels.textContent = `${channelCount} 路`
-    el.devConnState.textContent = `已连接 · ${snapshot.devices.length} 设备`
+    el.devConnState.textContent = `已连接 · ${snapshot.devices.length} 台`
     el.devConnState.className = 'pill on'
 
     // 正在设备卡里操作（滑杆拖动、下拉展开、输入框聚焦）时不要重建卡片：
@@ -719,6 +735,14 @@
     const editingFocus = active !== null && el.devDevices.contains(active)
       && (active.tagName === 'INPUT' || active.tagName === 'SELECT' || active.tagName === 'TEXTAREA')
     if (editing.size > 0 || editingFocus) return
+    // 状态没变就不重建卡片：读屏器/文本选择/悬停状态不该每 500ms 被清掉。
+    const nextSignature = JSON.stringify({
+      locked,
+      devices: snapshot.devices,
+      managed: [...managedKeys].sort(),
+    })
+    if (nextSignature === deviceSignature) return
+    deviceSignature = nextSignature
     // 按钮焦点在重建后会丢：记下「第几张卡 + 按钮文字」，重建后放回等价按钮，
     // 否则键盘用户在设备卡里每 500ms 就被弹回页面开头。
     const focusHint = active !== null && el.devDevices.contains(active) && active.tagName === 'BUTTON'
@@ -735,7 +759,7 @@
       // 链路丢失对操作者只意味着「断开」；连接按钮才会重新开始扫描。
       const shownLife = device.lifecycle === 'failed' ? 'disconnected' : device.lifecycle
       life.className = `life ${shownLife}`
-      life.textContent = shownLife
+      life.textContent = LIFECYCLE_TEXT[shownLife] ?? '未连接'
       const actions = document.createElement('div')
       actions.className = 'device-actions'
       header.append(title, life, actions)
@@ -876,6 +900,11 @@
   }
 
   // ── 添加设备弹窗 ────────────────────────────────────────────────────────
+  /** Focusable controls inside the dialog, for the Tab trap. */
+  function dialogFocusables() {
+    return [...el.devAddDialog.querySelectorAll('button, input')]
+      .filter(node => !node.disabled)
+  }
   function openAddDialog() {
     el.devAddDialog.style.display = 'flex'
     // 弹窗打开时把焦点送进对话框，关闭后还给「添加设备」按钮。
@@ -895,6 +924,21 @@
   })
   document.addEventListener('keydown', event => {
     if (event.key === 'Escape') closeAddDialog()
+  })
+  // Tab 在模态框内循环：对话框之外的控件在视觉上不可达，键盘也应一致。
+  el.devAddDialog.addEventListener('keydown', event => {
+    if (event.key !== 'Tab') return
+    const items = dialogFocusables()
+    if (items.length === 0) return
+    const first = items[0]
+    const last = items[items.length - 1]
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault()
+      last.focus()
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault()
+      first.focus()
+    }
   })
   el.devAddConfirm.addEventListener('click', async () => {
     // 协议只来自对话框里被选中的单选项；没有选中时退回郊狼。

@@ -68,7 +68,7 @@
 
   function describe(error) {
     if (error === null || error === undefined) return '未知错误'
-    if (error.status === 401) return 'token 无效或已更换：请从启动日志重新打开本页'
+    if (error.status === 401) return 'token 无效或已更换：请从启动窗口重新打开本页'
     if (typeof error.message === 'string' && error.message !== '') return error.message
     return String(error)
   }

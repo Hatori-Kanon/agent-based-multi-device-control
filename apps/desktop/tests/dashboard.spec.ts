@@ -1279,6 +1279,9 @@ describe('play page (B2-T12)', () => {
     // The allowlist is still a whitelist: unknown names are clean 404s.
     expect((await fetch(`${base(host)}/play.json`)).status).toBe(404)
     expect((await fetch(`${base(host)}/src/ui/index.html`)).status).toBe(404)
+    // Browsers ask for the favicon on every navigation; answer 204 so the
+    // console is not filled with 404 noise (the static allowlist is unchanged).
+    expect((await fetch(`${base(host)}/favicon.ico`)).status).toBe(204)
   })
 
   it('renders choices from the session snapshot and posts the picked id', async () => {

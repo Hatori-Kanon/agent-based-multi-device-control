@@ -98,6 +98,20 @@
 | core 审查 · minor | 设置页无法清除已存密钥；刷新会清掉未保存的模型输入；pagehide 不 flush | 增加「清除密钥」按钮（`POST {apiKey:''}`）；刷新按钮只重绘设备区、模型表单有 dirty 保护；pagehide flush |
 | core 审查 · nit | 生产不再使用 `hzBandToCode`，与 dashboard 的映射实现可能漂移 | 双端补丁有与 `hzBandToCode` 的 parity 测试；代码注释说明为何单端路径必须自己保留原始码 |
 
+第二轮独立 UI/UX 审查（真实 dashboard + CDP 截图/交互）发现的问题与修复：
+
+| 来源 | 问题 | 修复 |
+| --- | --- | --- |
+| UI 审查 · major | sessionStorage 记住的视图会覆盖显式深链：在游玩页停留过后打开 `/settings` 会落到 play 并改写地址栏 | `shell.js` 改为**深链优先**（`pathView() ?? rememberedView() ?? DEFAULT`）；切视图时地址栏已同步，刷新仍回到当前视图。CDP 实测：remembered=play 时打开 `/settings` 落在 settings |
+| UI 审查 · minor | 每页请求 `/favicon.ico` 404；深链到设备/设置时 play.js 仍拉 `/api/session`（无会话 404 噪音） | 页面加 `<link rel="icon" href="data:,">`，dashboard 对 `/favicon.ico` 回 204（新增测试）；play.js 启动只在游玩视图可见时拉会话接口 |
+| UI 审查 · minor | 设备卡显示原始英文 `disconnected`、技术副标签 `a · level`、状态写成「已连接 · 7 设备」 | 生命周期映射为中文（已连接/连接中/未连接/连接失败）、删除技术副标签、量词改「台」 |
+| UI 审查 · minor | 频率滑杆 1 Hz 步进与协议码量化不匹配且无提示 | 频率滑杆 title 增加「协议码量化，回读可能差几 Hz」说明（读数本身随快照回读） |
+| UI 审查 · minor | 设置页控件可访问名重复（两个「启用」/「设备」/「刷新」）；添加设备对话框无 Tab 焦点陷阱 | 摄像头/麦克风控件加 `aria-label`（启用摄像头/摄像头设备/刷新摄像头列表…）；对话框 Tab/Shift+Tab 在框内循环（Escape 关闭与焦点还原本已存在） |
+| UI 审查 · minor | 设备卡每 500ms 全量重建（读屏器虚拟光标被清空） | 按 snapshot 内容签名跳过无变化重建（状态栏与锁定横幅仍每 tick 更新） |
+| UI 审查 · nit | 残留无用 CSS（kbd/.main-single/.card-flush/.q-warn/.stage-wrap/.phone-note） | 删除 |
+| UI 审查 · nit | 边缘文案写「启动日志」（UI 不展示日志） | 改为「启动窗口」 |
+| UI 审查 · nit | `EMBODIED_MOCK_DEVICES=1` 演示模式仍显示 Mock 名称 | 这是开发/演示开关，不是产品入口；已在 README/设计说明记录。默认产品入口无 mock，且旧 manifest 的 mock 条目会被迁移清除 |
+
 **已知保留项**（有意识不修）：
 
 - 原生强度步进 2（0–200 只到偶数）：内部安全语义是整数百分比，奇数原生值需要非整数百分比；

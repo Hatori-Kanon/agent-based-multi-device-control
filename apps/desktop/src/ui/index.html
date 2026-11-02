@@ -16,6 +16,7 @@
 -->
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'">
 <title>Embodied · 游玩 / 设备 / 设置</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body data-view="play">
@@ -212,14 +213,14 @@
       <section class="card settings-card">
         <h2 class="card-title">摄像头</h2>
         <div class="field-row">
-          <label class="field-label"><input type="checkbox" id="setCamEnabled"> 启用</label>
+          <label class="field-label"><input type="checkbox" id="setCamEnabled" aria-label="启用摄像头"> 启用</label>
         </div>
         <div class="field-row">
           <label class="field-label" for="setCamDevice">设备</label>
-          <select id="setCamDevice">
+          <select id="setCamDevice" aria-label="摄像头设备">
             <option value="">—</option>
           </select>
-          <button class="mini" id="setCamRefresh" type="button">刷新</button>
+          <button class="mini" id="setCamRefresh" type="button" aria-label="刷新摄像头列表">刷新</button>
           <span class="settings-status" id="setCamStatus" aria-live="polite"></span>
         </div>
       </section>
@@ -227,14 +228,14 @@
       <section class="card settings-card">
         <h2 class="card-title">麦克风</h2>
         <div class="field-row">
-          <label class="field-label"><input type="checkbox" id="setMicEnabled"> 启用</label>
+          <label class="field-label"><input type="checkbox" id="setMicEnabled" aria-label="启用麦克风"> 启用</label>
         </div>
         <div class="field-row">
           <label class="field-label" for="setMicDevice">设备</label>
-          <select id="setMicDevice">
+          <select id="setMicDevice" aria-label="麦克风设备">
             <option value="">—</option>
           </select>
-          <button class="mini" id="setMicRefresh" type="button">刷新</button>
+          <button class="mini" id="setMicRefresh" type="button" aria-label="刷新麦克风列表">刷新</button>
           <span class="settings-status" id="setMicStatus" aria-live="polite"></span>
         </div>
       </section>

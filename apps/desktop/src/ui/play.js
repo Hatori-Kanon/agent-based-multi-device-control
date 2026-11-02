@@ -166,7 +166,7 @@
 
   function describe(error) {
     if (error === null || error === undefined) return '未知错误'
-    if (error.status === 401) return 'token 无效或已更换：请从启动日志重新打开本页'
+    if (error.status === 401) return 'token 无效或已更换：请从启动窗口重新打开本页'
     if (error.status === 403) return `被拒绝：${error.message ?? '权限不足'}`
     if (typeof error.code === 'string' && ERROR_TEXT[error.code] !== undefined) {
       return `${ERROR_TEXT[error.code]}（${error.message ?? error.code}）`
@@ -971,11 +971,12 @@
 
   /** 切回游玩视图时立即拉一次全部状态（不等下一个 500ms 窗口）。 */
   async function refreshAll() {
+    // A deep link to /device or /settings must not fire the session endpoints
+    // (there is no session yet, and the 404s only add console noise). The
+    // viewchange handler refreshes the play view as soon as it is opened.
     await Promise.all([
       refreshPacks(),
-      refreshSession(),
-      refreshTranscript(),
-      refreshSnapshot(),
+      ...(playVisible() ? [refreshSession(), refreshTranscript(), refreshSnapshot()] : []),
     ])
   }
 
@@ -1119,7 +1120,7 @@
 
   async function panic() {
     if (token.length < 16) {
-      showError('急停需要控制台 token：请从启动日志打开本页')
+      showError('急停需要控制台 token：请从启动窗口打开本页')
       return
     }
     // 设备视图的直控滑杆由 app.js 管理；急停按钮只有这一处绑定，用一个
@@ -1251,7 +1252,7 @@
       el.conn.textContent = '缺少 token'
       el.conn.classList.remove('on')
       el.conn.classList.add('bad')
-      showError('URL 缺少 token 参数：请从启动日志打开游玩页地址（/play?token=…）')
+      showError('URL 缺少 token 参数：请从启动窗口打开游玩页地址（/play?token=…）')
       renderSession()
       return
     }

@@ -819,6 +819,15 @@ export class DashboardServer {
     // it protects the DATA endpoints, not the UI text. Without this exemption
     // the 401 JSON blocks app.js (wrong MIME type) and the whole console is
     // silent, which is exactly the "controls missing" bug this prevents.
+    // Browsers ask for /favicon.ico on every page. The console ships no icon
+    // (static allowlist unchanged), so answer 204 instead of leaving a 404 in
+    // the console on every navigation.
+    if (request.method === 'GET' && pathname === '/favicon.ico') {
+      response.writeHead(204, { 'Cache-Control': 'public, max-age=86400' })
+      response.end()
+      return
+    }
+
     const isApi = pathname.startsWith('/api/')
     if (isApi && !tokenMatches(this.options.token, request, url)) {
       sendError(response, 401, 'missing or invalid x-control-token')
