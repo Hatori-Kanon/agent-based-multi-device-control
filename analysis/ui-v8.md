@@ -14,7 +14,7 @@
   降级 tools→json_schema→text，产生 JSON envelope/raw `,"line"`/重复短句。修复：
   - 自动/检查点回合末尾补一条**系统续行 user 消息**（不进 transcript/审计）；
   - adapter 不把 `reasoning_content` 类 400 当能力拒绝，避免一次错误永久降级进程能力缓存；
-  - 自动模式不生成 choices（宿主丢弃），避免引擎停在选择菜单。
+  - 自动运行不再禁止 choices（模型可给 0–3 条；出现菜单时引擎等玩家选）。
 - **真实模型验证**（修复后）：turn 1/2/3 均为不同、完整的正文，无 reasoning 400、无
   `pacing` 丢弃、无 JSON 残片。
 
@@ -54,12 +54,11 @@
     `旁白` 标签不存在，无 console error；
   - 截图 `.ui-shots/v8/v8-two-turns.png`、`.ui-shots/v8/v8-opening.png`。
 - 静态：`#lines role="log"`、`#currentLine`/`#nowCard` 不存在；play.js 含 `is-latest`。
-- core **682 tests** / desktop **214 tests**；tsc、esbuild、`node --check` 通过。
+- core **682 tests** / desktop **216 tests**；tsc、esbuild、`node --check` 通过。
 
 ## 4. 限制
 
 - 没有时间戳、Markdown 渲染或消息复制；长会话只保留最近 300 条 DOM。
 - 旧会话里已经写入的 JSON 残片不会自动修复（新局/新回合才会用新协议）；UI 只兜底
   字面量换行。
-- 自动运行仍不替玩家做选择：自动模式不生成 choices；关闭自动运行后是否出选项仍由模型
-  决定（导演职责）。
+- 自动运行仍不替玩家做选择：模型可以给 choices，出现菜单时引擎会等玩家选。

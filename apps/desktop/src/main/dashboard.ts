@@ -80,6 +80,16 @@ export interface PackImportSummary {
   readonly active: boolean
 }
 
+/** Compact waveform chart data (per-slot protocol values, not full frames). */
+export interface WaveformPreviewPayload {
+  readonly id: string
+  readonly name: string
+  readonly loop: boolean
+  readonly durationMs: number
+  readonly freq: readonly number[]
+  readonly intensity: readonly number[]
+}
+
 /** Every capability the console needs; satisfied by HostRuntime plus audit. */
 export interface DashboardDeps {
   snapshot(): unknown
@@ -132,6 +142,14 @@ export interface DashboardDeps {
   /** Human protocol experiment: one raw frame to the device transport. */
   rawWrite(deviceId: string, hex: string, channel: 'live' | 'setup'): Promise<void>
   listWaveforms(): unknown[]
+  /**
+   * Compact frame preview for the play rail's live waveform chart.
+   *
+   * Optional (older test doubles answer 404). `freq`/`intensity` are the
+   * waveform's per-slot values in protocol units; no full frame payload is
+   * exposed through the normal waveform summary.
+   */
+  readonly waveformPreview?: (id: string) => WaveformPreviewPayload | undefined
   importWaveform(name: string, frames: string[]): Promise<{ id: string; name: string; frames: number }>
   promoteWaveform(id: string): Promise<unknown[]>
   setWaveform(deviceId: string, channelId: string, waveformId: string | undefined): Promise<void>
@@ -1428,6 +1446,23 @@ export class DashboardServer {
 
     if (request.method === 'GET' && pathname === '/api/waveforms') {
       sendJson(response, 200, this.waveformPayload())
+      return
+    }
+
+    // Compact per-slot preview for the play rail's animated waveform chart.
+    // Kept separate from the summary list (which deliberately excludes frames).
+    if (request.method === 'GET' && pathname === '/api/waveforms/preview') {
+      const id = asOptionalString(url.searchParams.get('id'))
+      if (id === undefined) {
+        sendError(response, 400, 'id is required')
+        return
+      }
+      const preview = this.options.deps.waveformPreview?.(id)
+      if (preview === undefined) {
+        sendError(response, 404, `no waveform with id "${id}"`)
+        return
+      }
+      sendJson(response, 200, preview)
       return
     }
 

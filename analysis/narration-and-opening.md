@@ -57,8 +57,8 @@ turn_completed turnId=2 outcome=completed durationMs=1072
    场景/背景（环境、玩家姿态、角色如何出现），再进入互动。
 4. **空回退重试**：`runTurn` 在「无正文且无 plan」时用一条纠正 user 消息重试一次（不重复
    派发；有 plan 时不重试），覆盖模型偶发只调查询工具的情况。
-5. **自动运行不阻塞选项**：自动运行开启时提示词要求模型不要生成 choices，宿主也会丢弃
-   plan 里的 choices（自动模式没有玩家可点；否则引擎会等选择菜单而看起来像停住）。
+5. **自动运行保留选项**：自动运行不再禁止 choices；提示词说明自动运行也会给玩家选项，由模型
+   决定给 0–3 条（出现选项时引擎会等玩家选，这是玩家决策而不是静默）。
 6. **thinking-mode 历史修复**：自动运行/检查点回合没有玩家消息时，在消息列末尾补一条
    系统续行 user 消息（`（系统：自动运行继续…）`），不再让请求以 assistant 结尾；它不进
    transcript、不进审计。adapter 不再把 `reasoning_content` 类 400 误判为工具能力缺失，
@@ -73,12 +73,12 @@ turn_completed turnId=2 outcome=completed durationMs=1072
     随后进入试探接触；`autopilot.enabled=true, intervalSec=10`。
   - 修复后自动运行：开场后 26s 快照到 turn 3；transcript 的 turn 1/2 都是完整、不同的正文；
     没有再出现 reasoning_content 400、pacing 被丢或文本 envelope。
-  - 第二回合玩家消息：正文包含触手动作、身体反应与支配台词；自动模式不生成 choices。
+  - 第二回合玩家消息：正文包含触手动作、身体反应与支配台词；自动运行仍可出 choices。
 - core 新增测试：`runTurn` 使用 `narration` 作为 line；空回复重试一次；adapter 不对
   thinking-mode 400 降级 tools；`protocol` mandatory 且排在 world 之后；tool schema 含
   `narration`。宿主测试：开场 prompt 含协议与开场指令；自动回合末尾补系统续行 user 消息，
-  且不生成 choices。
-- 全量：core 52 files / **682 tests**、desktop 17 files / **214 tests**。
+  并保留 choices。
+- 全量：core 52 files / **682 tests**、desktop 17 files / **216 tests**。
 
 ## 影响
 

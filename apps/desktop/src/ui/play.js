@@ -531,13 +531,45 @@
       .replaceAll('\\t', '  ')
   }
 
+  /** 小框：本回合实际下发的部位 / 强度 / 波形（来自宿主 dispatch 结果）。 */
+  function renderEffects(effects) {
+    const list = Array.isArray(effects) ? effects.filter(effect => effect !== null && typeof effect === 'object') : []
+    if (list.length === 0) return null
+    const box = document.createElement('div')
+    box.className = 'line-effects'
+    const seen = new Set()
+    for (const effect of list) {
+      const part = typeof effect.regionLabel === 'string' && effect.regionLabel !== ''
+        ? effect.regionLabel
+        : (typeof effect.region === 'string' && effect.region !== '' ? effect.region : '未指定部位')
+      const percent = typeof effect.percent === 'number' && Number.isFinite(effect.percent)
+        ? `${Math.round(effect.percent)}%`
+        : ''
+      const waveform = typeof effect.waveformName === 'string' && effect.waveformName !== ''
+        ? effect.waveformName
+        : ''
+      const suffix = effect.status === 'rejected'
+        ? '（未下发）'
+        : effect.status === 'degraded' ? '（降级）' : ''
+      const text = [part, percent, waveform].filter(partText => partText !== '').join(' · ') + suffix
+      const key = [part, percent, waveform].join('\u0000')
+      if (text === '' || seen.has(key)) continue
+      seen.add(key)
+      const chip = document.createElement('span')
+      chip.className = 'line-effect'
+      chip.textContent = text
+      box.append(chip)
+    }
+    return box.childElementCount === 0 ? null : box
+  }
+
   /**
    * 追加一条会话消息。
    *
    * 只有一条时间线：旁白/玩家/系统都进同一个可滚动容器，最新一条加
    * `is-latest`（字号稍大）；不再有「现在卡 + 历史气泡」两套视觉。
    */
-  function appendLine(role, text, latest = true) {
+  function appendLine(role, text, latest = true, effects = undefined) {
     const stick = nearBottom()
     const stale = el.lines.querySelector('.hint')
     if (stale !== null) stale.remove()
@@ -550,6 +582,10 @@
         : 'line line--sys'
     if (latest) row.classList.add('is-latest')
     row.textContent = normalizeLineText(text)
+    if (role === 'assistant') {
+      const box = renderEffects(effects)
+      if (box !== null) row.append(box)
+    }
     el.lines.append(row)
     while (el.lines.childElementCount > 300) el.lines.firstElementChild.remove()
     if (stick) el.lines.scrollTop = el.lines.scrollHeight
@@ -604,6 +640,13 @@
   // 边界修改走 /api/cap —— 只有人类能改这些（D4 不变）。
   /** 每个挂载点各自的重绘签名；大厅与右轨互不影响。 */
   const setupSignatures = new Map()
+  /** 右轨每个通道的实时预览节点（只有 #devices 挂载点会填）。 */
+  const channelLiveViews = new Map()
+  /** 波形 preview 缓存：id -> { freq, intensity }；同波形只取一次。 */
+  const waveformPreviews = new Map()
+  const waveformPreviewPending = new Set()
+  const waveformPreviewFailed = new Set()
+  let liveRaf = 0
 
   function setupMounts() {
     return [el.softCapsLobby, el.devices].filter(mount => mount !== null)
@@ -666,11 +709,13 @@
       if (active !== null && mount.contains(active)
         && (active.tagName === 'INPUT' || active.tagName === 'SELECT')) continue
       setupSignatures.set(mount, signature)
-      mount.replaceChildren(...setupNodes(snapshot))
+      if (mount === el.devices) channelLiveViews.clear()
+      mount.replaceChildren(...setupNodes(snapshot, mount === el.devices))
     }
+    updateChannelLive(snapshot)
   }
 
-  function setupNodes(snap) {
+  function setupNodes(snap, live = false) {
     if (snap === null) return [hintNode('正在读取…')]
     const devices = Array.isArray(snap.devices) ? snap.devices : []
     if (devices.length === 0) return [hintNode('还没有设备')]
@@ -678,13 +723,13 @@
     for (const device of devices) {
       const channels = Array.isArray(device.channels) ? device.channels : []
       // 一台设备一张卡，卡里再按通道分段：重复设备名读起来像列表被复制了两遍。
-      if (channels.length > 0) nodes.push(setupCard(device, channels, snap.locked === true))
+      if (channels.length > 0) nodes.push(setupCard(device, channels, snap.locked === true, live))
     }
     if (nodes.length === 0) return [hintNode('还没有通道')]
     return nodes
   }
 
-  function setupCard(device, channels, locked) {
+  function setupCard(device, channels, locked, live) {
     const card = document.createElement('div')
     card.className = 'soft-cap'
     const head = document.createElement('div')
@@ -698,12 +743,155 @@
     state.textContent = LIFECYCLE_TEXT[device.lifecycle] ?? String(device.lifecycle ?? '—')
     head.append(name, state)
     card.append(head)
-    for (const channel of channels) card.append(setupChannel(device, channel, locked))
+    for (const channel of channels) card.append(setupChannel(device, channel, locked, live))
     return card
   }
 
-  /** 一个通道块：部位输入 + 强度范围 +（波形通道）频率范围。 */
-  function setupChannel(device, channel, locked) {
+  /** 通道实时预览：一条小强度条 +（波形通道）柱状波形。 */
+  function channelLiveRow(device, channel) {
+    const row = document.createElement('div')
+    row.className = 'channel-live'
+
+    const level = document.createElement('div')
+    level.className = 'live-level'
+    const bar = document.createElement('div')
+    bar.className = 'live-level-bar'
+    const fill = document.createElement('span')
+    fill.className = 'live-level-fill'
+    bar.append(fill)
+    const percent = document.createElement('span')
+    percent.className = 'live-percent'
+    percent.textContent = '0%'
+    level.append(bar, percent)
+    row.append(level)
+
+    let canvas = null
+    if (channel.supportsWaveform === true) {
+      canvas = document.createElement('canvas')
+      canvas.className = 'live-wave'
+      canvas.width = 300
+      canvas.height = 32
+      canvas.setAttribute('aria-label', `${channel.label ?? channel.id ?? '通道'} 实时波形`)
+      row.append(canvas)
+    }
+
+    channelLiveViews.set(regionKey(device.id, channel.id), {
+      deviceId: device.id,
+      channelId: channel.id,
+      row,
+      fill,
+      percent,
+      canvas,
+      level: 0,
+      waveformId: '',
+    })
+    return row
+  }
+
+  /** 从当前快照刷新每个通道的强度条与波形 id；不重建 DOM。 */
+  function updateChannelLive(snap = snapshot) {
+    if (channelLiveViews.size === 0) return
+    const byKey = new Map()
+    for (const device of Array.isArray(snap?.devices) ? snap.devices : []) {
+      for (const channel of Array.isArray(device.channels) ? device.channels : []) {
+        byKey.set(regionKey(device.id, channel.id), channel)
+      }
+    }
+    for (const [key, view] of channelLiveViews) {
+      const channel = byKey.get(key)
+      if (channel === undefined) {
+        view.row.style.display = 'none'
+        continue
+      }
+      view.row.style.display = ''
+      const level = typeof channel.percent === 'number' && Number.isFinite(channel.percent)
+        ? Math.max(0, Math.min(100, channel.percent))
+        : 0
+      view.level = level
+      view.fill.style.width = `${level}%`
+      view.percent.textContent = `${Math.round(level)}%`
+      const waveformId = typeof channel.waveform?.id === 'string' ? channel.waveform.id : ''
+      if (view.waveformId !== waveformId) {
+        view.waveformId = waveformId
+        if (waveformId !== '') void ensureWaveformPreview(waveformId)
+      }
+    }
+  }
+
+  /** 只取一次某波形的采样值；旧宿主没有 preview 路由时安静跳过。 */
+  async function ensureWaveformPreview(id) {
+    if (id === '' || waveformPreviews.has(id) || waveformPreviewPending.has(id)
+      || waveformPreviewFailed.has(id)) return
+    waveformPreviewPending.add(id)
+    try {
+      const body = await api(`/api/waveforms/preview?id=${encodeURIComponent(id)}`)
+      if (body !== null && typeof body === 'object'
+        && Array.isArray(body.freq) && Array.isArray(body.intensity)
+        && body.freq.length > 0 && body.intensity.length > 0) {
+        waveformPreviews.set(id, { freq: body.freq, intensity: body.intensity })
+      } else {
+        waveformPreviewFailed.add(id)
+      }
+    } catch {
+      // 控制台测试替身/旧宿主没有该路由：记住失败，别每 500ms 重试。
+      waveformPreviewFailed.add(id)
+    } finally {
+      waveformPreviewPending.delete(id)
+    }
+  }
+
+  /**
+   * 波形柱状图：从右往左滚；频率越低柱距越大，强度越高柱子越高。
+   *
+   * 这里画的是宿主给出的一帧采样（每 25ms 一个 slot）；当前通道强度作为
+   * 整体振幅，波形自身的 intensity 作为纹理，最后再按当前百分比缩放。
+   */
+  function drawLiveWave(view) {
+    const canvas = view.canvas
+    if (canvas === null || view.row.offsetParent === null) return
+    const context = canvas.getContext('2d')
+    if (context === null) return
+    const width = canvas.width
+    const height = canvas.height
+    context.clearRect(0, 0, width, height)
+    const preview = view.waveformId === '' ? undefined : waveformPreviews.get(view.waveformId)
+    if (preview === undefined) {
+      context.strokeStyle = 'rgba(247, 217, 122, 0.18)'
+      context.lineWidth = 1
+      context.beginPath()
+      context.moveTo(0, height - 1)
+      context.lineTo(width, height - 1)
+      context.stroke()
+      return
+    }
+    const { freq, intensity } = preview
+    const count = Math.min(freq.length, intensity.length)
+    if (count === 0) return
+    let sum = 0
+    for (const value of freq) sum += value
+    const avgFreq = sum / freq.length
+    // 协议频率 10-240：低频柱距宽、高频柱距窄。
+    const spacing = Math.max(4, Math.min(22, 4 + (240 - avgFreq) / 12))
+    const phase = (performance.now() / 1000) * 28 % (spacing * 8)
+    context.fillStyle = 'rgba(247, 217, 122, 0.72)'
+    for (let x = -phase; x < width + spacing; x += spacing) {
+      const index = Math.floor((x + phase) / spacing * 8) % count
+      const sample = Math.abs(index)
+      const texture = Math.max(0, Math.min(100, intensity[sample] ?? 0)) / 100
+      const barHeight = Math.max(1, Math.round(texture * (view.level / 100) * (height - 3)))
+      const barX = Math.round(x)
+      context.fillRect(barX, height - barHeight - 1, Math.max(2, spacing - 2), barHeight)
+    }
+  }
+
+  function liveLoop() {
+    liveRaf = requestAnimationFrame(liveLoop)
+    if (!playVisible() || session === null) return
+    for (const view of channelLiveViews.values()) drawLiveWave(view)
+  }
+
+  /** 一个通道块：部位输入 + 实时强度/波形 + 强度范围 +（波形通道）频率范围。 */
+  function setupChannel(device, channel, locked, live) {
     const block = document.createElement('div')
     block.className = 'soft-cap-channel'
     const head = document.createElement('div')
@@ -728,6 +916,7 @@
     })
     head.append(input)
     block.append(head)
+    if (live) block.append(channelLiveRow(device, channel))
 
     const caps = capsOf(channel)
     const names = { device: deviceName, channel: channelName }
@@ -1067,7 +1256,7 @@
         if (typeof entry.turnId !== 'number' || typeof entry.text !== 'string' || entry.text === '') continue
         // 路由目前返回整段转写；按 turnId 去重，未来做增量过滤也依然成立。
         if (entry.turnId <= lastTurnId) continue
-        appendLine('assistant', entry.text)
+        appendLine('assistant', entry.text, true, entry.effects)
         lastTurnId = entry.turnId
         if (typeof entry.at === 'number') lastAt = Math.max(lastAt, entry.at)
       }
@@ -1082,6 +1271,7 @@
     if (snap === null || typeof snap !== 'object') return
     snapshot = snap
     renderSetup()
+    updateChannelLive(snap)
     renderLock()
     renderControls()
   }
@@ -1664,6 +1854,7 @@
   async function boot() {
     // 大厅自动运行控件先落到默认值（上一局结束时会被覆盖）。
     renderLobbyAuto()
+    if (liveRaf === 0) liveRaf = requestAnimationFrame(liveLoop)
     if (token.length < 16) {
       el.conn.textContent = '缺少 token'
       el.conn.classList.remove('on')

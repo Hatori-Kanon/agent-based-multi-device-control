@@ -492,6 +492,19 @@ describe('session HTTP routes', () => {
       .toMatchObject({ enabled: true, intervalSec: 15 })
     expect((await post('/api/session/autopilot', { enabled: 'yes' })).status).toBe(400)
 
+    // The play rail's live chart asks for one waveform's per-slot preview.
+    const library = await get('/api/waveforms')
+    expect(library.status).toBe(200)
+    const waveforms = await library.json() as { id: string }[]
+    expect(waveforms.length).toBeGreaterThan(0)
+    const preview = await get(`/api/waveforms/preview?id=${encodeURIComponent(waveforms[0]!.id)}`)
+    expect(preview.status).toBe(200)
+    expect(await preview.json()).toMatchObject({
+      id: waveforms[0]!.id,
+      freq: expect.any(Array),
+      intensity: expect.any(Array),
+    })
+
     const messaged = await post('/api/session/message', { text: '我往后缩了一下' })
     expect(messaged.status).toBe(200)
     const secondTurn = await messaged.json() as { turnId: number; lastLine?: string }
@@ -962,24 +975,55 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
     await h.host.end('stop')
   })
 
-  it('suppresses player choices in autopilot mode', async () => {
-    const h = await createHarness([
-      scriptedTurn('自动推进。', [choicePlanCall()]),
-      scriptedTurn('第二回合。'),
-    ])
+  it('keeps player choices in autopilot mode', async () => {
+    const h = await createHarness([scriptedTurn('自动推进。', [choicePlanCall()])])
     const started = await h.host.start({
       packId: 'demo',
       plannedMinutes: 30,
       autopilot: { enabled: true, intervalSec: 10 },
     })
-    expect(started.choices).toBeUndefined()
+    expect(started.choices).toHaveLength(1)
     const system = h.runner.requests[0]?.messages.find(message => message.role === 'system')?.content ?? ''
     expect(system).toContain('自动运行')
-    expect(system).toContain('不要生成 choices')
+    expect(system).toContain('choices')
+    expect(system).not.toContain('不要生成 choices')
+    await h.host.end('completed')
+  })
 
-    // Let the FakeClock fire one autopilot tick; the auto turn must end with a
-    // synthetic user continuation, because DeepSeek thinking mode rejects a
-    // history ending on an assistant message.
+  it('does not wait forever on a choice in autopilot mode', async () => {
+    const h = await createHarness([
+      scriptedTurn('开场带选项。', [choicePlanCall()]),
+      scriptedTurn('超时后继续。'),
+    ])
+    await h.host.start({
+      packId: 'demo',
+      plannedMinutes: 30,
+      autopilot: { enabled: true, intervalSec: 10 },
+    })
+    expect(h.host.snapshot()?.choices).toHaveLength(1)
+    // The choice timeout is passive: no player decision is fabricated, the
+    // menu expires and the autopilot opens the next turn.
+    h.clock.advance(60_000)
+    for (let i = 0; i < 20 && h.runner.requests.length < 2; i += 1) {
+      await Promise.resolve()
+      await new Promise(resolve => setTimeout(resolve, 0))
+    }
+    expect(h.runner.requests).toHaveLength(2)
+    expect(h.host.snapshot()?.choices).toBeUndefined()
+    await h.host.end('completed')
+  })
+
+  it('sends a synthetic continuation user turn for auto turns', async () => {
+    const h = await createHarness([
+      scriptedTurn('开场。'),
+      scriptedTurn('自动回合。'),
+    ])
+    await h.host.start({
+      packId: 'demo',
+      plannedMinutes: 30,
+      autopilot: { enabled: true, intervalSec: 10 },
+    })
+    // FakeClock fires one autopilot tick; no choice menu is open.
     h.clock.advance(10_000)
     for (let i = 0; i < 20 && h.runner.requests.length < 2; i += 1) {
       await Promise.resolve()
@@ -1136,9 +1180,16 @@ describe('session controls (B2-T11)', () => {
     ])
     await h.host.start({ packId: 'demo', plannedMinutes: 30 })
 
-    expect(h.host.transcript()).toEqual([
-      { turnId: 1, at: h.clock.now(), text: '第一句。' },
-    ])
+    const opening = h.host.transcript()[0]
+    expect(opening).toMatchObject({ turnId: 1, at: h.clock.now(), text: '第一句。' })
+    // Resolved dispatch actions ride along as the per-turn effect summary.
+    expect(opening?.effects.length).toBeGreaterThan(0)
+    expect(opening?.effects[0]).toMatchObject({
+      deviceId: 'mock-pulse',
+      channelId: 'a',
+      percent: expect.any(Number),
+      status: 'dispatched',
+    })
 
     h.clock.advance(1_234)
     await h.host.message('嗯。')

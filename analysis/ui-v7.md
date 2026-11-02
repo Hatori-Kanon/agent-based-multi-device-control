@@ -40,7 +40,7 @@
     成功 `applySession`，失败 noteError 并回拉真值。
   - paused 可改；locked/ending/ended 禁用；结束后大厅沿用上一局设置（每 sessionId 一次，
     轮询不会覆盖玩家之后在大厅的手动修改）。
-  - 自动运行时不生成/丢弃 choices（没有玩家可点，避免引擎停在选择菜单）；关闭后恢复。
+  - 自动运行仍会显示 choices（由模型决定 0–3 条）；出现菜单时引擎等玩家选择，这是玩家决策。
 - 自动运行不改变任何安全边界：它只触发 P3 回合，输出仍受每通道 policy/ceiling/LOCKED 约束。
 
 ## 2. 应用内确认
@@ -68,7 +68,7 @@
 
 ## 4. 验证
 
-- core：52 files / **682 tests**；desktop：17 files / **214 tests**；两边 `tsc --noEmit` 0 error；
+- core：52 files / **682 tests**；desktop：17 files / **216 tests**；两边 `tsc --noEmit` 0 error；
   main/dev-server esbuild + `node --check` 通过。
   - 新增引擎测试：snapshot autopilot 字段、`setAutopilotInterval` clamp + 重排定时器。
   - 宿主测试：开局 autopilot 应用到 snapshot；`setAutopilot` 修改；ended 后新 start 成功

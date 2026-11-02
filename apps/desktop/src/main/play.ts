@@ -150,9 +150,9 @@ const OPENING_PROTOCOL = [
   '这是开场回合：narration 第一段先交代场景/背景（环境、玩家姿态、角色如何出现），再进入互动；不能只写一句空泛台词。',
 ] as const
 
-/** Auto mode has no player to pick options, so it must not stall on a menu. */
+/** Auto mode still offers the human choices; it never picks for them. */
 const AUTOPILOT_PROTOCOL = [
-  '当前会话处于自动运行：不要生成 choices；玩家不会选择，用 narration 直接推进本回合。',
+  '当前会话处于自动运行：本回合必须给玩家 1–3 条 choices 供其随时接管（只有急停/收束等确实不适合选择的回合才可省略）。',
 ] as const
 
 /**
@@ -290,6 +290,27 @@ export interface PlaySnapshot extends EngineSnapshot {
 }
 
 /**
+ * One resolved action summarized for the transcript's small effect box.
+ *
+ * The transcript is still the narrative line; this is the human-facing
+ * "what did this turn target" row (part / actual percent / selected waveform).
+ * It is derived from the executor's dispatch result, never from model JSON.
+ */
+export interface PlayTurnEffect {
+  readonly deviceId: string
+  readonly channelId: string
+  readonly channelLabel?: string
+  readonly region?: string
+  readonly regionLabel?: string
+  readonly percent?: number
+  readonly waveformId?: string
+  readonly waveformName?: string
+  readonly intentId?: string
+  readonly status: string
+  readonly reason?: string
+}
+
+/**
  * One settled line of the play transcript (`GET /api/session/transcript`).
  *
  * Derived from the same line record the writer's prompt uses — no separate
@@ -301,6 +322,8 @@ export interface PlayTranscriptEntry {
   readonly turnId: number
   readonly at: number
   readonly text: string
+  /** Resolved effects for this turn, in dispatch order. */
+  readonly effects: readonly PlayTurnEffect[]
 }
 
 /** One loaded pack, as seen by the session service. */
@@ -361,6 +384,8 @@ export class PlaySession {
   private starting = false
   /** Settled assistant lines, newest last; the transcript and prompt memory. */
   private readonly recentEntries: PlayTranscriptEntry[] = []
+  /** Full session transcript (the UI scrollback); `recentEntries` stays capped for prompts. */
+  private readonly transcriptEntries: PlayTranscriptEntry[] = []
   /** B2-T7 archive; undefined when the host injected no `archive` seam. */
   private store: SessionStore | undefined
   /** B2-T8 ledger; undefined when the host injected no `archive` seam. */
@@ -678,7 +703,7 @@ export class PlaySession {
    * lines remain readable for the UI.
    */
   transcript(): readonly PlayTranscriptEntry[] {
-    return [...this.recentEntries]
+    return [...this.transcriptEntries]
   }
 
   /**
@@ -881,7 +906,6 @@ export class PlaySession {
     const opening = request.turnId === 1
       && request.playerText === undefined
       && request.choiceId === undefined
-    const autopilot = this.engine?.autopilotEnabled === true
     const messages = this.messagesFor(request, phases, pack, snapshot, opening)
     this.openingBrief = undefined
     const result = await runTurn({
@@ -915,13 +939,19 @@ export class PlaySession {
     if (line.trim() !== '') {
       // One entry serves both the writer's recent memory and the transcript:
       // no second write path, and `at` is the injected-clock settlement time.
-      this.recentEntries.push({ turnId: request.turnId, at: this.env.clock.now(), text: line })
+      this.recentEntries.push({
+        turnId: request.turnId,
+        at: this.env.clock.now(),
+        text: line,
+        effects: this.effectSummary(result),
+      })
+      this.transcriptEntries.push({ ...this.recentEntries[this.recentEntries.length - 1]! })
       if (this.recentEntries.length > RECENT_LINE_LIMIT) this.recentEntries.shift()
     }
     // Ledger/archive facts for this turn: dispatched percentages (B2-T8
     // `maxCapUsed`, never a cap) and the intent ids of the last two turns.
     this.recordTurnFacts(result)
-    const choices = autopilot ? undefined : result.plan?.choices
+    const choices = result.plan?.choices
     return {
       line,
       ...(choices === undefined ? {} : { choices }),
@@ -1008,6 +1038,51 @@ export class PlaySession {
     if (intents.length === 0) return
     this.turnBeats.push([...new Set(intents)])
     if (this.turnBeats.length > 2) this.turnBeats.shift()
+  }
+
+  /**
+   * Human-facing summary of what this turn actually dispatched.
+   *
+   * Uses the post-dispatch registry snapshot so a waveform selected by this
+   * turn's plan is already reflected; region labels use the same vocabulary the
+   * player sees in the soft-cap editors. No numbers beyond the actual
+   * dispatched percentage reach this row.
+   */
+  private effectSummary(result: TurnResult): readonly PlayTurnEffect[] {
+    const scenario = this.scenario
+    if (scenario === undefined) return []
+    const after = this.env.registry.snapshot()
+    const labels = new Map(
+      sessionRegions(scenario, after).map(region => [region.id, region.label] as const),
+    )
+    const channels = new Map<string, { channel: (typeof after.devices)[number]['channels'][number]; deviceName: string }>()
+    for (const device of after.devices) {
+      for (const channel of device.channels) {
+        channels.set(`${device.id}:${channel.id}`, { channel, deviceName: device.name })
+      }
+    }
+    const beats = new Map((result.plan?.beats ?? []).map(beat => [beat.id, beat] as const))
+    const effects: PlayTurnEffect[] = []
+    for (const action of result.dispatch?.actions ?? []) {
+      const found = channels.get(`${action.deviceId}:${action.channelId}`)
+      const channel = found?.channel
+      const region = channel?.region
+      const waveform = channel?.waveform
+      const intentId = beats.get(action.beatId)?.intentId
+      effects.push({
+        deviceId: action.deviceId,
+        channelId: action.channelId,
+        ...(channel?.label === undefined ? {} : { channelLabel: channel.label }),
+        ...(region === undefined ? {} : { region }),
+        ...(region === undefined ? {} : { regionLabel: labels.get(region) ?? region }),
+        ...(action.percent === undefined ? {} : { percent: action.percent }),
+        ...(waveform === undefined ? {} : { waveformId: waveform.id, waveformName: waveform.name }),
+        ...(intentId === undefined ? {} : { intentId }),
+        status: action.status,
+        ...(action.reason === undefined ? {} : { reason: action.reason }),
+      })
+    }
+    return effects
   }
 
   /**

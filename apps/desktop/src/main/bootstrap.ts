@@ -1447,6 +1447,26 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     connect: async deviceId => { await registry.connect(deviceId, controller.signal) },
     scan: async (deviceId, durationMs) => { await registry.scan('human', deviceId, durationMs, controller.signal) },
     listWaveforms: () => waveforms.list(),
+    waveformPreview: id => {
+      const waveform = waveforms.get(id)
+      if (waveform === undefined) return undefined
+      const freq: number[] = []
+      const intensity: number[] = []
+      for (const frame of waveform.frames) {
+        for (let slot = 0; slot < 4; slot += 1) {
+          freq.push(frame.freq[slot] ?? 0)
+          intensity.push(frame.intensity[slot] ?? 0)
+        }
+      }
+      return {
+        id: waveform.id,
+        name: waveform.name,
+        loop: waveform.loop,
+        durationMs: waveform.frames.length * 100,
+        freq,
+        intensity,
+      }
+    },
     importWaveform: async (name, frames) => {
       const imported = waveforms.importFrames(name, frames)
       await saveWaveforms()
