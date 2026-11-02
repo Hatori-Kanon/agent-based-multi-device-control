@@ -59,10 +59,7 @@
     lobby: document.getElementById('lobby'),
     sessionView: document.getElementById('sessionView'),
     sessionState: document.getElementById('sessionState'),
-    nowCard: document.getElementById('nowCard'),
-    nowEyebrow: document.getElementById('nowEyebrow'),
     phaseChip: document.getElementById('phaseChip'),
-    currentLine: document.getElementById('currentLine'),
     turnInfo: document.getElementById('turnInfo'),
     stageTimer: document.getElementById('stageTimer'),
     lines: document.getElementById('lines'),
@@ -106,14 +103,6 @@
   let lastTurnId = 0
   /** Newest `at` already seen; sent back as `?since=` (forward compatible). */
   let lastAt = 0
-  /**
-   * 最新一条旁白台词。
-   *
-   * 它已经显示在「现在」卡里，所以先不进对话流；等下一句（或玩家发言）到来
-   * 时才落进历史，避免同一句台词在屏幕上出现两次——这也是视觉小说的常见
-   * 处理：现在窗口是焦点，对话流是已经过去的台词。
-   */
-  let pendingLine = ''
   // 渲染签名：只有内容变了才重建 DOM（也避免轮询把输入框从光标下拿走）。
   // 初值用哨兵而不是空串，否则“列表清空”与“从未加载”无法区分。
   let choiceSignature = '\u0000init'
@@ -320,24 +309,9 @@
     const current = session
     const inSession = current !== null
     const ended = inSession && current.state === 'ended'
+    document.body.classList.toggle('in-session', inSession)
     el.lobby.style.display = inSession ? 'none' : ''
     el.sessionView.style.display = inSession ? '' : 'none'
-
-    // 结束态是一个安静的收尾卡，而不是留着金色大字框继续倒计时。
-    if (ended) {
-      flushPendingLine()
-    }
-    const lastLine = inSession && typeof current.lastLine === 'string' ? current.lastLine : ''
-    const pendingShown = !ended && lastLine === '' ? pendingLine : ''
-    const line = ended
-      ? '已结束'
-      : (lastLine !== '' ? lastLine : (pendingShown !== '' ? pendingShown : (inSession ? '（本回合还没有台词）' : '（尚未开局）')))
-    // 只在内容真的变化时写 DOM：这个节点是 aria-live，重复赋值会让读屏器反复播报同一句。
-    if (el.currentLine.textContent !== line) el.currentLine.textContent = line
-    el.currentLine.classList.toggle('placeholder', ended
-      || (!inSession || (lastLine === '' && pendingShown === '')))
-    el.nowCard.classList.toggle('is-ended', ended)
-    if (el.nowEyebrow !== null) el.nowEyebrow.textContent = ended ? '已结束' : '现在'
 
     el.phaseChip.textContent = ended ? '已结束' : (inSession ? phaseText(current.phase) : '未开局')
     el.turnInfo.textContent = inSession ? `第 ${current.turnId ?? 0} 回合` : '未开局'
@@ -548,54 +522,43 @@
     return el.lines.scrollHeight - el.lines.scrollTop - el.lines.clientHeight < 80
   }
 
-  function appendLine(role, text) {
+  /** 模型偶尔把换行写成字面量 `\\n`；显示前还原，避免正文里留着转义符。 */
+  function normalizeLineText(text) {
+    return String(text)
+      .replaceAll('\\r\\n', '\n')
+      .replaceAll('\\n', '\n')
+      .replaceAll('\\r', '\n')
+      .replaceAll('\\t', '  ')
+  }
+
+  /**
+   * 追加一条会话消息。
+   *
+   * 只有一条时间线：旁白/玩家/系统都进同一个可滚动容器，最新一条加
+   * `is-latest`（字号稍大）；不再有「现在卡 + 历史气泡」两套视觉。
+   */
+  function appendLine(role, text, latest = true) {
     const stick = nearBottom()
     const stale = el.lines.querySelector('.hint')
     if (stale !== null) stale.remove()
+    for (const previous of el.lines.querySelectorAll('.is-latest')) previous.classList.remove('is-latest')
     const row = document.createElement('div')
     row.className = role === 'assistant'
-      ? 'bubble bubble--narrator'
+      ? 'line line--narrator'
       : role === 'player'
-        ? 'bubble bubble--player'
-        : 'bubble bubble--sys'
-    const who = document.createElement('span')
-    who.className = 'who'
-    who.textContent = role === 'assistant' ? '旁白' : role === 'player' ? '你' : '系统'
-    const body = document.createElement('span')
-    body.className = 'text'
-    body.textContent = text
-    row.append(who, body)
+        ? 'line line--player'
+        : 'line line--sys'
+    if (latest) row.classList.add('is-latest')
+    row.textContent = normalizeLineText(text)
     el.lines.append(row)
     while (el.lines.childElementCount > 300) el.lines.firstElementChild.remove()
     if (stick) el.lines.scrollTop = el.lines.scrollHeight
     return row
   }
 
-  /**
-   * 把「现在」卡上那一句推进对话流，并返回被推进的文本（用于请求失败时回滚）。
-   *
-   * 玩家发言前先 flush，保证顺序是「旁白 → 你的话」；新一句旁白到来时 flush
-   * 上一句，于是对话流里永远只缺最新那句。
-   */
-  function flushPendingLine() {
-    if (pendingLine === '') return ''
-    const text = pendingLine
-    pendingLine = ''
-    appendLine('assistant', text)
-    return text
-  }
-
-  /**
-   * 回滚一次乐观回显：删掉玩家气泡，把刚推进历史的旁白还原成 pending，
-   * 于是「现在」卡与历史的关系回到请求前的状态。
-   */
-  function rollbackPlayerEcho(playerRow, flushed, draft) {
+  /** 乐观回显撤回：只删掉这条玩家消息，不碰会话里已经出现的旁白。 */
+  function rollbackPlayerEcho(playerRow, draft) {
     if (playerRow !== null && typeof playerRow.remove === 'function') playerRow.remove()
-    if (flushed !== '') {
-      const last = el.lines.lastElementChild
-      if (last !== null && last.classList.contains('bubble--narrator')) last.remove()
-      pendingLine = flushed
-    }
     if (typeof draft === 'string') el.message.value = draft
   }
 
@@ -605,7 +568,6 @@
     el.choices.replaceChildren()
     lastTurnId = 0
     lastAt = 0
-    pendingLine = ''
     choiceSignature = '\u0000init'
   }
 
@@ -1105,9 +1067,7 @@
         if (typeof entry.turnId !== 'number' || typeof entry.text !== 'string' || entry.text === '') continue
         // 路由目前返回整段转写；按 turnId 去重，未来做增量过滤也依然成立。
         if (entry.turnId <= lastTurnId) continue
-        // 上一句「现在」台词先落进历史，最新一句留在「现在」卡里。
-        flushPendingLine()
-        pendingLine = entry.text
+        appendLine('assistant', entry.text)
         lastTurnId = entry.turnId
         if (typeof entry.at === 'number') lastAt = Math.max(lastAt, entry.at)
       }
@@ -1481,9 +1441,7 @@
     if (text === '' || !canSend()) return
     busy = true
     renderControls()
-    // 请求发出前就 flush 上一句并回显玩家这句，避免与 500ms 转录轮询竞态
-    // （详见 pickChoice 里的说明）；失败时用 rollbackPlayerEcho 原样撤回。
-    const flushed = flushPendingLine()
+    // 玩家消息先乐观回显；旁白由转录轮询/响应按时间追加到同一列。
     const draft = el.message.value
     const playerRow = appendLine('player', text)
     el.message.value = ''
@@ -1495,7 +1453,7 @@
       })
       applySession(next)
     } catch (error) {
-      rollbackPlayerEcho(playerRow, flushed, draft)
+      rollbackPlayerEcho(playerRow, draft)
       noteError('action', `发送失败：${describe(error)}`)
     } finally {
       busy = false
@@ -1508,10 +1466,7 @@
     if (!canSend()) return
     busy = true
     renderControls()
-    // 请求发出前就把上一句「现在」台词推进历史，并立刻回显玩家这句：
-    // 否则 500ms 的转录轮询可能在响应返回前把下一句拿到手，顺序会变成
-    // 「下一句旁白 → 玩家」而且那句在历史/现在卡里各出现一次。
-    const flushed = flushPendingLine()
+    // 选择也回显成一条玩家消息，顺序由同一时间线自然保证。
     const playerRow = appendLine('player', choice.label)
     try {
       const next = await api('/api/session/choice', {
@@ -1521,7 +1476,7 @@
       })
       applySession(next)
     } catch (error) {
-      rollbackPlayerEcho(playerRow, flushed)
+      rollbackPlayerEcho(playerRow)
       noteError('action', `选择失败：${describe(error)}`)
     } finally {
       busy = false

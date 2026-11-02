@@ -963,16 +963,31 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
   })
 
   it('suppresses player choices in autopilot mode', async () => {
-    const h = await createHarness([scriptedTurn('自动推进。', [choicePlanCall()])])
+    const h = await createHarness([
+      scriptedTurn('自动推进。', [choicePlanCall()]),
+      scriptedTurn('第二回合。'),
+    ])
     const started = await h.host.start({
       packId: 'demo',
       plannedMinutes: 30,
-      autopilot: { enabled: true, intervalSec: 60 },
+      autopilot: { enabled: true, intervalSec: 10 },
     })
     expect(started.choices).toBeUndefined()
     const system = h.runner.requests[0]?.messages.find(message => message.role === 'system')?.content ?? ''
     expect(system).toContain('自动运行')
     expect(system).toContain('不要生成 choices')
+
+    // Let the FakeClock fire one autopilot tick; the auto turn must end with a
+    // synthetic user continuation, because DeepSeek thinking mode rejects a
+    // history ending on an assistant message.
+    h.clock.advance(10_000)
+    for (let i = 0; i < 20 && h.runner.requests.length < 2; i += 1) {
+      await Promise.resolve()
+      await new Promise(resolve => setTimeout(resolve, 0))
+    }
+    expect(h.runner.requests).toHaveLength(2)
+    expect(h.runner.requests[1]?.messages.at(-1)).toMatchObject({ role: 'user' })
+    expect(h.runner.requests[1]?.messages.at(-1)?.content).toContain('自动运行继续')
     await h.host.end('completed')
   })
 

@@ -1324,6 +1324,11 @@ describe('play page (B2-T12)', () => {
     expect(html).toContain('id="softCapsLobby"')
     expect(html).toContain('id="devices"')
     expect(html).not.toContain('id="softCapsRail"')
+    // v8: one scrollable conversation column; the old "now card" is gone.
+    expect(html).toContain('id="lines"')
+    expect(html).toContain('role="log"')
+    expect(html).not.toContain('id="currentLine"')
+    expect(html).not.toContain('id="nowCard"')
     // The lobby owns the one content-pack import entry point (zip upload).
     expect(html).toContain('id="packImport"')
     expect(html).toContain('id="packFile"')
@@ -1374,6 +1379,7 @@ describe('play page (B2-T12)', () => {
     // Autopilot is session-scoped; end uses the in-page confirmation helper.
     expect(js).toContain('/api/session/autopilot')
     expect(js).toContain('embodiedConfirm')
+    expect(js).toContain('is-latest')
     expect(js).not.toContain('window.confirm')
     expect(js).toContain('region-input')
     expect(js).toContain('datalist')

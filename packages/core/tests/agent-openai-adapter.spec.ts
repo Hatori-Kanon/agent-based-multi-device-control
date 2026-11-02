@@ -167,6 +167,17 @@ describe('OpenAICompatibleRunner', () => {
     expect((fallbackBody.messages as unknown[]).length).toBe(3)
   })
 
+  it('does not downgrade tools on a thinking-mode history error', async () => {
+    const { runner, http } = harness({
+      replies: [rejectedReply(400, 'The `reasoning_content` in the thinking mode must be passed back to the API.')],
+    })
+    await expect(runner.run(request())).rejects.toBeInstanceOf(ModelError)
+    expect(http.callCount).toBe(1)
+    // Capability memory stays optimistic: this is a conversation-state error,
+    // not proof that the endpoint lacks tool support.
+    expect(runner.capabilities()).toEqual({ tools: true, jsonSchema: true })
+  })
+
   it('caches a capability probe per provider and model', async () => {
     const capabilities = new CapabilityCache()
     const envelope = { tool: 'apply_plan', arguments: PLAN, line: '好。' }

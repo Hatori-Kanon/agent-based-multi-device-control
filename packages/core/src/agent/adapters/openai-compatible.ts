@@ -409,10 +409,17 @@ function cacheKey(provider: string, model: string): string {
 }
 
 function isCapabilityRejection(error: unknown): error is ModelError {
-  return error instanceof ModelError
-    && error.code === 'http'
-    && error.status !== undefined
-    && CAPABILITY_REJECTION_STATUSES.has(error.status)
+  if (!(error instanceof ModelError)
+    || error.code !== 'http'
+    || error.status === undefined
+    || !CAPABILITY_REJECTION_STATUSES.has(error.status)) return false
+  // A thinking-mode conversation-state error (e.g. DeepSeek demanding the
+  // previous assistant's `reasoning_content`) says nothing about whether the
+  // endpoint supports tools. Treating it as a capability rejection permanently
+  // disables tools for this process and silently degrades every later turn
+  // into raw-JSON text fallback.
+  const detail = error.detail ?? ''
+  return !/reasoning_content|thinking mode/iu.test(detail)
 }
 
 /** Map one provider-neutral message onto the Chat Completions wire shape. */

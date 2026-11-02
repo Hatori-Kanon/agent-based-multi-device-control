@@ -155,6 +155,18 @@ const AUTOPILOT_PROTOCOL = [
   '当前会话处于自动运行：不要生成 choices；玩家不会选择，用 narration 直接推进本回合。',
 ] as const
 
+/**
+ * A synthetic user turn for auto/checkpoint turns.
+ *
+ * DeepSeek's thinking mode rejects a request whose history ends with an
+ * assistant message without `reasoning_content` (exactly the autopilot shape:
+ * system + previous assistant line). A short system continuation keeps the
+ * wire protocol valid and tells the model not to wait for input. It is not a
+ * player message: it never reaches the transcript or the audit line.
+ */
+const AUTO_CONTINUE_MESSAGE = '（系统：自动运行继续。直接推进本回合，不要等待玩家输入。）'
+
+
 /** Stable failure vocabulary for the HTTP layer (all map to 400). */
 export type SessionErrorCode =
   | 'NO_SESSION'
@@ -1016,6 +1028,7 @@ export class PlaySession {
   ): readonly LlmMessage[] {
     const system = this.systemPrompt(phases, pack, snapshot, opening)
     const playerText = playerTextOf(request)
+      ?? (request.turnId > 1 ? AUTO_CONTINUE_MESSAGE : undefined)
     return buildTurnMessages({
       ...(system === '' ? {} : { system }),
       recentLines: this.recentEntries.map(entry => entry.text),

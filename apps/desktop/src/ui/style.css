@@ -1076,11 +1076,17 @@ input[type="range"]:disabled {
   gap: 12px;
   width: 100%;
   /* 舞台内容列封顶：1600 下两侧留白比把卡片横向拉满更像舞台，
-     也让 now-card / choices / composer 的右边界收敛成一条。 */
+     也让 choices / composer 的右边界收敛成一条。 */
   max-width: 1040px;
   margin: 0 auto;
   min-height: 0;
   min-width: 0;
+  height: 100%;
+}
+
+/* 会话进行中由舞台内部滚动：整页不跟着长，输入框始终在底部。 */
+body.in-session .main-play {
+  overflow: hidden;
 }
 
 .stage-head {
@@ -1205,12 +1211,65 @@ input[type="range"]:disabled {
 
 .thread {
   flex: 1;
-  min-height: 120px;
+  min-height: 0;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 8px 4px 12px;
+  gap: 14px;
+  padding: 10px 4px 18px;
+  scrollbar-gutter: stable;
+  scroll-behavior: smooth;
+}
+
+/* 内容不足一屏时从底部开始排：最新一条贴在选择/输入框上方；
+   内容超过一屏时正常从顶部滚动，不会把最早的消息裁掉。 */
+.thread > :first-child {
+  margin-top: auto;
+}
+
+/* 一列到底的会话行：没有气泡标签，旁白保持可读的正文尺寸；
+   最新一条稍微放大、提亮，旧的略小一点。 */
+.line {
+  position: relative;
+  max-width: min(100%, 900px);
+  padding: 2px 2px;
+  font-family: var(--serif);
+  font-size: clamp(15.5px, 1.05vw, 17px);
+  line-height: 1.9;
+  letter-spacing: 0.01em;
+  color: #cfd6e1;
+  white-space: pre-wrap;
+  word-break: break-word;
+  animation: rise-in 0.24s var(--ease) both;
+}
+
+.line.is-latest {
+  font-size: clamp(18.5px, 1.35vw, 21px);
+  line-height: 1.85;
+  color: var(--text-warm);
+}
+
+.line--player {
+  align-self: flex-end;
+  max-width: min(88%, 640px);
+  padding: 8px 14px;
+  border: 1px solid rgba(247, 217, 122, 0.28);
+  border-radius: 12px;
+  background: rgba(255, 229, 154, 0.09);
+  color: var(--text-warm);
+  font-family: var(--sans);
+  font-size: 14.5px;
+  line-height: 1.7;
+}
+
+.line--sys {
+  align-self: center;
+  border: 0;
+  background: transparent;
+  font-family: var(--sans);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  color: var(--faint);
 }
 
 .bubble {
@@ -1717,17 +1776,20 @@ input[type="range"]:disabled {
     overflow: visible;
   }
 
+  body.in-session .main-play {
+    overflow: visible;
+  }
+
   .stage {
     max-width: none;
     gap: 10px;
+    height: auto;
   }
 
-  .now-line {
-    font-size: 19px;
-  }
-
+  /* 窄屏整页滚动时，会话区仍保留自己的滚动条，避免新消息把输入框顶出屏幕。 */
   .thread {
-    max-height: none;
+    max-height: min(62vh, 640px);
+    min-height: 220px;
   }
 
   /* 输入框吸附在底栏上方，滚到选项时也能直接回复 */

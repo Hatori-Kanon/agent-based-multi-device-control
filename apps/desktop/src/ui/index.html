@@ -96,12 +96,8 @@
             <span class="stage-timer" id="stageTimer">—</span>
           </div>
 
-          <div class="now-card" id="nowCard">
-            <div class="now-eyebrow" id="nowEyebrow">现在</div>
-            <p class="now-line placeholder" id="currentLine" aria-live="polite">（尚未开局）</p>
-          </div>
-
-          <div class="thread" id="lines">
+          <!-- 一列到底的会话：所有消息按时间从上到下，最新一条在底部。 -->
+          <div class="thread" id="lines" role="log" aria-live="polite" aria-label="对话">
             <div class="hint">还没有台词</div>
           </div>
 

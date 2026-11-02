@@ -6,7 +6,7 @@ Agent 主持的具身角色扮演系统：摄像头/麦克风感知 + 多设备�
 v4 把界面收敛成面向用户的产品：游玩 / 设备 / 设置三个视图、按原生单位显示的郊狼强度与物理频率、麦克风采集与传感器开关；日志/审计/调试与模拟设备不再出现在产品 UI 里。
 v5 把「部位」并入每设备每通道的软上限：部位、意图菜单与已就位部位进入模型提示词与 `apply_plan` 运行时枚举。
 v6 允许玩家**自由命名**每个通道的身体部位（如「左胸」），内容包 `scenario.regions` 降级为可选推荐（datalist 建议；名称/ id 匹配时自动复用包 id）。
-v7 增加**自动运行**（大厅与进行中都可设开关/间隔）、应用内确认框（结束/移除设备不再用浏览器原生弹窗），并在结束后回到大厅（同一进程可再开一局）。v7 运行修订把单次调用的正文放进 `apply_plan.narration`，并在提示词里加入 mandatory 工具/输出协议；开场回合要求先交代场景背景。
+v7 增加**自动运行**（大厅与进行中都可设开关/间隔）、应用内确认框（结束/移除设备不再用浏览器原生弹窗），并在结束后回到大厅（同一进程可再开一局）。v7 运行修订把单次调用的正文放进 `apply_plan.narration`，并在提示词里加入 mandatory 工具/输出协议；开场回合要求先交代场景背景。v8 把舞台改成**单列可滚动会话流**：最新消息在底部、字号稍大，旧旁白略小且无标签。
 
 - 第一次上手：`pnpm install && pnpm run check`；起控制台用 `start.bat`，纯 Node 演示用 `start-dev.bat`。
 - 游玩页 `http://<host>:<port>/play?token=…`（控制台顶部「游玩」或 `Ctrl+Alt+P`）；无硬件时可 `node scripts/demo-m2.mjs` 跑离线四步演示。
@@ -37,6 +37,8 @@ v7 增加**自动运行**（大厅与进行中都可设开关/间隔）、应用
   当前内容包 `scenario.regions[].label` 只是 datalist 推荐：名称或 id 完全一致（trim、大小写不敏感）
   时自动复用包 id，否则玩家文本本身作为会话部位 key。包推荐 + 玩家命名 + 意图菜单会进入单调用
   提示词，并作为 `apply_plan` 的运行时枚举；设备/通道 id 不进提示词。
+- **单列会话流**：一场对话从上到下滚动，最新消息贴底、字号稍大；旧旁白略小、无“旁白”
+  标签，玩家消息在右侧。舞台内部滚动，输入框与右轨固定。
 - **自动运行**：大厅「开局」卡与进行中右轨都有开关 + 10–60s 间隔滑块；开局时随 start 提交，
   进行中走 `POST /api/session/autopilot`。结束后大厅沿用上一局设置。
 - **应用内确认**：结束本局/移除设备使用页面内 `<dialog>`，不再是浏览器原生弹窗；结束后回到大厅，
@@ -72,7 +74,8 @@ v7 增加**自动运行**（大厅与进行中都可设开关/间隔）、应用
 | `analysis/ui-v5.md` | 部位与软上限合并：部位词表 API、每设备每通道映射、模型侧事实与枚举注入、复核记录 |
 | `analysis/ui-v6.md` | 玩家自由命名部位：region key 放宽、内容包 regions 降级为可选推荐、会话词表并集、验收记录 |
 | `analysis/ui-v7.md` | 自动运行、应用内确认、结束后回大厅：引擎/宿主契约、UI、验收与限制 |
-| `analysis/narration-and-opening.md` | 自动运行「AI 不说话」根因（DeepSeek tool-call 无 content）与 narration/开场协议修复 |
+| `analysis/narration-and-opening.md` | 自动运行「AI 不说话」根因（DeepSeek tool-call 无 content / thinking-mode 历史）与 narration/开场协议修复 |
+| `analysis/ui-v8.md` | 单列会话流：滚动、最新字号、无标签旁白、转录去重与后端配套 |
 | [`deliverables/content-pack-kit/`](deliverables/content-pack-kit/README.md) | 内容包制作包：当前实现格式要求、可改模板、校验/打包/安装脚本 |
 | `analysis/` | 证据笔记：AI-for-Coyote 后端/产品面、己方基线、HW9 心率带与 RR 调研 |
 
