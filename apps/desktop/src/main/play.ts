@@ -190,7 +190,15 @@ export interface PlaySessionEnvironment {
   readonly policy: PolicyStore
   readonly waveforms: WaveformLibrary
   readonly sensors: SensorRegistry
-  readonly runner: ModelRunner
+  /**
+   * Model gateway for the next turn.
+   *
+   * A function is resolved **at turn time**, so the settings view can rebuild
+   * the runner (new provider/model/key) and have the next turn use it without
+   * restarting the host. A bare `ModelRunner` keeps every pre-settings test
+   * double and embedded host working unchanged.
+   */
+  readonly runner: ModelRunner | (() => ModelRunner)
   /** Persist `state/policy.json` after a human ceiling change (D4/A1-T10). */
   readonly savePolicy: () => Promise<void>
   /**
@@ -754,6 +762,17 @@ export class PlaySession {
   }
 
   /**
+   * The model runner in force for this turn.
+   *
+   * A provider is read here rather than at session start: the settings view
+   * swaps the runner after a model change, and the *next* turn must use it.
+   */
+  private modelRunnerFor(): ModelRunner {
+    const source = this.env.runner
+    return typeof source === 'function' ? source() : source
+  }
+
+  /**
    * One single-call turn.
    *
    * Stage forwarding is guarded by the engine's own state so a stream that
@@ -783,7 +802,7 @@ export class PlaySession {
     const messages = this.messagesFor(request, phases, pack)
     this.openingBrief = undefined
     const result = await runTurn({
-      runner: this.env.runner,
+      runner: this.modelRunnerFor(),
       tools: M2_MODEL_TOOLS,
       executor,
       input: {

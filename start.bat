@@ -60,7 +60,7 @@ echo [4/4] Starting console...
 echo.
 echo   Data dir : %EMBODIED_DATA_DIR%  (unset = system default; set it first
 echo              with: set EMBODIED_DATA_DIR=E:\embodied-data)
-echo   No BLE hardware / mock only? Run start-dev.bat instead.
+echo   No BLE hardware? Use start-dev.bat (add "mock" for demo devices).
 echo.
 call corepack pnpm --filter @embodied/desktop exec electron .
 

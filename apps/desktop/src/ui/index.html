@@ -4,19 +4,18 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <!--
-  v3 单窗口应用页：原「Embodied 游玩」页与「Embodied 控制台」合并成这一张页面
-  （`设备范围与单窗口界面-设计说明.md` §3.1）。默认显示游玩视图；点顶栏「设备」
-  切到三栏控制台，再点「游玩」切回。视图切换由 /shell.js 负责，页面本身不做
-  业务逻辑：所有状态都来自 dashboard 的 JSON API。
+  v3 单窗口应用页：游玩 / 设备 / 设置三个视图共用这一张页面，视图切换由
+  /shell.js 完成。页面本身不做业务逻辑：所有状态都来自 dashboard 的 JSON API。
 
   token 只从地址栏读一次，之后只进 `x-control-token` 请求头 —— 不写本地存储、
-  不写 DOM、不进日志。CSP 与合并前一致：没有外链脚本/字体/图片。
+  不写 DOM。CSP 与合并前一致：没有外链脚本/字体/图片。
 
   设备视图（#view-device）的 id 统一加 dev 前缀，游玩视图（#view-play）沿用
-  play.js 既有约定；两个视图的轮询在隐藏时停止，切回时立即刷新一次。
+  play.js 既有约定；设置视图（#view-settings）只有标记，逻辑在 settings.js。
+  两个轮询视图在隐藏时停止，切回时立即刷新一次。
 -->
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'">
-<title>Embodied 控制台 · 游玩 / 设备</title>
+<title>Embodied · 游玩 / 设备 / 设置</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body data-view="play">
@@ -25,11 +24,11 @@
     <div class="brand">
       <span class="brand-mark"></span>
       <span class="brand-title">Embodied</span>
-      <span class="brand-sub" id="viewLabel">游玩</span>
     </div>
     <nav class="nav" aria-label="视图">
       <button class="nav-tab active" id="navPlay" type="button" data-view-target="play" aria-controls="view-play" aria-pressed="true">游玩</button>
       <button class="nav-tab" id="navDevice" type="button" data-view-target="device" aria-controls="view-device" aria-pressed="false">设备</button>
+      <button class="nav-tab" id="navSettings" type="button" data-view-target="settings" aria-controls="view-settings" aria-pressed="false">设置</button>
     </nav>
     <span class="topbar-spacer"></span>
     <div class="topbar-meta">
@@ -44,19 +43,13 @@
   <!-- ── 游玩视图（默认） ─────────────────────────────────────────────── -->
   <section id="view-play" data-view="play">
     <div class="lock-banner" id="lockBanner" role="alert">
-      <span><strong>输出已被锁定。</strong>所有写入都会被拒绝；解锁后才能继续这一局。</span>
+      <span><strong>输出已被锁定。</strong></span>
       <button class="btn btn-sm" id="unlock" type="button">解锁</button>
     </div>
 
     <main class="main main-play">
-      <!-- 未开局：像海报一样的大厅。 -->
+      <!-- 未开局：大厅。 -->
       <div class="lobby" id="lobby">
-        <div class="lobby-hero">
-          <div class="eyebrow">EMBODIED ROLEPLAY</div>
-          <h1 class="lobby-title">今晚，由你来决定分寸</h1>
-          <p class="lobby-sub">选一个内容包，定下这一局的时长。开场之后，导演会读你的表情与声音，写作会替他把话说完——而你只需要回应。每台设备的强度与频率范围在「设备」里设置。</p>
-        </div>
-
         <div class="lobby-grid">
           <section class="card card-hero lobby-card">
             <h2 class="card-title">开局</h2>
@@ -71,29 +64,15 @@
               <input id="plannedMinutes" type="number" min="1" max="240" step="5" value="30">
               <span class="hint">分钟</span>
             </div>
-            <p class="hint">全局会话上限不再由这里设置：输出边界改为按设备通道的软上限，随时可以在右侧「软上限」里调整。</p>
             <button class="btn btn-accent btn-lg btn-block" id="start" type="button">开局</button>
-            <div class="hint" id="startHint">点「开局」后会以已激活版本的内容包开一局；开局不再写入会话上限。</div>
           </section>
 
-          <div class="lobby-stack">
-            <section class="card lobby-card">
-              <h2 class="card-title">准备工作</h2>
-              <ol class="steps">
-                <li>在「设备」视图添加并连接设备，确认通道被点亮；不需要输出时先把直控滑杆拉回 0。</li>
-                <li>导入内容包并激活版本 —— 存档会记住这一局用的是哪个版本。</li>
-                <li>回到这里点「开局」，开场白与第一个选择会自动出现。</li>
-              </ol>
-              <p class="hint">急停始终在右上角；长按空格 1 秒也可以立即停止所有输出。</p>
-            </section>
-
-            <section class="card lobby-card soft-caps-card">
-              <h2 class="card-title">软上限<small>只有你能改</small></h2>
-              <div id="softCapsLobby">
-                <div class="hint">正在读取设备…</div>
-              </div>
-            </section>
-          </div>
+          <section class="card lobby-card soft-caps-card">
+            <h2 class="card-title">软上限</h2>
+            <div id="softCapsLobby">
+              <div class="hint">读取中…</div>
+            </div>
+          </section>
         </div>
       </div>
 
@@ -112,7 +91,7 @@
           </div>
 
           <div class="thread" id="lines">
-            <div class="hint">（还没有台词）</div>
+            <div class="hint">还没有台词</div>
           </div>
 
           <div id="choicesPanel" style="display:none">
@@ -133,30 +112,19 @@
               <dt>阶段</dt><dd>—</dd>
               <dt>时间</dt><dd>—</dd>
               <dt>内容包</dt><dd>—</dd>
-              <dt>边界</dt><dd>—</dd>
             </dl>
           </section>
 
           <section class="card">
-            <h2 class="card-title">连接与部位<small>部位标签由你设置</small></h2>
-            <div id="devices"><div class="hint">正在读取…</div></div>
+            <h2 class="card-title">连接与部位</h2>
+            <div id="devices"><div class="hint">读取中…</div></div>
           </section>
 
           <section class="card">
-            <h2 class="card-title">软上限<small>只有你能改</small></h2>
+            <h2 class="card-title">软上限</h2>
             <div id="softCapsRail">
-              <div class="hint">正在读取设备…</div>
+              <div class="hint">读取中…</div>
             </div>
-          </section>
-
-          <section class="card">
-            <h2 class="card-title">感知<small>只显示可用性</small></h2>
-            <div id="sensors"><div class="hint">正在读取…</div></div>
-          </section>
-
-          <section class="card" id="debugPanel" style="display:none">
-            <h2 class="card-title">调试<small>probe 数值与解析结果</small></h2>
-            <div class="debug-list" id="debugProbes"></div>
           </section>
         </aside>
       </div>
@@ -166,56 +134,31 @@
       <button class="btn" id="pause" type="button" disabled>暂停</button>
       <button class="btn" id="resume" type="button" disabled>继续</button>
       <button class="btn" id="end" type="button" disabled>结束</button>
-      <button class="btn btn-ghost btn-sm" id="debugToggle" type="button" aria-pressed="false" title="显示 probe 数值与解析结果（默认关闭；不影响审计与模型上下文）">调试</button>
-      <span class="hint">长按空格 1 秒急停 · 一次只能跑一局</span>
     </footer>
   </section>
 
   <!-- ── 设备视图（点顶栏「设备」切过来） ──────────────────────────────── -->
   <section id="view-device" data-view="device" hidden>
     <div class="lock-banner" id="devLockBanner" role="alert">
-      <span><strong>输出已被锁定。</strong>所有写入都会被拒绝，直到你在这里解锁。</span>
+      <span><strong>输出已被锁定。</strong></span>
       <button class="btn btn-sm" id="devUnlock" type="button">解锁</button>
-    </div>
-
-    <div class="viewbar">
-      <span class="eyebrow">设备控制台</span>
-      <span class="hint viewbar-hint">强度/频率范围只能人工修改；直控滑杆 0 = 停止。</span>
-      <nav class="nav" aria-label="遥测面板">
-        <button class="nav-tab" id="devLogsToggle" type="button" aria-pressed="false" title="显示后台环形缓冲日志">日志</button>
-        <button class="nav-tab" id="devAuditToggle" type="button" aria-pressed="false" title="显示 append-only 审计日志">审计</button>
-        <button class="nav-tab" id="devDebugToggle" type="button" aria-pressed="false" title="显示 probe 数值与解析结果（默认关闭；不影响审计与模型上下文）">调试</button>
-      </nav>
     </div>
 
     <main class="main main-console">
       <aside class="rail rail-left">
         <section class="card">
-          <h2 class="card-title">设备管理<small>手动连接</small></h2>
+          <h2 class="card-title">设备管理</h2>
           <button class="btn btn-accent btn-sm btn-block" id="devAddDevice" type="button">＋ 添加设备</button>
-          <p class="hint" style="margin-top:10px">设备不会自动连接：启动与添加后都停在「连接」，点设备卡上的「连接」才开始扫描。</p>
         </section>
 
         <section class="card">
-          <h2 class="card-title">感知<small>可用性</small></h2>
-          <div id="devSensors"><span class="hint">加载中…</span></div>
-        </section>
-
-        <section class="card">
-          <h2 class="card-title">运行状态<small>本地 dashboard</small></h2>
+          <h2 class="card-title">运行状态</h2>
           <dl class="stats">
             <dt>连接</dt><dd><span class="pill off" id="devConnState">连接中…</span></dd>
             <dt>设备</dt><dd id="devStatDevices">—</dd>
             <dt>通道</dt><dd id="devStatChannels">—</dd>
             <dt>锁定</dt><dd id="devLockState">—</dd>
-            <dt>刷新</dt><dd>0.5s · 轮询</dd>
-            <dt>审计</dt><dd>append-only</dd>
           </dl>
-        </section>
-
-        <section class="card" id="devErrorsPanel" style="display:none">
-          <h2 class="card-title">运行时错误<small>最近记录</small></h2>
-          <div class="errors" id="devErrors"></div>
         </section>
       </aside>
 
@@ -225,61 +168,75 @@
         <div id="devDevices"></div>
 
         <section class="card">
-          <h2 class="card-title">波形库<small>agent 创作的波形存于「会话」作用域；「存入库」是人工动作</small></h2>
+          <h2 class="card-title">波形库</h2>
           <div class="import-row">
             <input type="text" id="devWfName" placeholder="波形名称" aria-label="新波形名称">
             <button class="mini" id="devWfImport" type="button">导入</button>
-            <span class="hint">粘贴每帧 16 位十六进制，空白或逗号分隔</span>
           </div>
-          <textarea id="devWfFrames" rows="2" aria-label="波形帧序列（每帧 16 位十六进制）" placeholder="0A0A0A0A00000000 0A0A0A0A64646464"></textarea>
+          <textarea id="devWfFrames" rows="2" aria-label="波形帧序列" placeholder="0A0A0A0A00000000 0A0A0A0A64646464"></textarea>
           <div class="wf-grid" id="devWfGrid" style="margin-top:10px"></div>
         </section>
       </div>
-
-      <aside class="rail rail-right">
-        <section class="card rail-home" id="devRailHome">
-          <h2 class="card-title">遥测<small>默认收起</small></h2>
-          <div class="rail-home-body">
-            <p class="hint">审计、日志与调试默认关闭，避免和操作区抢注意力。打开任意面板后，这里让位给具体内容。</p>
-            <div class="rail-home-list">
-              <button class="rail-home-item" id="devRailOpenLogs" type="button">
-                <span>运行日志</span><span class="tag">环形缓冲</span>
-              </button>
-              <button class="rail-home-item" id="devRailOpenAudit" type="button">
-                <span>审计日志</span><span class="tag gold">append-only</span>
-              </button>
-              <button class="rail-home-item" id="devRailOpenDebug" type="button">
-                <span>调试探针</span><span class="tag">默认关闭</span>
-              </button>
-            </div>
-            <div class="rail-home-foot">
-              <span class="eyebrow">全局急停</span>
-              <span class="kbd">Ctrl + Alt + X</span>
-            </div>
-          </div>
-        </section>
-
-        <section class="card" id="devAuditPanel" style="display:none">
-          <h2 class="card-title">审计<small>append-only · 模型不可写删</small></h2>
-          <div class="audit" id="devAudit"><div class="hint">加载中…</div></div>
-        </section>
-
-        <section class="card" id="devLogPanel" style="display:none">
-          <h2 class="card-title">运行日志<small>后台环形缓冲</small></h2>
-          <div class="log" id="devLogs"></div>
-        </section>
-
-        <section class="card" id="devDebugPanel" style="display:none">
-          <h2 class="card-title">调试<small>仅本机可见 · 不写审计</small></h2>
-          <div class="debug-list" id="devDebugProbes"></div>
-        </section>
-      </aside>
     </main>
+  </section>
 
-    <footer class="bottombar">
-      <span class="eyebrow" style="margin-right:12px">安全边界</span>
-      <span class="hint" style="margin-left:0">全局急停热键 <span class="kbd">Ctrl+Alt+X</span> · 上限只能人工修改 · 每次改动都会重新下发郊狼的 <span class="kbd">BF</span> 硬件软上限并写入审计 · 带外急停端点见启动窗口日志</span>
-    </footer>
+  <!-- ── 设置视图（点顶栏「设置」切过来；逻辑在 /settings.js） ─────────── -->
+  <section id="view-settings" data-view="settings" hidden>
+    <main class="main main-settings">
+      <section class="card settings-card">
+        <h2 class="card-title">模型</h2>
+        <div class="field-row">
+          <label class="field-label" for="setProvider">服务商</label>
+          <input id="setProvider" type="text" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field-row">
+          <label class="field-label" for="setModel">模型</label>
+          <input id="setModel" type="text" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field-row">
+          <label class="field-label" for="setBaseUrl">接口地址</label>
+          <input id="setBaseUrl" type="text" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field-row">
+          <label class="field-label" for="setApiKey">API 密钥</label>
+          <input id="setApiKey" type="password" placeholder="sk-…" autocomplete="new-password">
+        </div>
+        <div class="settings-actions">
+          <button class="btn btn-accent btn-sm" id="setLlmSave" type="button">保存</button>
+          <span class="settings-status" id="setLlmStatus" aria-live="polite"></span>
+        </div>
+      </section>
+
+      <section class="card settings-card">
+        <h2 class="card-title">摄像头</h2>
+        <div class="field-row">
+          <label class="field-label"><input type="checkbox" id="setCamEnabled"> 启用</label>
+        </div>
+        <div class="field-row">
+          <label class="field-label" for="setCamDevice">设备</label>
+          <select id="setCamDevice">
+            <option value="">—</option>
+          </select>
+          <button class="mini" id="setCamRefresh" type="button">刷新</button>
+          <span class="settings-status" id="setCamStatus" aria-live="polite"></span>
+        </div>
+      </section>
+
+      <section class="card settings-card">
+        <h2 class="card-title">麦克风</h2>
+        <div class="field-row">
+          <label class="field-label"><input type="checkbox" id="setMicEnabled"> 启用</label>
+        </div>
+        <div class="field-row">
+          <label class="field-label" for="setMicDevice">设备</label>
+          <select id="setMicDevice">
+            <option value="">—</option>
+          </select>
+          <button class="mini" id="setMicRefresh" type="button">刷新</button>
+          <span class="settings-status" id="setMicStatus" aria-live="polite"></span>
+        </div>
+      </section>
+    </main>
   </section>
 </div>
 
@@ -287,7 +244,7 @@
 
 <div class="hold-overlay" id="holdOverlay" aria-hidden="true">
   <div class="hold-card">
-    <div class="hold-title">紧急停止<small>松开空格即取消</small></div>
+    <div class="hold-title">紧急停止</div>
     <div class="hold-bar"><div class="hold-fill" id="holdFill"></div></div>
   </div>
 </div>
@@ -295,11 +252,9 @@
 <div class="modal" id="devAddDialog" style="display:none">
   <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="devAddDialogTitle">
     <h3 id="devAddDialogTitle">添加设备</h3>
-    <p class="hint" style="margin-bottom:10px">添加时请只打开一台对应协议的设备；移除设备会立即停止输出并断开。</p>
-    <label class="radio"><input type="radio" name="addProto" value="coyote" checked>郊狼 · DG-LAB Coyote<span class="tag">BLE 直连</span></label>
-    <label class="radio"><input type="radio" name="addProto" value="xhtkj">谜姬 / XHTKJ<span class="tag">BLE 直连</span></label>
-    <label class="radio"><input type="radio" name="addProto" value="ankni">安可尼旋转棒 · ANKNI<span class="tag">流式直连</span></label>
-    <label class="radio"><input type="radio" name="addProto" value="mock">模拟设备<span class="tag">Mock</span></label>
+    <label class="radio"><input type="radio" name="addProto" value="coyote" checked>郊狼 · DG-LAB Coyote</label>
+    <label class="radio"><input type="radio" name="addProto" value="xhtkj">谜姬 / XHTKJ</label>
+    <label class="radio"><input type="radio" name="addProto" value="ankni">安可尼旋转棒 · ANKNI</label>
     <div class="modal-actions">
       <button class="btn btn-ghost" id="devAddCancel" type="button">取消</button>
       <button class="btn btn-accent" id="devAddConfirm" type="button">添加</button>
@@ -310,5 +265,6 @@
 <script src="/shell.js"></script>
 <script src="/play.js"></script>
 <script src="/app.js"></script>
+<script src="/settings.js"></script>
 </body>
 </html>

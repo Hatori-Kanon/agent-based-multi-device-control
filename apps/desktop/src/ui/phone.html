@@ -59,12 +59,6 @@
     gap: 9px;
   }
 
-  .phone-tagline {
-    color: var(--muted);
-    font-size: 12px;
-    letter-spacing: 0.2em;
-  }
-
   /* 已锁定横幅：借用全站 .lock-banner，只改成本页需要的宽度/边距。 */
   .phone-page #locked-banner {
     width: 100%;
@@ -108,11 +102,6 @@
     line-height: 1.6;
     max-width: 34ch;
     word-break: break-word;
-  }
-
-  .phone-page .phone-note {
-    max-width: 36ch;
-    font-size: 12px;
   }
 
   /* token 卡片：只在需要人工粘贴 token 时出现，但始终保留在流里。 */
@@ -161,12 +150,6 @@
   #message.bad {
     color: var(--bad);
   }
-
-  .phone-foot {
-    color: var(--faint);
-    font-size: 11px;
-    line-height: 1.6;
-  }
 </style>
 </head>
 <body class="phone-page">
@@ -177,18 +160,14 @@
       <span class="brand-title">Embodied</span>
       <span class="brand-sub">手机急停</span>
     </div>
-    <p class="phone-tagline">带外急停通道 · 控制端</p>
   </header>
 
   <div id="locked-banner" class="lock-banner" role="alert">
-    <span>输出已被锁定。需要在 PC 控制台解锁后才能重新输出。</span>
+    <span>输出已被锁定</span>
   </div>
 
   <div class="phone-dial">
-    <button id="panic-button" class="phone-stop" type="button">
-      紧急停止
-      <small>点按立即生效</small>
-    </button>
+    <button id="panic-button" class="phone-stop" type="button">紧急停止</button>
   </div>
 
   <div class="phone-state" aria-live="polite">
@@ -196,22 +175,14 @@
     <span id="status">正在读取状态…</span>
   </div>
 
-  <p class="phone-note">
-    这是带外急停通道：与模型、设备自身的停止逻辑相互独立。触发后所有输出立即清零并锁定，
-    需要在 PC 控制台解锁后才能恢复输出。本页不采集摄像头/麦克风。
-  </p>
-
   <section class="phone-token">
-    <label class="phone-token-label" for="token">控制台 token</label>
+    <label class="phone-token-label" for="token">token</label>
     <div class="token-row">
-      <input id="token" type="password" autocomplete="off" spellcheck="false"
-             placeholder="控制台 URL 里 ?token= 后面那段">
+      <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="token">
       <button id="save-token" class="btn btn-sm" type="button">保存</button>
     </div>
     <p id="message" role="status" aria-live="polite"></p>
   </section>
-
-  <footer class="phone-foot">状态每秒刷新 · token 只保存在本机浏览器</footer>
 </main>
 <script>
   (() => {
@@ -247,7 +218,7 @@
 
     document.getElementById('save-token').addEventListener('click', () => {
       try { localStorage.setItem(STORAGE_KEY, token()) } catch { /* 存不了只影响下次自动填充 */ }
-      say('token 已保存到本机浏览器', 'ok')
+      say('已保存', 'ok')
       void refresh()
     })
 
@@ -266,7 +237,7 @@
       if (token().length === 0) {
         renderLocked(false)
         setPill('off', '未配置')
-        statusLine.textContent = '请先填入控制台 token'
+        statusLine.textContent = '需要 token'
         return
       }
       try {
@@ -274,7 +245,7 @@
         if (response.status === 401) {
           renderLocked(false)
           setPill('bad', 'token 无效')
-          statusLine.textContent = 'token 无效或已更换，请重新填入'
+          statusLine.textContent = 'token 无效'
           return
         }
         // 非 2xx（例如 500）不是快照：绝不能当成「未锁定/可输出」来渲染。
@@ -307,7 +278,7 @@
 
     async function panic() {
       if (token().length === 0) {
-        say('急停需要控制台 token；请先填入并保存', 'bad')
+        say('需要 token', 'bad')
         setPill('off', '未配置')
         return
       }
@@ -325,7 +296,7 @@
           return
         }
         setPill('bad', '已急停')
-        say('已急停。输出锁定，需在 PC 控制台解锁。', 'ok')
+        say('已急停', 'ok')
       } catch (error) {
         say('急停失败：' + (error && error.message ? error.message : String(error)), 'bad')
       } finally {

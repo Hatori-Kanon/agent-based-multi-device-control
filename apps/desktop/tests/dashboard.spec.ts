@@ -77,7 +77,8 @@ describe('DashboardServer', () => {
     const response = await fetch(`${base(host)}/`, { headers: headers(host.dashboardToken) })
     expect(response.status).toBe(200)
     expect(response.headers.get('content-type')).toContain('text/html')
-    expect(await response.text()).toContain('Embodied 控制台')
+    // The page is the single-window app: the play view is the default surface.
+    expect(await response.text()).toContain('id="view-play"')
   })
 
   it('serves the static UI without a token so app.js actually runs', async () => {
@@ -90,7 +91,8 @@ describe('DashboardServer', () => {
     expect(page.status).toBe(200)
     expect(page.headers.get('content-type')).toContain('text/html')
     const html = await page.text()
-    expect(html).toContain('Embodied 控制台')
+    expect(html).toContain('Embodied')
+    expect(html).toContain('id="view-play"')
 
     const script = await fetch(`${base(host)}/app.js`)
     expect(script.status).toBe(200)
@@ -154,16 +156,26 @@ describe('DashboardServer', () => {
     let body: { devices: Array<{ key: string }>; snapshot?: { devices: Array<{ id: string }> } } = await response.json()
     expect(body.devices).toEqual([])
 
+    // The product console does not offer simulated hardware: the add route
+    // refuses "mock" even though the runtime's test fixture can still create it.
     response = await fetch(`${base(host)}/api/devices`, {
       method: 'POST',
       headers: headers(token, true),
       body: JSON.stringify({ protocol: 'mock' }),
     })
-    expect(response.status).toBe(200)
+    expect(response.status).toBe(400)
+
+    // The remove route still has to work on whatever the manifest holds; the
+    // runtime API is the fixture path for creating a device without BLE.
+    const added = await host.addDevice('mock')
+    expect(added.key).toBe('mock')
+    response = await fetch(`${base(host)}/api/devices`, { headers: headers(token) })
     body = await response.json()
-    const devices = body.devices
-    expect(devices.map(device => device.key)).toContain('mock')
-    expect(body.snapshot!.devices.some(device => device.id === 'mock')).toBe(true)
+    expect(body.devices.map(device => device.key)).toContain('mock')
+    const liveSnapshot = await (await fetch(`${base(host)}/api/snapshot`, {
+      headers: headers(token),
+    })).json() as { devices: Array<{ id: string }> }
+    expect(liveSnapshot.devices.some(device => device.id === 'mock')).toBe(true)
 
     response = await fetch(`${base(host)}/api/devices/remove`, {
       method: 'POST',
@@ -525,19 +537,20 @@ describe('debug mode (A2-T7)', () => {
       expect(backOff.status).toBe(200)
       expect((await fetch(`${url}/api/debug/probes`, { headers: headers(DEBUG_TOKEN) })).status).toBe(403)
 
-      // The console page ships the switch but the default view renders no
-      // number at all; the script only asks for probes behind the switch.
+      // The user-facing console ships no debug switch at all. The probe route
+      // stays reachable for tools and tests, but neither shipped script can
+      // fetch or render a probe number, and the page markup has no panel.
       const html = await (await fetch(`${url}/`)).text()
-      expect(html).toContain('id="debugToggle"')
-      expect(html).toContain('id="debugPanel" style="display:none"')
-      expect(html).toContain('id="debugProbes"')
-      expect(html).toContain('id="sensors"')
+      expect(html).not.toContain('id="debugToggle"')
+      expect(html).not.toContain('id="debugPanel"')
+      expect(html).not.toContain('id="debugProbes"')
+      expect(html).not.toContain('id="sensors"')
       expect(html).not.toContain('0.31')
       expect(html).not.toContain('p-0007')
-      const script = await (await fetch(`${url}/app.js`)).text()
-      expect(script).toContain('/api/debug/probes')
-      expect(script).toContain('debugEnabled')
-      expect(script).toContain('解析')
+      const appScript = await (await fetch(`${url}/app.js`)).text()
+      expect(appScript).not.toContain('/api/debug')
+      const playScript = await (await fetch(`${url}/play.js`)).text()
+      expect(playScript).not.toContain('/api/debug')
     } finally {
       await server.stop()
     }
@@ -1148,42 +1161,60 @@ describe('play page (B2-T12)', () => {
 
   it('serves the single-window app and its scripts through the static whitelist', async () => {
     const host = await start()
-    // v3: `/` and `/play` are the same single-window page; a page navigation
-    // cannot carry headers, so scripts and styles must be readable without the
-    // token, exactly like the phone page.
+    // v4: `/`, `/play`, `/device` and `/settings` are the same single-window
+    // page; a page navigation cannot carry headers, so scripts and styles must
+    // be readable without the token, exactly like the phone page.
     const page = await fetch(`${base(host)}/play`)
     expect(page.status).toBe(200)
     expect(page.headers.get('content-type')).toContain('text/html')
     const html = await page.text()
-    // Both views live in the page; the play view is the default landing view.
+    // All three views live in the page; the play view is the default landing view.
     expect(html).toContain('id="view-play"')
     expect(html).toContain('id="view-device"')
+    expect(html).toContain('id="view-settings"')
     expect(html).toContain('data-view-target="play"')
     expect(html).toContain('data-view-target="device"')
-    // The play view is what the page opens on: the device section ships hidden
+    expect(html).toContain('data-view-target="settings"')
+    // The play view is what the page opens on: the other sections ship hidden
     // and the body starts in the play mode.
     expect(html).toContain('data-view="play"')
     expect(html).toMatch(/id="view-device"[^>]*hidden/u)
+    expect(html).toMatch(/id="view-settings"[^>]*hidden/u)
     expect(html).toContain('/play.js')
     expect(html).toContain('/app.js')
     expect(html).toContain('/shell.js')
+    expect(html).toContain('/settings.js')
     expect(html).toContain('href="/style.css"')
     expect(html).toMatch(/connect-src 'self'/)
     // Safety chrome is in the markup: a persistent stop button and the LOCKED
-    // banner. The debug panel ships hidden — off is the default view.
+    // banner, plus the player-visible narrative surface.
     expect(html).toContain('id="panic"')
     expect(html).toContain('紧急停止')
     expect(html).toContain('id="lockBanner"')
     expect(html).toContain('id="choices"')
-    expect(html).toContain('id="debugPanel" style="display:none"')
     // v3 dropped the global session ceiling X from the UI: the human bounds the
     // output per device/channel instead (软上限).
     expect(html).not.toContain('id="ceiling"')
     expect(html).toContain('软上限')
-    // No probe/tool field name and no probe number may appear in the default
-    // page — the player only sees narrative, options and time.
+    // The product console shows no telemetry surface at all: no log/audit/debug
+    // panels and no probe field name or probe number on the default page.
+    expect(html).not.toContain('id="debugToggle"')
+    expect(html).not.toContain('id="debugPanel"')
+    expect(html).not.toContain('id="debugProbes"')
+    expect(html).not.toContain('id="sensors"')
     expect(html).not.toMatch(/motionEnergy|motionPeak|staticRatio|centerMotionRatio|lumaMean|lumaStd|overexposedRatio|underexposedRatio|audioLevelPct|bpm/u)
     expect(html).not.toContain('0.31')
+    expect(html).not.toContain('append-only')
+    expect(html).not.toContain('遥测')
+    // The settings view is markup only; its logic lives in /settings.js and
+    // the ids are the contract between the two.
+    for (const id of [
+      'setProvider', 'setModel', 'setBaseUrl', 'setApiKey', 'setLlmSave', 'setLlmStatus',
+      'setCamEnabled', 'setCamDevice', 'setCamRefresh', 'setCamStatus',
+      'setMicEnabled', 'setMicDevice', 'setMicRefresh', 'setMicStatus',
+    ]) {
+      expect(html).toContain(`id="${id}"`)
+    }
 
     const script = await fetch(`${base(host)}/play.js`)
     expect(script.status).toBe(200)
@@ -1193,19 +1224,35 @@ describe('play page (B2-T12)', () => {
     expect(js).toContain('/api/session/transcript')
     expect(js).toContain('/api/panic')
     expect(js).toContain('/api/cap')
-    // The global ceiling route is gone from this view.
+    // The global ceiling route and the debug/probe surface are gone from this view.
     expect(js).not.toContain('/api/session/ceiling')
+    expect(js).not.toContain('/api/debug')
+    expect(js).not.toContain('/api/sensors')
     // Token convention: query once, then the header — never persisted, and no
     // bare console.error when a poll fails.
     expect(js).not.toContain('localStorage')
     expect(js).not.toMatch(/\bconsole\./u)
 
-    // The device view's script is the console logic; it owns direct control.
+    // The device view's script is the console logic; it owns direct control and
+    // no longer exposes logs/audit/debug to the user.
     const consoleScript = await fetch(`${base(host)}/app.js`)
     expect(consoleScript.status).toBe(200)
     const consoleJs = await consoleScript.text()
     expect(consoleJs).toContain('/api/level')
     expect(consoleJs).toContain('/api/cap')
+    expect(consoleJs).not.toContain('/api/logs')
+    expect(consoleJs).not.toContain('/api/audit')
+    expect(consoleJs).not.toContain('/api/debug')
+
+    // The settings view's script talks to the settings API and never persists
+    // the token itself.
+    const settingsScript = await fetch(`${base(host)}/settings.js`)
+    expect(settingsScript.status).toBe(200)
+    expect(settingsScript.headers.get('content-type')).toContain('javascript')
+    const settingsJs = await settingsScript.text()
+    expect(settingsJs).toContain('/api/settings')
+    expect(settingsJs).not.toContain('localStorage')
+    expect(settingsJs).not.toMatch(/\bconsole\./u)
 
     // The view switch is a tiny separate script so the page needs no inline JS.
     const shell = await fetch(`${base(host)}/shell.js`)
@@ -1217,12 +1264,16 @@ describe('play page (B2-T12)', () => {
     expect(shellJs).toContain('sessionStorage')
     expect(shellJs).toContain('replaceState')
     expect(shellJs).toContain('viewchange')
+    expect(shellJs).toContain('settings')
 
-    // `/device` is a deep link to the same page, and the deleted play.html is
-    // not reachable any more.
+    // `/device` and `/settings` are deep links to the same page, and the
+    // deleted play.html is not reachable any more.
     const devicePage = await fetch(`${base(host)}/device`)
     expect(devicePage.status).toBe(200)
     expect(await devicePage.text()).toContain('id="view-device"')
+    const settingsPage = await fetch(`${base(host)}/settings`)
+    expect(settingsPage.status).toBe(200)
+    expect(await settingsPage.text()).toContain('id="view-settings"')
     expect((await fetch(`${base(host)}/play.html`)).status).toBe(404)
 
     // The allowlist is still a whitelist: unknown names are clean 404s.
@@ -1278,7 +1329,7 @@ describe('play page (B2-T12)', () => {
     // `start-dev.bat` runs `dev-server.ts`, which inlines the UI files into the
     // bundle and hands them over as `staticFiles`; this is that exact path.
     const { readFile } = await import('node:fs/promises')
-    const names = ['index.html', 'play.js', 'app.js', 'shell.js'] as const
+    const names = ['index.html', 'play.js', 'app.js', 'shell.js', 'settings.js'] as const
     const files = Object.fromEntries(await Promise.all(names.map(async name =>
       [name, await readFile(join(process.cwd(), 'src', 'ui', name), 'utf8')] as const,
     )))

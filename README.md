@@ -2,7 +2,8 @@
 
 Agent 主持的具身角色扮演系统：摄像头/麦克风感知 + 多设备并行物理反馈，安全边界由硬件与人类共同持有。
 
-**当前状态：M0、M1、M2 已交付（M2 = 第一个可玩版本）。** 安全底座、波形子系统、**五个真实后端**（郊狼 V3 / 谜姬 XHTKJ / 安可尼 JH1 / MonsterParty / Buttplug），以及 M2 的感知源、被动 probe、回合引擎、导演-写作-执行、内容包与跨会话账本。
+**当前状态：M0、M1、M2 已交付（M2 = 第一个可玩版本），产品化界面 v4 已落地。** 安全底座、波形子系统、**五个真实后端**（郊狼 V3 / 谜姬 XHTKJ / 安可尼 JH1 / MonsterParty / Buttplug），以及 M2 的感知源、被动 probe、回合引擎、导演-写作-执行、内容包与跨会话账本。
+v4 把界面收敛成面向用户的产品：游玩 / 设备 / 设置三个视图、按原生单位显示的郊狼强度与物理频率、麦克风采集与传感器开关；日志/审计/调试与模拟设备不再出现在产品 UI 里。
 
 - 第一次上手：`pnpm install && pnpm run check`；起控制台用 `start.bat`，纯 Node 演示用 `start-dev.bat`。
 - 游玩页 `http://<host>:<port>/play?token=…`（控制台顶部「游玩」或 `Ctrl+Alt+P`）；无硬件时可 `node scripts/demo-m2.mjs` 跑离线四步演示。
@@ -11,23 +12,31 @@ Agent 主持的具身角色扮演系统：摄像头/麦克风感知 + 多设备�
 
 ## 界面
 
-界面是**一个窗口、两个视图**，共用一套「墨金」设计系统（近黑底 + 金色强调 + 细描边圆角卡片），
+界面是**一个窗口、三个视图**，共用一套「墨金」设计系统（近黑底 + 金色强调 + 细描边圆角卡片），
 纯静态 HTML/CSS/JS，没有打包器、没有外链字体与 CDN——CSP 仍是 `default-src 'none'`。
 
 | 视图 / 界面 | 入口 | 用途 |
 |---|---|---|
-| **游玩**（默认） | `/` 或 `/play` | 大厅（内容包 / 时长 / 开局）→ 舞台（大字台词 + 对话流 + 选项 + 右轨状态与「软上限」） |
-| **设备**（同一页，点顶栏「设备」） | `/device` | 三栏控制台：设备卡（直控强度条 / 强度范围 / 频率范围 / 时长 / 波形）、波形库、感知、审计/日志/调试 |
+| **游玩**（默认） | `/` 或 `/play` | 大厅（内容包 / 时长 / 开局 + 软上限）→ 舞台（大字台词 + 对话流 + 选项 + 右轨状态与「软上限」） |
+| **设备**（同一页，点顶栏「设备」） | `/device` | 两栏控制台：设备卡（直控强度条 / 强度范围 / 频率范围 / 时长 / 波形）与波形库 |
+| **设置**（同一页，点顶栏「设置」） | `/settings` | 模型 API（服务商 / 模型 / 接口地址 / 密钥）与摄像头、麦克风的设备选择与开关 |
 | 手机急停 | `/phone` | 手机上的红色圆钮带外急停，一键清零并锁定 |
-| 设备运行时 | Electron 主窗口 | 设备/波形/审计的最小管理窗口，与主界面同色系 |
 
+- **界面只留功能文字**：说明性段落、营销标题、快捷键提示、面板小标题都从产品 UI 移除；标签、数值、状态、
+  按钮与必要的 placeholder 保留。日志 / 审计 / 调试只留在宿主与审计文件里，**前端不显示、也不请求**。
+- **单位面向设备原厂语义**：DG-LAB 郊狼的强度按原生 **0–200** 显示与控制（不再是百分比），频率按官方
+  10–240 传送码换算出的**物理频率 Hz（1–100）**显示；其他后端仍是 0–100%。内部安全语义不变——
+  策略与 `/api/level` 仍用整数百分比，原生值只是显示/换算层。
 - **输出边界按通道设**：每设备每通道有强度下限/上限与频率下限/上限，只有人类能改；
   模型与内容包仍然只写 0–100% 的**相对**百分比，映射进人设定的区间（0 仍是停止）。全局会话上限 X
   不再出现在界面里，引擎那一道闸门保留。
 - **直控**：设备视图的强度条本身就是滑杆，拖动即改变输出（0 = 停止），不再有「试跑」按钮。
+- 产品 UI 不包含模拟设备：Electron 主窗口与默认 `start-dev.bat` 都不会注册 mock 设备；无硬件演示见下节
+  `start-dev.bat mock`。
 - 设计令牌与类名约定：[`前端界面设计.md`](前端界面设计.md)（`apps/desktop/src/ui/style.css` 是唯一来源）；
-  v3 语义契约：[`设备范围与单窗口界面-设计说明.md`](设备范围与单窗口界面-设计说明.md)。
-- 重做记录与验收：[`analysis/ui-redesign.md`](analysis/ui-redesign.md)、[`analysis/ui-v3.md`](analysis/ui-v3.md)。
+  v3 语义契约与 v4 单位/设置说明：[`设备范围与单窗口界面-设计说明.md`](设备范围与单窗口界面-设计说明.md)。
+- 重做记录与验收：[`analysis/ui-redesign.md`](analysis/ui-redesign.md)、[`analysis/ui-v3.md`](analysis/ui-v3.md)、
+  [`analysis/ui-v4.md`](analysis/ui-v4.md)。
 - 改 UI 不用重新构建：`EMBODIED_UI_FROM_DISK=1 pnpm --filter @embodied/desktop dev` 会让 dev-server 每次请求从 `src/ui` 读文件。
 
 ## 文档
@@ -46,6 +55,7 @@ Agent 主持的具身角色扮演系统：摄像头/麦克风感知 + 多设备�
 | `跨会话记忆与游戏性后果-设计草案.md` | M2 草案：账本、会话级上限、DLC 声明式反应 |
 | `M2-实施计划.md` | M2 原子任务、接口契约、验收测试与并行度 |
 | `analysis/m2-design-audit.md` | M2 冻结前的独立一致性审计（9 阻塞 / 31 应修 / 7 可选） |
+| `analysis/ui-v4.md` | 产品化界面 v4：原生单位、设置页、麦克风、去说明文字与验收记录 |
 | `analysis/` | 证据笔记：AI-for-Coyote 后端/产品面、己方基线、HW9 心率带与 RR 调研 |
 
 ## 五个真实后端，三种失效语义
@@ -150,11 +160,14 @@ pnpm run check          # typecheck + test
 .\start.bat
 ```
 
-**没有 GPU 桌面 / 只想在浏览器里测**（纯 Node，mock 设备，无需 Electron，自动打开浏览器）：
+**没有 GPU 桌面 / 只想在浏览器里测**（纯 Node，无需 Electron，自动打开浏览器）：
 
 ```powershell
-.\start-dev.bat
+.\start-dev.bat          # 产品状态：不注册任何模拟设备
+.\start-dev.bat mock     # 演示模式：额外注册两台模拟设备（mock-pulse / mock-hold）
 ```
+
+演示模式也可以用环境变量手动打开：`EMBODIED_MOCK_DEVICES=1 pnpm --filter @embodied/desktop dev`。
 
 手动方式：`pnpm --filter @embodied/desktop dev`（或先设 `EMBODIED_DASHBOARD_PORT` 指定端口）。它会打印带 token 的控制台地址，粘贴到浏览器。
 
@@ -165,7 +178,7 @@ $env:EMBODIED_DATA_DIR = "E:\embodied-data"   # 可选：固定数据目录，�
 pnpm --filter @embodied/desktop start
 ```
 
-**设备清单（manifest）**：哪些 BLE 单元存在由持久化清单决定（`<dataDir>/state/devices.json`，首次 BLE 运行自动写入一台郊狼 + 一台谜姬）。控制台顶部「设备管理」可随时**添加/移除**设备：添加时选择协议（郊狼 / 谜姬直连 / 模拟），移除会立即停止输出并断开。多台同协议单元在添加时只打开一台即可准确配对。`EMBODIED_WITH_BUTTPLUG = "0"` 可以在没有 Buttplug 设备时跳过 Intiface 探测。
+**设备清单（manifest）**：哪些 BLE 单元存在由持久化清单决定（`<dataDir>/state/devices.json`，首次 BLE 运行自动写入一台郊狼 + 一台谜姬 + 安可尼）。控制台「设备管理」可随时**添加/移除**设备：添加时选择协议（郊狼 / 谜姬直连 / 安可尼），移除会立即停止输出并断开。多台同协议单元在添加时只打开一台即可准确配对。`EMBODIED_WITH_BUTTPLUG = "0"` 可以在没有 Buttplug 设备时跳过 Intiface 探测。模拟设备不再是可添加协议，只保留 `EMBODIED_MOCK_DEVICES=1` 这一演示/测试开关。
 
 MonsterParty 中继需要分享链接 token：`$env:EMBODIED_MONSTERPARTY_TOKEN = "<token>"`。
 
@@ -173,16 +186,15 @@ MonsterParty 中继需要分享链接 token：`$env:EMBODIED_MONSTERPARTY_TOKEN 
 
 Electron 窗口加载的就是控制台网页，它由运行时内置的 HTTP 服务器提供（默认 `127.0.0.1`，端口随机，启动日志会打印带 token 的完整地址）。**同一个网页也可以直接在任何浏览器打开**——桌面窗口只是浏览器的一个壳。
 
-- **这是最终终端的雏形**：HTTP API（`/api/snapshot`、`/api/panic`、`/api/unlock`、`/api/cap`、`/api/pattern`、`/api/stop`、`/api/connect`、`/api/scan`、`/api/waveforms/*`、`/api/audit`）就是终端的能力面，M4b 的 Android WebView / 局域网手机浏览器复用的就是这套接口和这份静态 UI，零改动。UI 是纯静态三个文件（`apps/desktop/src/ui/`），无框架无构建。
+- **这是最终终端的雏形**：HTTP API（`/api/snapshot`、`/api/panic`、`/api/unlock`、`/api/cap`、`/api/level`、`/api/pattern`、`/api/stop`、`/api/connect`、`/api/scan`、`/api/waveforms/*`、`/api/settings/*`）就是终端的能力面，M4b 的 Android WebView / 局域网手机浏览器复用的就是这套接口和这份静态 UI，零改动。UI 是 `apps/desktop/src/ui/` 下的一组静态文件（`index.html` + `shell.js` + `play.js` + `app.js` + `settings.js` + `style.css` + `phone.html`），无框架无构建。审计/日志/调试/probe 仍保留为宿主与 API 能力（`/api/audit`、`/api/logs`、`/api/debug`），但产品 UI 不再展示或调用它们。
 - 所有请求都要 `x-control-token`；凭据写在 `<dataDir>/state/dashboard.json`。
 - 带外急停（`POST /panic`）是**独立服务器、独立 token**，即使控制台出问题也不受影响。
-- 控制台功能：设备管理（添加/移除，添加时选协议）、设备卡片（**不自动连接**：启动与添加都只注册，点「连接」才扫描/连接；断线后同样显示「连接」）、每通道强度/脉宽/时长上限滑块（改动即下发郊狼 `BF` 并审计）、波形下拉选择、15 秒试跑、波形库（导入 hex、会话→库提升）、审计日志尾部、**「日志」/「审计」面板**（后台环形缓冲：BLE 扫描、选择器决策、设备诊断；终端只显示构建令牌/控制台地址等关键一行信息）、大急停按钮 + LOCKED 横幅。
-
-点"试跑"会在对应通道跑 15 秒的 `wave` 包络——用来手工确认整条链路（策略校验 → 调度 → 串行写入 → 审计）真的通了。郊狼会作为 `coyote` 出现，谜姬作为 `xhtkj`；它们在启动时是 `disconnected`，点击卡片上的「连接」后开始扫描；失败的设备同样一键重试，不必重启 app。
+- 设备视图：设备管理（添加/移除，添加时选协议）、设备卡片（**不自动连接**：启动与添加都只注册，点「连接」才扫描/连接；断线后同样显示「连接」）、每通道直控滑杆（0 = 停止）、强度范围（郊狼按 0–200 原生值）、频率范围（物理 Hz）、时长上限、波形下拉与波形库（导入 hex、会话→库提升）、大急停按钮 + LOCKED 横幅。全部改动写审计；边界改动同时重下发郊狼 `BF`。
+- 设置视图：模型 API 配置（服务商/模型/接口地址/密钥，密钥只落 `state/llm.json`，环境变量优先；保存后下一回合即生效，无需重启）、摄像头与麦克风启用开关与设备选择（偏好写 `state/settings.json`；麦克风默认关闭）。
 
 ## 物理调试顺序
 
-1. **不接设备，先验证急停**：mock 设备试跑 → `Ctrl+Alt+X` → 锁定横幅 + 归零 → 锁定期间试跑被拒 → 解锁 → 审计日志里有 `panic`。
+1. **不接设备，先验证急停**：`start-dev.bat mock` 起演示设备 → `Ctrl+Alt+X` → 锁定横幅 + 归零 → 锁定期间写入被拒 → 解锁 → 审计日志里有 `panic`。
 2. **上限先压到 5** 再连接真机（郊狼的 `BF` 硬件软上限在连接时按 policy 写入，之后改滑块会重写）。
 3. 郊狼开蓝牙但**别开官方 App**（BLE 一次只允许一个主连接）。
 4. 逐台验证：先只动一个通道，感受上限收紧/放宽的差别，再动第二个通道确认互不干扰。
@@ -191,8 +203,8 @@ Electron 窗口加载的就是控制台网页，它由运行时内置的 HTTP �
 ## 测试
 
 ```
-packages/core    635 passed (50 files)
-apps/desktop     162 passed (14 files)
+packages/core    660 passed (51 files)
+apps/desktop     191 passed (17 files)
 ```
 
 两份套件要在**各自包目录**下跑（从仓库根跑会跨包解析依赖，`ws` 之类会加载不到）。命令见下节。
@@ -248,4 +260,14 @@ cd packages/core  ; node node_modules/typescript/bin/tsc --noEmit -p tsconfig.js
 
 **百分比在不同后端不可比。** 郊狼是线性的（`percent × 2` → 强度 0–200）；谜姬把 0–100% 映射到马达可用区间，**1% 的命令已经产生约 31% 的输出**。
 
-所以 `Channel.outputFloorPercent` 会声明「最小非零命令已经产生百分之多少的输出」，`devices_list` 和 UI 都暴露它。默认 `maxPercent` 因此定在 **20**，与 谜姬 参考实现实测后选的默认值一致。
+所以 `Channel.outputFloorPercent` 会声明「最小非零命令已经产生百分之多少的输出」，`devices_list` 与 `/api/snapshot` 暴露它，控制台 UI 不再把它写成说明文字。默认 `maxPercent` 因此定在 **20**，与 谜姬 参考实现实测后选的默认值一致。
+
+**郊区（DG-LAB）的两个原厂量纲**（v4 起设备页直接显示）：
+
+- **强度 0–200**：硬件与官方协议的绝对强度范围；`percent × 2 = 强度`。设备页、直控滑杆、强度范围都按
+  原生值显示（步进 2，保证与整数百分比一一对应），API 与安全策略内部仍是 0–100% 整数。
+- **频率 10–240 传送码 → 物理 1–100 Hz**：`B0` 帧里的频率字节不是 Hz，而是脉冲周期 ms 的分段压缩
+  （10–100 段 1:1、101–200 段 1:5、201–240 段 1:10），物理频率 = `1000 / 周期`，所以 10 → 100 Hz、
+  100 → 10 Hz、240 → 1 Hz。设备页频率范围按物理 Hz 显示与修改，内部策略仍存协议码；换算见
+  `packages/core/src/backends/coyote/frequency.ts`。码值分辨率在高速端是 1 ms（约 9 Hz），
+  因此 60 Hz 这类请求落到最近码后可能回读为 59 Hz——这是协议粒度，不是 bug。

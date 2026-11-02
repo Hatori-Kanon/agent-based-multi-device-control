@@ -33,7 +33,7 @@ const PLAY_ACCELERATOR = 'Control+Alt+P'
  * prints it at startup so a stale dist/main.mjs is never mistaken for current
  * code — which already cost one debugging round.
  */
-const BUILD_TOKEN = 'embodied-build-c8fb8'
+const BUILD_TOKEN = 'embodied-build-d19e3'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -257,17 +257,19 @@ void app.whenReady().then(async () => {
     callback(allowedPermissions.has(permission as string))
   })
 
-  // The BLE worker is optional: without it the runtime still serves the mock
-  // devices, which is better than refusing to start on a machine with no
-  // Bluetooth adapter.
+  // The BLE worker is optional: without it the runtime still serves the
+  // console (empty device list), which is better than refusing to start on a
+  // machine with no Bluetooth adapter.
   try {
     bleWorker = await createBleWorker(reportError)
   } catch (error) {
     reportError(error)
   }
 
-  // Same for the camera worker: a machine without a camera (or with the OS
-  // camera privacy switch off) still runs the console and the mock devices.
+  // Same for the camera/microphone worker: a machine without a camera (or with
+  // the OS camera privacy switch off) still runs the console; the camera source
+  // simply reports unavailable until one is attached. Microphone capture stays
+  // off until a human enables it in the settings view.
   try {
     cameraWorker = await createCameraWorker({ onError: reportError })
   } catch (error) {
@@ -282,11 +284,14 @@ void app.whenReady().then(async () => {
     // dashboard.ts depends on whether the code runs from src/ or dist/.
     dashboardStaticDir: join(app.getAppPath(), 'src', 'ui'),
     ...(bleWorker === undefined ? {} : { bleTransport: bleWorker.transport }),
-    ...(cameraWorker === undefined ? {} : { cameraHost: cameraWorker.host }),
+    ...(cameraWorker === undefined ? {} : { cameraHost: cameraWorker.host, audioHost: cameraWorker.audioHost }),
     // Operator configuration only; never reaches a tool argument or result.
     ...(process.env.EMBODIED_MONSTERPARTY_TOKEN === undefined
       ? {}
       : { monsterPartyToken: process.env.EMBODIED_MONSTERPARTY_TOKEN }),
+    // A user-facing product never seeds fake hardware. The two mock devices
+    // exist for fixtures and the demo launcher only (`EMBODIED_MOCK_DEVICES=1`).
+    withMockDevices: process.env.EMBODIED_MOCK_DEVICES === '1',
     // Which BLE units exist is the manifest (state/devices.json), managed from
     // the console's 设备管理 (add/remove); no env tuning needed.
     // Without Buttplug hardware, skip the engine probe and spawn entirely.

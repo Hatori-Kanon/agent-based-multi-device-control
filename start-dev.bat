@@ -1,6 +1,8 @@
 @echo off
 setlocal
-rem One-click browser console (no Electron, no BLE hardware, mock devices).
+rem One-click browser console (no Electron, no BLE hardware).
+rem Pass "mock" as the first argument to seed the two simulated devices when
+rem there is no real hardware to test the device page with: start-dev.bat mock
 cd /d "%~dp0"
 
 rem Keep corepack/pnpm state inside this repository so the script works
@@ -9,6 +11,9 @@ set "COREPACK_HOME=%~dp0.cache\corepack"
 set "COREPACK_ENABLE_DOWNLOAD_PROMPT=0"
 rem pnpm refuses destructive actions without a TTY; CI mode skips the prompt.
 set "CI=true"
+
+rem A plain run is the product UI: no simulated devices. "mock" opts in.
+if /I "%~1"=="mock" set "EMBODIED_MOCK_DEVICES=1"
 
 echo.
 echo ============================================

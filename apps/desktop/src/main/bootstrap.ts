@@ -37,6 +37,7 @@ import {
   type FeatureSample,
   type FetchLike,
   type LlmConfig,
+  type ModelConfig,
   type ModelRunner,
   type PolicySnapshot,
   type RawInflate,
@@ -54,8 +55,27 @@ import { FsPackStore } from './pack-store.ts'
 import { RegistryPackSource } from './pack-source.ts'
 import { PanicServer } from './panic-server.ts'
 import { PlayHost } from './play.ts'
+import { audioSensorSource, type AudioHost } from './sensors/audio-host.ts'
 import { cameraSensorSource, DEFAULT_CAMERA_FPS, type CameraHost } from './sensors/camera-host.ts'
-import { createModelRunner, llmSummaryOf, loadLlmSettings, settingsFromConfig, singleCallModel } from './llm.ts'
+import {
+  buildLlmSettingsPayload,
+  buildSettingsPayload,
+  loadSensorPreferences,
+  mergeSensorPreferences,
+  saveSensorPreferences,
+  SettingsError,
+  unsupportedSensorState,
+  type LlmSettingsPatch,
+  type SensorCaptureState,
+  type SensorDeviceInfo,
+  type SensorPreferences,
+  type SensorPreferencesPatch,
+  type SensorPreference,
+  type SettingsDeps,
+  type SettingsPayload,
+} from './host-settings.ts'
+import { createModelRunner, llmSummaryOf, loadLlmSettings, saveLlmConfig, settingsFromConfig, singleCallModel } from './llm.ts'
+import type { LlmSettings } from './llm.ts'
 import type { LlmSummary, SettingsEnv } from './settings.ts'
 
 export interface HostRuntimeOptions {
@@ -77,7 +97,16 @@ export interface HostRuntimeOptions {
   readonly dashboardStaticFiles?: Readonly<Record<string, string>>
   /** Skip the control console entirely (used by tests that do not need it). */
   readonly withDashboard?: boolean
-  /** Register the simulated devices. Defaults to true. */
+  /**
+   * Register the two simulated devices (`mock-pulse`, `mock-hold`).
+   *
+   * Defaults to true for **fixtures and tests only**. Every product entry
+   * point passes an explicit value (Electron `main/index.ts` and the headless
+   * dev-server only when `EMBODIED_MOCK_DEVICES=1`): a user-facing device page
+   * must never contain fake hardware, and the console does not offer
+   * "模拟设备" as an addable protocol. The backend type stays because the mock
+   * pair is the cheapest way to drive the safety runtime in tests.
+   */
   readonly withMockDevices?: boolean
   /**
    * When present, real BLE backends are registered and connected.
@@ -97,10 +126,25 @@ export interface HostRuntimeOptions {
    * capture unless {@link withCamera} is false (tests, camera disabled).
    */
   readonly cameraHost?: CameraHost
-  /** Start camera capture on boot. Defaults to true when a host is supplied. */
+  /**
+   * Start camera capture on boot. Defaults to the persisted preference
+   * (`state/settings.json`, camera on for a fresh install).
+   *
+   * `false` is a host-level override for tests/headless runs: the capture host
+   * is still wired (so the settings view can report it), but nothing starts
+   * until a human enables it through `POST /api/settings/sensors`.
+   */
   readonly withCamera?: boolean
   /** Camera feature push rate; the capture host clamps it to 1-2 Hz. */
   readonly cameraFps?: number
+  /**
+   * Microphone capture host (the Electron hidden worker's audio path).
+   *
+   * Omitted in headless runs: the settings payload then reports the microphone
+   * as `supported: false`. When supplied, one `audio` sensor source is
+   * registered and capture starts only if the human enabled it (default off).
+   */
+  readonly audioHost?: AudioHost
   /**
    * In-memory LLM config override (tests, embedded hosts).
    *
@@ -149,12 +193,35 @@ export interface HostRuntime {
    * actually runs. Built from the single-call model (director role, `null` →
    * default) for the M2 pipeline; split mode builds role runners from
    * {@link llm} without changing this field's meaning.
+   *
+   * A getter: `saveLlmSettings` rebuilds the runner, and the next turn picks it
+   * up through the session's runner provider — no restart.
    */
   readonly modelRunner: ModelRunner
-  /** Effective LLM config (by construction it carries no API key). */
+  /** Effective LLM config in force now (by construction it carries no API key). */
   readonly llm: LlmConfig
   /** Key-free LLM status — the only LLM shape the console may display. */
   llmSummary(): LlmSummary
+  /**
+   * 设置页数据（产品需求 #5）：无密钥的模型视图 + 摄像头/麦克风的实时采集状态。
+   *
+   * Device lists are re-read on every call, so the page's refresh button just
+   * calls it again. Reading never starts capture.
+   */
+  settingsSnapshot(): Promise<SettingsPayload>
+  /**
+   * Persist a model change and swap the runner used by the next turn.
+   *
+   * Refused with {@link SettingsError} `FIXED_LLM_CONFIG` when this host was
+   * started from an in-memory config: there would be no file to persist to.
+   */
+  saveLlmSettings(patch: LlmSettingsPatch): Promise<SettingsPayload>
+  /**
+   * Persist camera/microphone preferences and apply them to the live capture
+   * hosts. Capture failures are reported in the returned payload, never thrown
+   * as a host fault.
+   */
+  saveSensorSettings(patch: SensorPreferencesPatch): Promise<SettingsPayload>
   /**
    * Host session service (B1-T16): one pack-backed session per process.
    *
@@ -289,6 +356,39 @@ function createMockDevices(clock: Clock): MockBackend[] {
   ]
 }
 
+/**
+ * The subset of a capture host the settings wiring drives.
+ *
+ * Camera and microphone hosts share this shape, so boot/save handling lives in
+ * one place. The optional `fps` is honoured by the camera host and ignored by
+ * the audio host (its cadence is fixed at 2 Hz).
+ */
+interface CaptureHostLike {
+  readonly sourceId: string
+  readonly label: string
+  listDevices(): Promise<readonly SensorDeviceInfo[]>
+  start(deviceId: string, options?: { readonly fps?: number }): Promise<void>
+  stop(): Promise<void>
+  onFeatures(listener: (sample: FeatureSample) => void): () => void
+}
+
+/**
+ * Live state of one capture source.
+ *
+ * `preference` mirrors the persisted human choice; `status`/`error` describe
+ * what the host is actually doing and are never written to disk (a stale
+ * "running" from the previous process would lie).
+ */
+interface CaptureControl {
+  readonly host: CaptureHostLike | undefined
+  preference: SensorPreference
+  status: 'running' | 'stopped' | 'unavailable' | 'error'
+  error: string | undefined
+  devices: SensorDeviceInfo[]
+  /** Device capture actually opened, or `null` when not capturing. */
+  runningDeviceId: string | null
+}
+
 export async function createHostRuntime(options: HostRuntimeOptions): Promise<HostRuntime> {
   const clock = options.clock ?? systemClock
   const onError = options.onError ?? ((): void => {})
@@ -397,18 +497,24 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
   // environment-first and is never copied into the config object. Assembling
   // the runner performs NO network IO — the first request happens on the first
   // turn, so booting offline (or without a key) is a supported state.
+  //
+  // `llmSettings`/`llm`/`modelRunner` are mutable because the settings view can
+  // replace the model at run time: `saveLlmSettings` persists, rebuilds the
+  // runner and swaps it in. The session reads the runner through the provider
+  // passed to `PlayHost` below, so the *next* turn uses the new model.
   const llmEnv = options.llmEnv ?? process.env
-  const llmSettings = options.llmConfig === undefined
+  let llmSettings: LlmSettings = options.llmConfig === undefined
     ? await loadLlmSettings(options.dataDir, llmEnv)
     : settingsFromConfig(options.llmConfig, llmEnv)
-  const llm = llmSettings.config
-  const modelRunner = createModelRunner({
-    model: singleCallModel(llm),
-    ...(llmSettings.apiKey === undefined ? {} : { apiKey: llmSettings.apiKey }),
+  let llm: LlmConfig = llmSettings.config
+  const buildModelRunner = (settings: LlmSettings): ModelRunner => createModelRunner({
+    model: singleCallModel(settings.config),
+    ...(settings.apiKey === undefined ? {} : { apiKey: settings.apiKey }),
     fetch: options.llmFetch ?? globalThis.fetch,
     clock,
     env: llmEnv,
   })
+  let modelRunner: ModelRunner = buildModelRunner(llmSettings)
   const llmSummary = (): LlmSummary => llmSummaryOf(llmSettings)
 
   // Region labels: manifest defaults live in the registry snapshot; the
@@ -431,40 +537,283 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
   // tools then have a single place to read perception from, and "no source"
   // is a supported state rather than a missing dependency.
   const sensors = new SensorRegistry({ clock, onError: recordError })
+  // ── Capture state for the settings view (product requirement #5) ────────
+  // Preferences live in `state/settings.json`; capture status is live and never
+  // persisted. A host that is not wired (headless dev-server, no camera) is
+  // `supported: false`, which the settings page renders as 不可用.
+  let sensorPreferences: SensorPreferences = await loadSensorPreferences(documents)
+  /** One-shot `unavailable` sample: a stopped source must not read as healthy. */
+  const pushUnavailableSample = (sourceId: string): void => {
+    try {
+      sensors.push({ sourceId, ts: clock.now(), frameAgeMs: 0, quality: 'unavailable' })
+    } catch (error) {
+      recordError(error)
+    }
+  }
+  const shortError = (error: unknown): string => {
+    const message = error instanceof Error ? error.message : String(error)
+    return message.length > 120 ? `${message.slice(0, 117)}…` : message
+  }
+  const listCaptureDevices = async (host: CaptureHostLike | undefined): Promise<SensorDeviceInfo[]> => {
+    if (host === undefined) return []
+    try {
+      return [...await host.listDevices()]
+    } catch (error) {
+      recordError(error)
+      return []
+    }
+  }
+  /**
+   * Open the preferred device (or the first available one) and start capture.
+   *
+   * A start failure is state, not a host fault: the settings payload reports
+   * `status: 'error'` with a short reason and the caller still persists the
+   * preference. That is what a permission refusal or an unplugged device should
+   * look like in the UI.
+   */
+  const startCapture = async (control: CaptureControl, preferred: string | null): Promise<void> => {
+    const host = control.host
+    if (host === undefined) {
+      control.status = 'unavailable'
+      return
+    }
+    control.devices = await listCaptureDevices(host)
+    const stored = preferred !== null && control.devices.some(device => device.deviceId === preferred)
+      ? preferred
+      : undefined
+    const chosen = stored ?? control.devices[0]?.deviceId
+    if (chosen === undefined) {
+      control.runningDeviceId = null
+      control.status = 'unavailable'
+      control.error = '没有可用的设备'
+      log(`[${host.sourceId}] no capture device found`)
+      pushUnavailableSample(host.sourceId)
+      return
+    }
+    if (control.runningDeviceId === chosen && control.status === 'running') {
+      control.error = undefined
+      return
+    }
+    try {
+      await host.start(chosen, { fps: options.cameraFps ?? DEFAULT_CAMERA_FPS })
+      control.runningDeviceId = chosen
+      control.status = 'running'
+      control.error = undefined
+    } catch (error) {
+      recordError(error)
+      control.runningDeviceId = null
+      control.status = 'error'
+      control.error = shortError(error)
+      // A refused stream still leaves a registered source; make its loss
+      // explicit instead of letting it read as "camera fine, no data".
+      pushUnavailableSample(host.sourceId)
+    }
+  }
+  /** Stop capture; emits one `unavailable` sample so the registry stops lying. */
+  const stopCapture = async (control: CaptureControl): Promise<void> => {
+    const host = control.host
+    if (host === undefined) {
+      control.status = 'unavailable'
+      return
+    }
+    if (control.runningDeviceId !== null) {
+      try {
+        await host.stop()
+      } catch (error) {
+        // A failing bridge stop must not block disabling the source.
+        recordError(error)
+      }
+    }
+    control.runningDeviceId = null
+    control.status = 'stopped'
+    control.error = undefined
+    pushUnavailableSample(host.sourceId)
+  }
+  /** Apply one persisted preference to a live capture host. */
+  const applyCapturePreference = async (control: CaptureControl, preference: SensorPreference): Promise<void> => {
+    control.preference = preference
+    if (control.host === undefined) return
+    if (!preference.enabled) {
+      await stopCapture(control)
+      return
+    }
+    await startCapture(control, preference.deviceId)
+  }
+  /** Project one live control into the settings payload. */
+  const captureState = (control: CaptureControl): SensorCaptureState => {
+    if (control.host === undefined) return unsupportedSensorState()
+    return {
+      supported: true,
+      enabled: control.preference.enabled,
+      deviceId: control.preference.deviceId,
+      devices: control.devices,
+      status: control.status,
+      ...(control.error === undefined ? {} : { error: control.error }),
+    }
+  }
+  /** Fan one camera/microphone sample into the registry and the status line. */
+  const wireCaptureFeatures = (control: CaptureControl): ((sample: FeatureSample) => void) => sample => {
+    try {
+      sensors.push(sample)
+    } catch (error) {
+      recordError(error)
+    }
+    // The capture end owns the `unavailable` signal (plan §8.7 ruling 5): when
+    // a stream ends on its own, the settings view must stop claiming `running`.
+    if (sample.quality === 'unavailable' && control.runningDeviceId !== null) {
+      control.runningDeviceId = null
+      control.status = 'unavailable'
+      control.error = '采集已中断'
+    }
+  }
+
+  const cameraControl: CaptureControl = {
+    host: options.cameraHost,
+    preference: sensorPreferences.camera,
+    status: 'stopped',
+    error: undefined,
+    devices: [],
+    runningDeviceId: null,
+  }
+  const microphoneControl: CaptureControl = {
+    host: options.audioHost,
+    preference: sensorPreferences.microphone,
+    status: 'stopped',
+    error: undefined,
+    devices: [],
+    runningDeviceId: null,
+  }
+
   if (options.cameraHost !== undefined) {
     const camera = options.cameraHost
     sensors.register(cameraSensorSource(camera))
-    // The capture end owns the `unavailable` signal (plan §8.7 ruling 5):
-    // the registry derives `stale` from its clock but must not guess that a
-    // camera disappeared, so the host pushes a sample that says so.
-    camera.onFeatures(sample => {
-      try {
-        sensors.push(sample)
-      } catch (error) {
-        recordError(error)
-      }
+    camera.onFeatures(wireCaptureFeatures(cameraControl))
+  }
+  if (options.audioHost !== undefined) {
+    const audio = options.audioHost
+    sensors.register(audioSensorSource(audio))
+    audio.onFeatures(wireCaptureFeatures(microphoneControl))
+  }
+
+  // Boot-time application of the persisted preferences. Camera on is the old
+  // behaviour (and the documented default); microphone on only if a human
+  // enabled it earlier — a fresh install never records room audio.
+  if (options.cameraHost !== undefined && sensorPreferences.camera.enabled && options.withCamera !== false) {
+    await startCapture(cameraControl, sensorPreferences.camera.deviceId)
+  }
+  if (options.audioHost !== undefined && sensorPreferences.microphone.enabled) {
+    await startCapture(microphoneControl, sensorPreferences.microphone.deviceId)
+  }
+
+  // ── Settings service (product requirement #5) ──────────────────────────
+  // The console's 设置 view is a thin client of these three operations. The API
+  // key never crosses this boundary: `LlmSettings` is its only carrier and it
+  // goes straight into the runner's auth header.
+  const settingsSnapshot = async (): Promise<SettingsPayload> => {
+    // The page's refresh buttons re-list devices by calling this again.
+    cameraControl.devices = await listCaptureDevices(options.cameraHost)
+    microphoneControl.devices = await listCaptureDevices(options.audioHost)
+    return buildSettingsPayload({
+      llm: buildLlmSettingsPayload(llmSummary(), llm),
+      sensors: { camera: captureState(cameraControl), microphone: captureState(microphoneControl) },
     })
-    if (options.withCamera !== false) {
-      try {
-        const devices = await camera.listDevices()
-        const first = devices[0]
-        if (first === undefined) {
-          log('[camera] no video input found; the sensor source will report unavailable')
-        } else {
-          await camera.start(first.deviceId, { fps: options.cameraFps ?? DEFAULT_CAMERA_FPS })
-        }
-      } catch (error) {
-        recordError(error)
-        // A refused getUserMedia still leaves a registered source; make its
-        // loss explicit instead of letting it read as "camera fine, no data".
-        try {
-          sensors.push({ sourceId: camera.sourceId, ts: clock.now(), frameAgeMs: 0, quality: 'unavailable' })
-        } catch (pushError) {
-          recordError(pushError)
-        }
-      }
+  }
+
+  const saveLlmSettings = async (patch: LlmSettingsPatch): Promise<SettingsPayload> => {
+    if (options.llmConfig !== undefined) {
+      throw new SettingsError(
+        'FIXED_LLM_CONFIG',
+        'this host was started with an in-memory model config; start it from state/llm.json to change the model here',
+      )
+    }
+    // Re-read the file: a hand-edit between boot and save must not be silently
+    // dropped from the fields this patch does not mention.
+    const before = await loadLlmSettings(options.dataDir, llmEnv)
+    const previousDefault = before.config.default
+    const baseUrl = patch.baseUrl === undefined ? previousDefault.baseUrl : (patch.baseUrl ?? undefined)
+    const { baseUrl: _previousBaseUrl, ...restDefault } = previousDefault
+    const nextDefault: ModelConfig = {
+      ...restDefault,
+      ...(patch.provider === undefined ? {} : { provider: patch.provider }),
+      ...(patch.model === undefined ? {} : { model: patch.model }),
+      ...(baseUrl === undefined ? {} : { baseUrl }),
+    }
+    const nextConfig: LlmConfig = {
+      default: nextDefault,
+      director: before.config.director ?? null,
+      writer: before.config.writer ?? null,
+    }
+    // Key semantics: omitted = keep the stored key, `''` = clear, else replace.
+    // An env-resolved key is never copied into the file.
+    const storedKey = patch.apiKey === undefined
+      ? (before.apiKeySource === 'file' ? before.apiKey : undefined)
+      : (patch.apiKey.trim() === '' ? undefined : patch.apiKey.trim())
+    await saveLlmConfig(options.dataDir, nextConfig, storedKey === undefined ? {} : { apiKey: storedKey })
+    const next = await loadLlmSettings(options.dataDir, llmEnv)
+    llmSettings = next
+    llm = next.config
+    // Swap the runner: the next turn resolves it through the session provider.
+    modelRunner = buildModelRunner(next)
+    await audit.record({
+      actor: 'human',
+      action: 'settings_change',
+      result: 'ok',
+      detail: {
+        scope: 'llm',
+        provider: next.config.default.provider,
+        model: next.config.default.model,
+        baseUrl: next.config.default.baseUrl ?? null,
+        apiKeySource: next.apiKeySource,
+        apiKeyChanged: patch.apiKey !== undefined,
+      },
+    })
+    return settingsSnapshot()
+  }
+
+  /** A mentioned device id must exist on that capture host right now. */
+  const assertKnownCaptureDevice = async (
+    control: CaptureControl,
+    designation: { readonly deviceId?: string | null },
+  ): Promise<void> => {
+    const deviceId = designation.deviceId
+    if (deviceId === undefined || deviceId === null) return
+    // Re-list before judging: a device plugged in after boot is selectable.
+    control.devices = await listCaptureDevices(control.host)
+    if (!control.devices.some(device => device.deviceId === deviceId)) {
+      throw new SettingsError('INVALID_SENSOR', `unknown capture device "${deviceId}"`)
     }
   }
+
+  const saveSensorSettings = async (patch: SensorPreferencesPatch): Promise<SettingsPayload> => {
+    if (patch.camera !== undefined) await assertKnownCaptureDevice(cameraControl, patch.camera)
+    if (patch.microphone !== undefined) await assertKnownCaptureDevice(microphoneControl, patch.microphone)
+    const nextPreferences = mergeSensorPreferences(sensorPreferences, patch)
+    sensorPreferences = nextPreferences
+    // Capture failures are reported, never thrown: the preference is saved and
+    // the payload carries `status: 'error'` plus a short reason.
+    if (patch.camera !== undefined) await applyCapturePreference(cameraControl, nextPreferences.camera)
+    if (patch.microphone !== undefined) await applyCapturePreference(microphoneControl, nextPreferences.microphone)
+    await saveSensorPreferences(documents, nextPreferences)
+    await audit.record({
+      actor: 'human',
+      action: 'settings_change',
+      result: 'ok',
+      detail: {
+        scope: 'sensors',
+        camera: { enabled: nextPreferences.camera.enabled, deviceId: nextPreferences.camera.deviceId },
+        microphone: { enabled: nextPreferences.microphone.enabled, deviceId: nextPreferences.microphone.deviceId },
+      },
+    })
+    return settingsSnapshot()
+  }
+
+  /** The seam the console's settings routes are driven through. */
+  const settingsDeps: SettingsDeps = {
+    snapshot: settingsSnapshot,
+    saveLlm: saveLlmSettings,
+    saveSensors: saveSensorSettings,
+  }
+
   const firstImageSourceId = (): string | undefined =>
     sensors.statuses().find(status => status.kind === 'image')?.id
   const sensorsStatus = (): readonly SensorStatus[] => sensors.statuses()
@@ -511,7 +860,9 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     policy,
     waveforms,
     sensors,
-    runner: modelRunner,
+    // Provider, not a snapshot: a model change in the settings view must reach
+    // the next turn without restarting the session or the host.
+    runner: () => modelRunner,
     savePolicy,
     packs: new RegistryPackSource({ registry: packRegistry, store: packStore, engineVersion: ENGINE_VERSION }),
     // B2-T7/T8: every settled turn writes a snapshot, every session one ledger
@@ -576,6 +927,9 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     }
   }
 
+  // Tests and fixtures keep the two simulated devices; product entry points
+  // (Electron main, dev-server) pass `withMockDevices: false` unless the
+  // operator explicitly asked for a hardware-free demo run.
   if (options.withMockDevices !== false) {
     for (const backend of createMockDevices(clock)) {
       registry.register(backend)
@@ -889,6 +1243,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     },
     regions: () => play.regions(),
     recentLogs,
+    settings: settingsDeps,
   }
 
   if (options.withDashboard !== false) {
@@ -918,8 +1273,9 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     waveforms,
     documents,
     sensors,
-    modelRunner,
-    llm,
+    // Getter pairs: the settings view can replace the runner/config in place.
+    get modelRunner(): ModelRunner { return modelRunner },
+    get llm(): LlmConfig { return llm },
     play,
     packs: packRegistry,
     panicToken,
@@ -936,6 +1292,9 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     sensorFrame,
     pushFeatures,
     llmSummary,
+    settingsSnapshot,
+    saveLlmSettings,
+    saveSensorSettings,
     panic,
     saveWaveforms,
     savePolicy,

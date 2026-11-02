@@ -4,11 +4,14 @@
  *
  * This is for environments where a GPU-backed shell cannot run (this sandbox
  * included) and doubles as the answer to "open the console in a browser". BLE
- * backends are unavailable here; the mock devices exercise every console
- * operation end to end.
+ * backends are unavailable here; `EMBODIED_MOCK_DEVICES=1` seeds the two
+ * simulated devices so the console can be exercised without hardware. A plain
+ * `start-dev.bat` run has an empty device list on purpose: mock hardware is
+ * not part of the product UI.
  *
  *     pnpm --filter @embodied/desktop exec tsx src/dev-server.ts
  *     pnpm --filter @embodied/desktop dev
+ *     EMBODIED_MOCK_DEVICES=1 pnpm --filter @embodied/desktop dev
  */
 
 import { join } from 'node:path'
@@ -20,6 +23,7 @@ import indexHtml from './ui/index.html?text'
 import appJs from './ui/app.js?text'
 import playJs from './ui/play.js?text'
 import shellJs from './ui/shell.js?text'
+import settingsJs from './ui/settings.js?text'
 import styleCss from './ui/style.css?text'
 // The phone stop page is the third static file; keeping it in the map means the
 // bundle really is self-contained (no disk lookup for a page that must work
@@ -38,6 +42,8 @@ const runtime = await createHostRuntime({
   dataDir,
   withPanicServer: false,
   withButtplug: false,
+  // Product UI: no fake devices unless the operator asks for a demo run.
+  withMockDevices: process.env.EMBODIED_MOCK_DEVICES === '1',
   dashboardPort: port,
   // The UI files ride inside this bundle, so the dev server is self-contained
   // and works from any working directory. `EMBODIED_UI_FROM_DISK=1` drops that
@@ -51,6 +57,7 @@ const runtime = await createHostRuntime({
           'app.js': appJs,
           'play.js': playJs,
           'shell.js': shellJs,
+          'settings.js': settingsJs,
           'style.css': styleCss,
           'phone.html': phoneHtml,
         },

@@ -18,23 +18,38 @@ import { fileURLToPath } from 'node:url'
 import type { ChannelPolicy, PackRegistryEntry } from '@embodied/core'
 import {
   ContentPackError,
+  frequencyBandToHz,
+  hzBandToCode,
+  isSafetyError,
   isSensorError,
+  MAX_FREQ_CODE,
+  MAX_FREQ_HZ,
   MAX_ZIP_BYTES,
+  MIN_FREQ_CODE,
+  MIN_FREQ_HZ,
   PackRegistryError,
   probeDirectorJson,
   ZipError,
 } from '@embodied/core'
 import type { FeatureSample, ProbeRecord, SensorQuality, SensorStatus, Snapshot } from '@embodied/core'
 import type { DeviceManagerEntry, DeviceProtocol } from './bootstrap.ts'
+import type { SettingsDeps } from './host-settings.ts'
 import { isSessionError } from './play.ts'
 import type { PlayHostStartRequest } from './play.ts'
+import { handleSettingsRequest, isSettingsPath } from './settings-routes.ts'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
 const MAX_BODY_BYTES = 256 * 1024
 
-/** Protocols the operator may add through the console. */
-const ADDABLE_PROTOCOLS: readonly string[] = ['coyote', 'xhtkj', 'mock']
+/**
+ * Protocols the operator may add through the console.
+ *
+ * Matches the add-device dialog (coyote / xhtkj / ankni). Mock devices are
+ * deliberately absent: fake hardware is not a product feature, and the demo
+ * path is `EMBODIED_MOCK_DEVICES=1` at the host level.
+ */
+const ADDABLE_PROTOCOLS: readonly string[] = ['coyote', 'xhtkj', 'ankni']
 
 /** 一次导入的结果，只含 UI 需要的小字段（`LoadedPack` 不可序列化）。 */
 export interface PackImportSummary {
@@ -117,6 +132,13 @@ export interface DashboardDeps {
   readonly setRegion?: (deviceId: string, channelId: string, region: string | undefined) => Promise<void>
   /** Region labels in force, keyed `device:channel` (B2-T10). */
   readonly regions?: () => Readonly<Record<string, string>>
+  /**
+   * 设置页 API（产品需求 #5）。
+   *
+   * 可选：只有控制台、没有采集宿主的测试替身仍然启动，`/api/settings*`
+   * 回答 404（而不是让整个服务器起不来）。实现见 `settings-routes.ts`。
+   */
+  readonly settings?: SettingsDeps
   /** Cross-session ledger entries, newest last (B2-T8/B2-T11). */
   readonly ledger?: (limit?: number) => Promise<readonly unknown[]>
 }
@@ -314,22 +336,228 @@ function asNumberArray(value: unknown): number[] | undefined {
   return out
 }
 
-function asPolicyPatch(value: unknown): Partial<ChannelPolicy> | undefined {
-  if (typeof value !== 'object' || value === null) return undefined
-  const raw = value as Record<string, unknown>
-  const keys = ['minPercent', 'maxPercent', 'minFreq', 'maxFreq', 'maxDurationSec'] as const
-  const patch: Record<string, number> = {}
-  for (const key of keys) {
-    if (!(key in raw)) continue
-    const field = raw[key]
+/** A JSON object response shape; the dashboard deps deliberately return `unknown`. */
+function asJsonObject(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  return value as Record<string, unknown>
+}
+
+/**
+ * Whole-Hz display band for a stored protocol code band.
+ *
+ * The policy keeps frequency in Coyote protocol units; only the console shows
+ * physical pulse frequency. Absent or out-of-range codes produce no fields
+ * rather than a fabricated band (an empty waveform summarises as `0`/`0`).
+ */
+function hzBandFields(minCode: unknown, maxCode: unknown): { minHz: number; maxHz: number } | undefined {
+  if (typeof minCode !== 'number' || !Number.isFinite(minCode)) return undefined
+  if (typeof maxCode !== 'number' || !Number.isFinite(maxCode)) return undefined
+  if (minCode < MIN_FREQ_CODE || minCode > MAX_FREQ_CODE) return undefined
+  if (maxCode < MIN_FREQ_CODE || maxCode > MAX_FREQ_CODE) return undefined
+  return frequencyBandToHz({ minCode, maxCode })
+}
+
+/**
+ * One channel plus the units the console renders it in.
+ *
+ * Additive only: `minFreq`/`maxFreq` (protocol codes) and every percentage
+ * field stay exactly as the safety runtime published them, so the model-facing
+ * projections and older clients keep working. A Coyote channel reports native
+ * strength 0-200; every other backend drives percentages 0-100.
+ */
+function decorateChannel(
+  channel: Record<string, unknown>,
+  protocol: DeviceProtocol | undefined,
+): Record<string, unknown> {
+  const nativeStrength = protocol === 'coyote'
+  const decorated: Record<string, unknown> = {
+    ...channel,
+    intensityUnit: nativeStrength ? 'strength' : 'percent',
+    intensityMax: nativeStrength ? 200 : 100,
+  }
+  const hz = hzBandFields(channel.minFreq, channel.maxFreq)
+  if (hz !== undefined) {
+    decorated.minFreqHz = hz.minHz
+    decorated.maxFreqHz = hz.maxHz
+  }
+  return decorated
+}
+
+/**
+ * Registry snapshot plus per-device protocol and per-channel native units.
+ *
+ * `protocol` is omitted for devices the operator manifest does not know (hub
+ * backends, the mock pair in tests); the console then falls back to percentage
+ * units, which is the safe default for anything that is not a Coyote.
+ */
+function decorateSnapshot(snapshot: unknown, protocols: ReadonlyMap<string, DeviceProtocol>): unknown {
+  const root = asJsonObject(snapshot)
+  if (root === undefined || !Array.isArray(root.devices)) return snapshot
+  const devices = root.devices.map(entry => {
+    const device = asJsonObject(entry)
+    if (device === undefined) return entry
+    const id = typeof device.id === 'string' ? device.id : undefined
+    const protocol = id === undefined ? undefined : protocols.get(id)
+    const channels = Array.isArray(device.channels)
+      ? device.channels.map(channel => {
+          const record = asJsonObject(channel)
+          return record === undefined ? channel : decorateChannel(record, protocol)
+        })
+      : device.channels
+    return {
+      ...device,
+      ...(protocol === undefined ? {} : { protocol }),
+      channels,
+    }
+  })
+  return { ...root, devices }
+}
+
+/**
+ * One waveform summary plus its whole-Hz display band.
+ *
+ * `minFreq`/`maxFreq` stay in protocol codes; the Hz fields are what the
+ * library cards print. Absent codes are left undecorated rather than guessed.
+ */
+function decorateWaveform(waveform: unknown): unknown {
+  const record = asJsonObject(waveform)
+  if (record === undefined) return waveform
+  const hz = hzBandFields(record.minFreq, record.maxFreq)
+  return hz === undefined ? record : { ...record, minFreqHz: hz.minHz, maxFreqHz: hz.maxHz }
+}
+
+/**
+ * The stored frequency band of one channel, in whole Hz.
+ *
+ * Read from the raw snapshot before a one-sided Hz patch is converted: the
+ * dashboard does not own the policy store, so the other end of the band can
+ * only come from what the registry just published.
+ */
+function storedFrequencyBand(
+  snapshot: unknown,
+  deviceId: unknown,
+  channelId: unknown,
+): { minHz: number; maxHz: number } | undefined {
+  const wantedDevice = asOptionalString(deviceId)
+  const wantedChannel = asOptionalString(channelId)
+  if (wantedDevice === undefined || wantedChannel === undefined) return undefined
+  const root = asJsonObject(snapshot)
+  if (root === undefined || !Array.isArray(root.devices)) return undefined
+  for (const rawDevice of root.devices) {
+    const device = asJsonObject(rawDevice)
+    if (device?.id !== wantedDevice || !Array.isArray(device.channels)) continue
+    for (const rawChannel of device.channels) {
+      const channel = asJsonObject(rawChannel)
+      if (channel?.id !== wantedChannel) continue
+      return hzBandFields(channel.minFreq, channel.maxFreq)
+    }
+  }
+  return undefined
+}
+
+/** Every field `/api/cap` accepts; all are whole numbers. */
+const CAP_PATCH_FIELDS = [
+  'minPercent',
+  'maxPercent',
+  'minFreq',
+  'maxFreq',
+  'maxDurationSec',
+  'minFreqHz',
+  'maxFreqHz',
+] as const
+
+/** Legacy protocol-code frequency fields. */
+const CAP_CODE_FREQ_FIELDS = ['minFreq', 'maxFreq'] as const
+/** Native whole-Hz frequency fields; converted into a code pair before `setCap`. */
+const CAP_HZ_FREQ_FIELDS = ['minFreqHz', 'maxFreqHz'] as const
+
+/**
+ * Turn one `/api/cap` body into the protocol-unit patch `setCap` takes.
+ *
+ * All-or-nothing: every known field is validated before anything is applied,
+ * so a patch carrying one bad value cannot move half a safety bound. The new
+ * client sends the frequency band in whole physical Hz (`minFreqHz`/
+ * `maxFreqHz`); this helper converts it to the protocol's compressed code pair.
+ * The legacy code fields (`minFreq`/`maxFreq`) are still accepted — tests and
+ * tools use them — but mixing both spellings in one patch is refused, because
+ * there would be no single intended band.
+ *
+ * A one-sided Hz patch needs the other end of the *current* band, which the
+ * dashboard can only read from the registry snapshot; both endpoints are then
+ * converted together and the resulting patch always carries the complete code
+ * pair. Sending the supplied endpoint alone could invert the band, which the
+ * policy validator would (correctly) refuse.
+ *
+ * @throws Error with the caller-readable reason when the patch is invalid.
+ */
+function capPatchFromBody(body: Record<string, unknown>, currentSnapshot: unknown): Partial<ChannelPolicy> {
+  const raw = body.patch
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new Error('patch must be an object of channel policy fields')
+  }
+  const record = raw as Record<string, unknown>
+  // A client still sending the removed pulse-width cap gets a clean 400.
+  if ('maxWaveIntensity' in record) {
+    throw new Error('maxWaveIntensity is not a configurable channel bound')
+  }
+  const numbers: Record<string, number> = {}
+  for (const key of CAP_PATCH_FIELDS) {
+    if (!(key in record)) continue
+    const field = record[key]
     // 任一已知字段非法就整条 patch 拒绝：静默丢弃会变成「只改了一半的边界」，
     // 而边界是安全状态，不能部分生效。
-    if (typeof field !== 'number' || !Number.isFinite(field) || !Number.isInteger(field)) return undefined
-    patch[key] = field
+    if (typeof field !== 'number' || !Number.isFinite(field) || !Number.isInteger(field)) {
+      throw new Error(`patch.${key} must be a whole number`)
+    }
+    numbers[key] = field
   }
-  // A client still sending the removed pulse-width cap gets a clean 400.
-  if ('maxWaveIntensity' in raw) return undefined
-  return Object.keys(patch).length === 0 ? undefined : patch as Partial<ChannelPolicy>
+  const hasCodeFreq = CAP_CODE_FREQ_FIELDS.some(key => numbers[key] !== undefined)
+  const hasHzFreq = CAP_HZ_FREQ_FIELDS.some(key => numbers[key] !== undefined)
+  if (hasCodeFreq && hasHzFreq) {
+    throw new Error('patch cannot mix minFreq/maxFreq with minFreqHz/maxFreqHz')
+  }
+
+  const patch: Record<string, number> = {}
+  for (const key of ['minPercent', 'maxPercent', 'maxDurationSec'] as const) {
+    const value = numbers[key]
+    if (value !== undefined) patch[key] = value
+  }
+  if (hasCodeFreq) {
+    // Legacy path: the policy store merges a code endpoint with its own current
+    // value and validates the resulting band itself.
+    for (const key of CAP_CODE_FREQ_FIELDS) {
+      const value = numbers[key]
+      if (value !== undefined) patch[key] = value
+    }
+  }
+  if (hasHzFreq) {
+    for (const key of CAP_HZ_FREQ_FIELDS) {
+      const value = numbers[key]
+      if (value !== undefined && (value < MIN_FREQ_HZ || value > MAX_FREQ_HZ)) {
+        throw new Error(`patch.${key} must be a whole number from ${MIN_FREQ_HZ} to ${MAX_FREQ_HZ} Hz`)
+      }
+    }
+    const needsStoredBand = numbers.minFreqHz === undefined || numbers.maxFreqHz === undefined
+    const stored = needsStoredBand
+      ? storedFrequencyBand(currentSnapshot, body.deviceId, body.channelId)
+      : undefined
+    const minHz = numbers.minFreqHz ?? stored?.minHz
+    const maxHz = numbers.maxFreqHz ?? stored?.maxHz
+    if (minHz === undefined || maxHz === undefined) {
+      throw new Error('cannot resolve the other frequency endpoint: unknown device or channel')
+    }
+    if (minHz >= maxHz) {
+      throw new Error('minFreqHz must be less than maxFreqHz')
+    }
+    const codes = hzBandToCode({ minHz, maxHz })
+    // The complete pair, never a single converted endpoint.
+    patch.minFreq = codes.minCode
+    patch.maxFreq = codes.maxCode
+  }
+  if (Object.keys(patch).length === 0) {
+    throw new Error('patch must set minPercent, maxPercent, minFreq, maxFreq, minFreqHz, maxFreqHz, or maxDurationSec')
+  }
+  return patch as Partial<ChannelPolicy>
 }
 
 /** Perceived qualities an external capture end may report. */
@@ -401,20 +629,21 @@ const STATIC_TYPES: Readonly<Record<string, string>> = {
  * same page, so `/` and `/play` both serve `index.html` and `shell.js` switches
  * views client-side.
  */
-const STATIC_FILES = new Set(['index.html', 'app.js', 'play.js', 'shell.js', 'style.css', 'phone.html'])
+const STATIC_FILES = new Set(['index.html', 'app.js', 'play.js', 'shell.js', 'settings.js', 'style.css', 'phone.html'])
 
 /**
  * Page aliases → static file name.
  *
- * `/play` and `/device` are deep links into the single-window app; the
- * allowlist still decides what can be served (a request for `/play.json` is a
- * clean 404).
+ * `/play`, `/device`, and `/settings` are deep links into the single-window
+ * app; the allowlist still decides what can be served (a request for
+ * `/play.json` is a clean 404).
  */
 const STATIC_ALIASES: Readonly<Record<string, string>> = {
   '/': '/index.html',
   '/phone': '/phone.html',
   '/play': '/index.html',
   '/device': '/index.html',
+  '/settings': '/index.html',
 }
 
 export class DashboardServer {
@@ -448,6 +677,27 @@ export class DashboardServer {
   /** One clock for ingested samples, injectable so tests get deterministic ts. */
   private now(): number {
     return this.options.now?.() ?? Date.now()
+  }
+
+  /** Protocol per registered device id, for the native-unit decorations. */
+  private deviceProtocols(): ReadonlyMap<string, DeviceProtocol> {
+    return new Map(this.options.deps.listDevices().map(entry => [entry.key, entry.protocol]))
+  }
+
+  /**
+   * The registry snapshot as the console sees it: protocol metadata plus the
+   * native units each channel/back end speaks.
+   *
+   * Every route that hands out a snapshot goes through here, so the decoration
+   * cannot be added to one route and forgotten on another.
+   */
+  private snapshotPayload(): unknown {
+    return decorateSnapshot(this.options.deps.snapshot(), this.deviceProtocols())
+  }
+
+  /** Waveform summaries plus their Hz display bands; every `{waveforms}` payload uses it. */
+  private waveformPayload(waveforms: readonly unknown[] = this.options.deps.listWaveforms()): unknown[] {
+    return waveforms.map(decorateWaveform)
   }
 
   start(): Promise<{ host: string; port: number }> {
@@ -521,6 +771,20 @@ export class DashboardServer {
     const isApi = pathname.startsWith('/api/')
     if (isApi && !tokenMatches(this.options.token, request, url)) {
       sendError(response, 401, 'missing or invalid x-control-token')
+      return
+    }
+
+    // ── Settings API (product requirement #5) ────────────────────────────
+    // Model configuration + camera/microphone preferences. The handlers live in
+    // `settings-routes.ts` so this router stays a router; they answer their own
+    // 400s. Without the deps (console-only test doubles) the routes are absent.
+    if (isSettingsPath(pathname)) {
+      const settings = this.options.deps.settings
+      if (settings === undefined) {
+        sendError(response, 404, 'the settings service is not available')
+        return
+      }
+      await handleSettingsRequest(request, response, settings)
       return
     }
 
@@ -964,12 +1228,12 @@ export class DashboardServer {
     }
 
     if (request.method === 'GET' && pathname === '/api/snapshot') {
-      sendJson(response, 200, this.options.deps.snapshot())
+      sendJson(response, 200, this.snapshotPayload())
       return
     }
 
     if (request.method === 'GET' && pathname === '/api/waveforms') {
-      sendJson(response, 200, this.options.deps.listWaveforms())
+      sendJson(response, 200, this.waveformPayload())
       return
     }
 
@@ -1004,7 +1268,7 @@ export class DashboardServer {
       sendJson(response, 200, {
         device,
         devices: this.options.deps.listDevices(),
-        snapshot: this.options.deps.snapshot(),
+        snapshot: this.snapshotPayload(),
       })
       return
     }
@@ -1012,7 +1276,7 @@ export class DashboardServer {
     if (request.method === 'POST' && pathname === '/api/devices/remove') {
       const body = await readJsonBody(request)
       await this.options.deps.removeDevice(asString(body.key, ''))
-      sendJson(response, 200, { devices: this.options.deps.listDevices(), snapshot: this.options.deps.snapshot() })
+      sendJson(response, 200, { devices: this.options.deps.listDevices(), snapshot: this.snapshotPayload() })
       return
     }
 
@@ -1020,28 +1284,38 @@ export class DashboardServer {
       const body = await readJsonBody(request)
       const channel = body.channel === 'setup' ? 'setup' : 'live'
       await this.options.deps.rawWrite(asString(body.deviceId, ''), asString(body.hex, ''), channel)
-      sendJson(response, 200, this.options.deps.snapshot())
+      sendJson(response, 200, this.snapshotPayload())
       return
     }
 
     if (request.method === 'POST' && pathname === '/api/panic') {
       const body = await readJsonBody(request)
       await this.options.deps.panic(asString(body.source, 'web-ui'))
-      sendJson(response, 200, this.options.deps.snapshot())
+      sendJson(response, 200, this.snapshotPayload())
       return
     }
 
     if (request.method === 'POST' && pathname === '/api/unlock') {
       await this.options.deps.unlock(asOptionalString(await readJsonBody(request).then(body => body.note)))
-      sendJson(response, 200, this.options.deps.snapshot())
+      sendJson(response, 200, this.snapshotPayload())
       return
     }
 
     if (request.method === 'POST' && pathname === '/api/cap') {
       const body = await readJsonBody(request)
-      const patch = asPolicyPatch(body.patch)
-      if (patch === undefined) {
-        sendError(response, 400, 'patch must set minPercent, maxPercent, minFreq, maxFreq, or maxDurationSec')
+      let patch: Partial<ChannelPolicy>
+      try {
+        // A one-sided Hz patch needs the current band, so conversion reads the
+        // raw snapshot; the response below is the decorated one.
+        patch = capPatchFromBody(body, this.options.deps.snapshot())
+      } catch (error) {
+        // 任一已知字段非法就整条 patch 拒绝（含 Hz/编码字段混用、Hz 越界）：
+        // 边界是安全状态，不能部分生效。
+        sendJson(response, 400, {
+          ok: false,
+          error: error instanceof Error ? error.message : 'invalid cap patch',
+          code: 'INVALID_POLICY',
+        })
         return
       }
       try {
@@ -1049,10 +1323,14 @@ export class DashboardServer {
       } catch (error) {
         // A malformed interval (min >= max, out of range) is a client error:
         // say which bound is wrong instead of turning it into a 500.
+        if (isSafetyError(error)) {
+          sendJson(response, 400, { ok: false, error: error.message, code: error.code })
+          return
+        }
         sendError(response, 400, error instanceof Error ? error.message : 'policy patch refused')
         return
       }
-      sendJson(response, 200, this.options.deps.snapshot())
+      sendJson(response, 200, this.snapshotPayload())
       return
     }
 
@@ -1086,35 +1364,35 @@ export class DashboardServer {
         sendError(response, 400, error instanceof Error ? error.message : 'level command refused')
         return
       }
-      sendJson(response, 200, this.options.deps.snapshot())
+      sendJson(response, 200, this.snapshotPayload())
       return
     }
 
     if (request.method === 'POST' && pathname === '/api/demo') {
       const body = await readJsonBody(request)
       await this.options.deps.demo(asString(body.deviceId, ''), asString(body.channelId, ''))
-      sendJson(response, 200, this.options.deps.snapshot())
+      sendJson(response, 200, this.snapshotPayload())
       return
     }
 
     if (request.method === 'POST' && pathname === '/api/stop') {
       const body = await readJsonBody(request)
       await this.options.deps.stop(asOptionalString(body.deviceId), asOptionalString(body.channelId))
-      sendJson(response, 200, this.options.deps.snapshot())
+      sendJson(response, 200, this.snapshotPayload())
       return
     }
 
     if (request.method === 'POST' && pathname === '/api/connect') {
       const body = await readJsonBody(request)
       await this.options.deps.connect(asString(body.deviceId, ''))
-      sendJson(response, 200, this.options.deps.snapshot())
+      sendJson(response, 200, this.snapshotPayload())
       return
     }
 
     if (request.method === 'POST' && pathname === '/api/scan') {
       const body = await readJsonBody(request)
       await this.options.deps.scan(asString(body.deviceId, ''), asNumber(body.durationMs, 5_000))
-      sendJson(response, 200, this.options.deps.snapshot())
+      sendJson(response, 200, this.snapshotPayload())
       return
     }
 
@@ -1127,13 +1405,14 @@ export class DashboardServer {
       }
       const parsed = frames.split(/[\s,]+/u).filter(frame => frame.length > 0)
       const imported = await this.options.deps.importWaveform(asString(body.name, ''), parsed)
-      sendJson(response, 200, { imported, waveforms: this.options.deps.listWaveforms() })
+      sendJson(response, 200, { imported, waveforms: this.waveformPayload() })
       return
     }
 
     if (request.method === 'POST' && pathname === '/api/waveforms/promote') {
       const body = await readJsonBody(request)
-      sendJson(response, 200, { waveforms: await this.options.deps.promoteWaveform(asString(body.id, '')) })
+      const promoted = await this.options.deps.promoteWaveform(asString(body.id, ''))
+      sendJson(response, 200, { waveforms: this.waveformPayload(promoted) })
       return
     }
 
@@ -1144,7 +1423,7 @@ export class DashboardServer {
         asString(body.channelId, ''),
         asOptionalString(body.waveformId),
       )
-      sendJson(response, 200, this.options.deps.snapshot())
+      sendJson(response, 200, this.snapshotPayload())
       return
     }
 
@@ -1164,7 +1443,7 @@ export class DashboardServer {
         envelope,
         durationSec,
       )
-      sendJson(response, 200, this.options.deps.snapshot())
+      sendJson(response, 200, this.snapshotPayload())
       return
     }
 

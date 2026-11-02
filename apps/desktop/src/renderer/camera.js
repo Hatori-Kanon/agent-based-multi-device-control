@@ -18,6 +18,15 @@ const WIDTH = 32
 const HEIGHT = 24
 /** JPEG quality for look snapshots: readable, not a transport burden. */
 const JPEG_QUALITY = 0.7
+/**
+ * Fixed microphone gain applied to the normalised RMS level.
+ *
+ * Calibrated so ordinary speech lands around 10-40% and loud room noise clips
+ * at 100%. The gain is deliberately constant (never auto-adjusted): a quiet
+ * room and a loud room must produce different numbers, otherwise the feature
+ * would describe the gain, not the room.
+ */
+const AUDIO_GAIN = 400
 
 const host = window.__cameraHost
 const video = document.getElementById('video')
@@ -31,6 +40,13 @@ let motionState = undefined
 let lastFrameAt = 0
 let sawAFrame = false
 let watchingFrames = false
+
+// Microphone state (the settings page's 麦克风 source). Kept separate from the
+// camera stream: either one can be started/stopped without touching the other.
+let audioStream = null
+let audioContext = null
+let audioAnalyser = null
+let audioBuffer = null
 
 host?.diag('camera worker loaded')
 
@@ -208,6 +224,123 @@ window.__camera = {
 
   stop() {
     releaseStream()
+    return true
+  },
+}
+
+// ── 麦克风 ────────────────────────────────────────────────────────────────
+// Same worker window, second capture path (the settings page's microphone).
+// getUserMedia + AudioContext exist only in a renderer, so the RMS level is
+// computed here and the main process's `AudioHost` polls it at 2 Hz:
+//
+//     window.__audio.listDevices() -> [{deviceId, label}]
+//     window.__audio.start(deviceId) -> true
+//     window.__audio.sample()      -> 0-100 level, or null without analyser data
+//     window.__audio.stop()        -> true
+//
+// The level is normalised RMS × AUDIO_GAIN, clamped to 0-100; it describes how
+// loud the room is, never what was said (no speech content leaves this page).
+function releaseAudio() {
+  if (audioStream !== null) {
+    for (const track of audioStream.getTracks()) {
+      try { track.stop() } catch { /* already gone */ }
+    }
+    audioStream = null
+  }
+  if (audioContext !== null) {
+    try { void audioContext.close() } catch { /* already closed */ }
+    audioContext = null
+  }
+  audioAnalyser = null
+  audioBuffer = null
+}
+
+window.__audio = {
+  /** Audio inputs, in platform order. Labels are empty before permission. */
+  async listDevices() {
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.enumerateDevices !== 'function') return []
+    let devices
+    try {
+      devices = await navigator.mediaDevices.enumerateDevices()
+    } catch (error) {
+      host?.diag(`enumerateDevices (audio) failed: ${describe(error)}`)
+      return []
+    }
+    return devices
+      .filter(device => device.kind === 'audioinput')
+      .map((device, index) => ({
+        deviceId: device.deviceId,
+        label: device.label || `麦克风 ${index + 1}`,
+      }))
+  },
+
+  async start(deviceId) {
+    releaseAudio()
+    // An empty id means the platform has not revealed device ids yet; let the
+    // platform pick its default input instead of failing an `exact` constraint.
+    const audioConstraint = typeof deviceId === 'string' && deviceId.length > 0
+      ? { deviceId: { exact: deviceId } }
+      : true
+    let opened
+    try {
+      opened = await navigator.mediaDevices.getUserMedia({ audio: audioConstraint, video: false })
+    } catch (error) {
+      throw new Error(`getUserMedia failed: ${describe(error)}`)
+    }
+    const AudioContextType = window.AudioContext ?? window.webkitAudioContext
+    if (typeof AudioContextType !== 'function') {
+      for (const track of opened.getTracks()) {
+        try { track.stop() } catch { /* already gone */ }
+      }
+      throw new Error('AudioContext is not available in this worker')
+    }
+    audioStream = opened
+    audioContext = new AudioContextType()
+    const source = audioContext.createMediaStreamSource(opened)
+    audioAnalyser = audioContext.createAnalyser()
+    audioAnalyser.fftSize = 1024
+    // A little smoothing stops single-window noise from flickering the level,
+    // while still following speech onsets inside one 500ms sample period.
+    audioAnalyser.smoothingTimeConstant = 0.3
+    source.connect(audioAnalyser)
+    audioBuffer = new Float32Array(audioAnalyser.fftSize)
+    // Hidden windows may start the context suspended; resume() needs no user
+    // gesture in Electron, and a refusal only costs accuracy.
+    if (audioContext.state === 'suspended') {
+      try {
+        await audioContext.resume()
+      } catch (error) {
+        host?.diag(`AudioContext.resume() refused: ${describe(error)}`)
+      }
+    }
+    const track = opened.getAudioTracks()[0]
+    if (track !== undefined) {
+      // A removed input surfaces here on Chromium; this is the authoritative
+      // "capture end" signal, which the main process turns into one
+      // `quality:'unavailable'` sample.
+      track.addEventListener('ended', () => {
+        host?.audioEnded('microphone capture ended (device removed)')
+        releaseAudio()
+      })
+      host?.diag(`microphone started: ${track.label || deviceId || 'default'}`)
+    }
+    return true
+  },
+
+  /** Current level 0-100, or null when nothing is being analysed. */
+  sample() {
+    if (audioAnalyser === null || audioBuffer === null) return null
+    audioAnalyser.getFloatTimeDomainData(audioBuffer)
+    let sum = 0
+    for (let index = 0; index < audioBuffer.length; index += 1) {
+      sum += audioBuffer[index] * audioBuffer[index]
+    }
+    const rms = Math.sqrt(sum / audioBuffer.length)
+    return Math.min(100, Math.max(0, Math.round(rms * AUDIO_GAIN)))
+  },
+
+  stop() {
+    releaseAudio()
     return true
   },
 }

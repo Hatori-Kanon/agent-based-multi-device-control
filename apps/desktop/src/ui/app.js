@@ -9,6 +9,19 @@
 //   - 直控拖动节流 ~120ms，非零时每 5s keepalive 续期；切走视图、页面隐藏、
 //     急停或锁定时立刻停掉 keepalive（切视图/页面隐藏会先发一次 0）。
 //
+// 单位约定（产品要求）：
+//   - 强度按后端原生单位显示与控制：郊狼是 0–200 的「力度」（快照
+//     intensityUnit='strength'，读数不带 %），其它后端仍是 0–100%；
+//   - 频率一律显示物理频率 Hz（快照 minFreqHz/maxFreqHz，1–100），不再出现
+//     协议「编码」；
+//   - API 侧不变：/api/level 仍收 percent（0–100 整数），/api/cap 的强度字段
+//     仍是 minPercent/maxPercent；频率发 minFreqHz/maxFreqHz，由宿主换算成
+//     协议编码。
+//   旧宿主缺新字段时降级为禁用 + 「—」，不会发出越界值。
+//
+// 本文件不渲染也不请求日志 / 审计 / 调试 / 遥测 / 运行时错误面板：这是给
+// 操作者用的产品界面，那些数据只留在宿主与审计文件里。
+//
 // 视图隐藏时（document.body.dataset.view !== 'device'）所有轮询直接返回；
 // `viewchange` 切回设备视图时立即刷新一次。
 
@@ -18,8 +31,11 @@
   const LEVEL_KEEPALIVE_MS = 5000
   /** 单条直控命令的时长上限：取通道 maxDurationSec 与 15 的较小值。 */
   const LEVEL_MAX_DURATION_SEC = 15
-  const MIN_FREQ = 10
-  const MAX_FREQ = 240
+  /** 频率范围的物理域：1–100 Hz（快照缺 minFreqHz/maxFreqHz 时不可用）。 */
+  const MIN_FREQ_HZ = 1
+  const MAX_FREQ_HZ = 100
+  /** percent 后端的强度上限；所有原生值都以它为换算基准。 */
+  const PERCENT_MAX = 100
 
   const el = {
     devConnState: document.getElementById('devConnState'),
@@ -31,44 +47,17 @@
     devAddDialog: document.getElementById('devAddDialog'),
     devAddConfirm: document.getElementById('devAddConfirm'),
     devAddCancel: document.getElementById('devAddCancel'),
-    devLogsToggle: document.getElementById('devLogsToggle'),
-    devLogPanel: document.getElementById('devLogPanel'),
-    devLogs: document.getElementById('devLogs'),
-    devAuditToggle: document.getElementById('devAuditToggle'),
-    devAuditPanel: document.getElementById('devAuditPanel'),
     devWfName: document.getElementById('devWfName'),
     devWfFrames: document.getElementById('devWfFrames'),
     devWfImport: document.getElementById('devWfImport'),
     devWfGrid: document.getElementById('devWfGrid'),
-    devSensors: document.getElementById('devSensors'),
-    devErrorsPanel: document.getElementById('devErrorsPanel'),
-    devErrors: document.getElementById('devErrors'),
     devStatDevices: document.getElementById('devStatDevices'),
     devStatChannels: document.getElementById('devStatChannels'),
-    devDebugToggle: document.getElementById('devDebugToggle'),
-    devDebugPanel: document.getElementById('devDebugPanel'),
-    devDebugProbes: document.getElementById('devDebugProbes'),
-    devRailHome: document.getElementById('devRailHome'),
-    devRailOpenLogs: document.getElementById('devRailOpenLogs'),
-    devRailOpenAudit: document.getElementById('devRailOpenAudit'),
-    devRailOpenDebug: document.getElementById('devRailOpenDebug'),
-    devAudit: document.getElementById('devAudit'),
     err: document.getElementById('err'),
   }
 
   let snapshot = null
   let waveforms = []
-  let logsOpen = false
-  let auditOpen = false
-  /**
-   * Process-local debug switch mirrored in this page.
-   *
-   * Off is the default and the safe state: while it is false the console does
-   * not fetch (and therefore cannot render) a single probe number or resolved
-   * target. The switch lives on the host (`GET/POST /api/debug`); toggling it
-   * never writes audit and never reaches the model.
-   */
-  let debugEnabled = false
   /** Keys of manifest devices: only these get a 移除 button. */
   let managedKeys = new Set()
   /** 正在编辑的通道控件（device:channel:field）。 */
@@ -79,11 +68,6 @@
   // ── 视图 ────────────────────────────────────────────────────────────────
   function isDeviceView() {
     return document.body.dataset.view === 'device'
-  }
-
-  /** 三个遥测面板都收起时显示右栏入口卡；有面板打开时让位。 */
-  function syncRailHome() {
-    el.devRailHome.style.display = logsOpen || auditOpen || debugEnabled ? 'none' : ''
   }
 
   // ── 基础工具 ────────────────────────────────────────────────────────────
@@ -163,12 +147,49 @@
     }
   }
 
+  // ── 强度单位（原生值 <-> 百分比） ───────────────────────────────────────
+  /**
+   * 通道强度的原生单位。
+   *
+   * 郊狼的强度是 0–200 的「力度」（intensityUnit='strength'），其它后端仍是
+   * 0–100%。`scale` 是原生值对百分比的倍数（郊狼 2、其它 1），滑杆的 step
+   * 也用它，这样原生值总是偶数、与整数百分比一一对应，`/api/level` 收的
+   * percent 不需要四舍五入。
+   *
+   * 缺字段时保持旧行为：没有 intensityUnit 就按 percent 显示；没有
+   * intensityMax 时 strength 兜底 200、percent 固定 100。
+   */
+  function intensityUnitOf(channel) {
+    const unit = channel.intensityUnit === 'strength' ? 'strength' : 'percent'
+    const declared = finite(channel.intensityMax)
+    const maxNative = unit === 'strength'
+      ? (declared !== undefined && declared > 0 ? Math.round(declared) : 200)
+      : PERCENT_MAX
+    return { unit, maxNative, scale: maxNative / PERCENT_MAX }
+  }
+
+  /** 原生强度读数：strength 是纯数字（不带 %），percent 带「%」。 */
+  function formatIntensity(native, unit) {
+    return unit === 'strength' ? String(native) : `${native}%`
+  }
+
+  /** 百分比 → 原生值（整数）。 */
+  function toNative(percent, scale) {
+    return Math.round(percent * scale)
+  }
+
+  /** 原生值 → 百分比（整数，/api/level 与 /api/cap 只收 0–100）。 */
+  function toPercent(native, scale) {
+    return Math.round(native / scale)
+  }
+
   // ── 直控（POST /api/level） ──────────────────────────────────────────────
   /**
    * 每个通道的直控状态。
    *
-   * `percent` 是本地意图（命令服务端的绝对值），`sentPercent` 是最后一次
-   * 真正发出的值；两者都在 0 时不再发请求（「0 = 停止」不需要重复续期）。
+   * `percent` 是本地意图（命令服务端的绝对值，永远 0–100），`sentPercent` 是
+   * 最后一次真正发出的值；两者都在 0 时不再发请求（「0 = 停止」不需要重复
+   * 续期）。UI 上的原生读数只是显示层换算，安全语义全部在百分比上进行。
    */
   const levels = new Map()
 
@@ -332,19 +353,25 @@
     input.style.setProperty('--fill', `${Math.min(100, Math.max(0, pct))}%`)
   }
 
-  /** 通道的边界字段；缺失时返回 undefined，由 UI 显示「—」并禁用。 */
+  /**
+   * 通道的边界字段；缺失时返回 undefined，由 UI 显示「—」并禁用。
+   *
+   * 强度字段仍是 minPercent/maxPercent（与 API 一致），频率字段换成宿主给的
+   * 物理频率 minFreqHz/maxFreqHz；旧宿主只给协议编码，这里读不到 Hz 就禁用，
+   * 不再把「编码」暴露给操作者。
+   */
   function capsOf(channel) {
     const minPercent = finite(channel.minPercent)
     const maxPercent = finite(channel.maxPercent)
-    const minFreq = finite(channel.minFreq)
-    const maxFreq = finite(channel.maxFreq)
+    const minFreqHz = finite(channel.minFreqHz)
+    const maxFreqHz = finite(channel.maxFreqHz)
     return {
       minPercent,
       maxPercent,
-      minFreq,
-      maxFreq,
+      minFreqHz,
+      maxFreqHz,
       intensity: minPercent !== undefined && maxPercent !== undefined && maxPercent > minPercent,
-      frequency: minFreq !== undefined && maxFreq !== undefined && maxFreq > minFreq,
+      frequency: minFreqHz !== undefined && maxFreqHz !== undefined && maxFreqHz > minFreqHz,
     }
   }
 
@@ -363,7 +390,6 @@
     const input = document.createElement('input')
     input.type = 'range'
     input.className = 'level-input'
-    input.step = '1'
 
     const readout = document.createElement('span')
     readout.className = 'val level-readout'
@@ -376,7 +402,6 @@
       input.max = '100'
       input.value = '0'
       input.disabled = true
-      rail.setAttribute('title', '宿主尚未提供通道范围；直控暂不可用')
       fill.style.width = '0%'
       readout.textContent = '—'
       rail.append(meter, floor, input)
@@ -384,29 +409,38 @@
       return row
     }
 
-    const minPercent = caps.minPercent
-    const maxPercent = caps.maxPercent
+    // `percent` 是安全语义上的值；滑杆上显示的是原生值（郊狼 0–200）。
+    const { unit, scale } = intensityUnitOf(channel)
+    const { minPercent, maxPercent } = caps
+    const minNative = toNative(minPercent, scale)
+    const maxNative = toNative(maxPercent, scale)
     const actual = finite(channel.percent)
     const commanded = state.percent > 0 ? state.percent : (actual ?? 0)
-    const value = Math.min(maxPercent, Math.max(0, commanded))
+    const value = Math.min(maxNative, Math.max(0, toNative(commanded, scale)))
     input.min = '0'
-    input.max = String(maxPercent)
+    input.max = String(maxNative)
+    // step = scale：郊狼只允许偶数原生值，保证与整数百分比一一对应。
+    input.step = String(scale)
     input.value = String(value)
     input.disabled = locked
-    input.title = `直接控制输出（0 = 停止；有效区间 ${minPercent}%–${maxPercent}%）`
+    input.title = '直控'
     input.setAttribute('aria-label', `${channel.label ?? channel.id ?? '通道'} 直控强度`)
     rail.style.setProperty('--floor', `${(minPercent / maxPercent) * 100}%`)
-    fill.style.width = `${(value / maxPercent) * 100}%`
-    readout.textContent = `${value}%`
+    fill.style.width = `${(value / maxNative) * 100}%`
+    readout.textContent = formatIntensity(value, unit)
 
     const key = `${deviceId}:${channel.id}:level`
     const begin = () => editing.add(key)
     const finish = () => editing.delete(key)
-    const paintLocal = next => {
-      const snapped = next <= 0 ? 0 : Math.max(minPercent, Math.min(maxPercent, next))
-      if (snapped !== next) input.value = String(snapped)
-      fill.style.width = `${(snapped / maxPercent) * 100}%`
-      readout.textContent = `${snapped}%`
+    /** 把滑杆读数夹进有效区间并对齐 step，返回原生值。 */
+    const paintLocal = nextNative => {
+      const rounded = Math.round(nextNative)
+      const snapped = rounded <= 0
+        ? 0
+        : Math.min(maxNative, Math.max(minNative, Math.round(rounded / scale) * scale))
+      if (snapped !== nextNative) input.value = String(snapped)
+      fill.style.width = `${(snapped / maxNative) * 100}%`
+      readout.textContent = formatIntensity(snapped, unit)
       return snapped
     }
     input.addEventListener('focus', begin)
@@ -415,11 +449,11 @@
     input.addEventListener('blur', finish)
     input.addEventListener('input', () => {
       const next = paintLocal(Number(input.value))
-      scheduleLevel(state, next, false)
+      scheduleLevel(state, toPercent(next, scale), false)
     })
     input.addEventListener('change', () => {
       finish()
-      const next = paintLocal(Number(input.value))
+      const next = toPercent(paintLocal(Number(input.value)), scale)
       // 0 必须真的停下来。`sentPercent` 只记录本页发过的值，而正在输出的
       // 可能是模型或另一个客户端（此时 sentPercent 仍是 0），走 flushLevel
       // 的早退会让「拖到 0」静默失效、读数 500ms 后又弹回去。
@@ -452,57 +486,63 @@
     label.textContent = kind === 'intensity' ? '强度范围' : '频率范围'
     wrap.append(label)
 
-    const available = kind === 'intensity' ? caps.intensity : caps.frequency
+    const isIntensity = kind === 'intensity'
+    const available = isIntensity ? caps.intensity : caps.frequency
     if (!available) {
+      // 旧宿主缺 minPercent/maxPercent，或没有物理频率字段：显示 — 并禁用。
       const dash = document.createElement('span')
       dash.className = 'val'
       dash.textContent = '—'
       wrap.append(dash)
-      wrap.title = '宿主尚未提供该通道范围'
       return wrap
     }
 
-    const intensity = kind === 'intensity'
-    const loMin = intensity ? caps.minPercent : caps.minFreq
-    const hiMax = intensity ? caps.maxPercent : caps.maxFreq
-    const floor = intensity ? 0 : MIN_FREQ
-    const ceiling = intensity ? 100 : MAX_FREQ
-    // 强度用百分比，频率用协议编码单位（界面上直接写出来，别只藏在 title 里）。
+    const { unit, scale, maxNative } = intensityUnitOf(channel)
+    // 强度滑杆域是原生值（0–200 / 0–100），频率滑杆域是物理 Hz（1–100）。
+    const loMin = isIntensity ? toNative(caps.minPercent, scale) : caps.minFreqHz
+    const hiMax = isIntensity ? toNative(caps.maxPercent, scale) : caps.maxFreqHz
+    const floor = isIntensity ? 0 : MIN_FREQ_HZ
+    // 上限滑杆的右端是**绝对**满量程，不是当前上限：否则一旦拖低，
+    // 这台设备就再也调不回更高的值（安全边界必须可双向调整）。
+    const ceiling = isIntensity ? maxNative : MAX_FREQ_HZ
+    const step = isIntensity ? scale : 1
     // 读屏器要能回答「这是哪台设备哪个通道的哪一端」，三组滑杆不能同名。
     const deviceName = (snapshot?.devices ?? []).find(device => device.id === deviceId)?.name ?? deviceId
     const channelName = channel.label ?? channel.id ?? '通道'
-    const rangeName = `${deviceName} ${channelName} ${intensity ? '强度' : '频率'}`
+    const rangeName = `${deviceName} ${channelName} ${isIntensity ? '强度' : '频率'}`
 
     const lo = document.createElement('input')
     lo.type = 'range'
     lo.min = String(floor)
-    lo.max = String(hiMax - 1)
-    lo.step = '1'
+    lo.max = String(hiMax - step)
+    lo.step = String(step)
     lo.value = String(loMin)
     lo.disabled = locked
-    lo.title = intensity ? '强度下限（必须小于上限）' : '频率下限（编码单位，必须小于上限）'
+    lo.title = isIntensity ? '强度下限' : '频率下限'
     lo.setAttribute('aria-label', `${rangeName}下限`)
     const hi = document.createElement('input')
     hi.type = 'range'
-    hi.min = String(loMin + 1)
+    hi.min = String(loMin + step)
     hi.max = String(ceiling)
-    hi.step = '1'
+    hi.step = String(step)
     hi.value = String(hiMax)
     hi.disabled = locked
-    hi.title = intensity ? '强度上限（必须大于下限）' : '频率上限（编码单位，必须大于下限）'
+    hi.title = isIntensity ? '强度上限' : '频率上限'
     hi.setAttribute('aria-label', `${rangeName}上限`)
 
     const readout = document.createElement('span')
     readout.className = 'val'
     const key = `${deviceId}:${channel.id}:${kind}`
     const sync = () => {
-      lo.max = String(Number(hi.value) - 1)
-      hi.min = String(Number(lo.value) + 1)
+      lo.max = String(Number(hi.value) - step)
+      hi.min = String(Number(lo.value) + step)
       if (Number(lo.value) > Number(lo.max)) lo.value = lo.max
       if (Number(hi.value) < Number(hi.min)) hi.value = hi.min
       paintRange(lo)
       paintRange(hi)
-      readout.textContent = intensity ? `${lo.value}%–${hi.value}%` : `${lo.value}–${hi.value}（编码）`
+      readout.textContent = isIntensity
+        ? (unit === 'strength' ? `${lo.value}–${hi.value}` : `${lo.value}%–${hi.value}%`)
+        : `${lo.value}–${hi.value} Hz`
     }
     const begin = () => editing.add(key)
     const finish = () => editing.delete(key)
@@ -521,7 +561,10 @@
         body: JSON.stringify({
           deviceId,
           channelId: channel.id,
-          patch: intensity ? { minPercent: Number(lo.value) } : { minFreq: Number(lo.value) },
+          // 强度仍发百分比，频率发物理 Hz，宿主负责换算成协议编码。
+          patch: isIntensity
+            ? { minPercent: toPercent(Number(lo.value), scale) }
+            : { minFreqHz: Number(lo.value) },
         }),
       }))
     })
@@ -533,7 +576,9 @@
         body: JSON.stringify({
           deviceId,
           channelId: channel.id,
-          patch: intensity ? { maxPercent: Number(hi.value) } : { maxFreq: Number(hi.value) },
+          patch: isIntensity
+            ? { maxPercent: toPercent(Number(hi.value), scale) }
+            : { maxFreqHz: Number(hi.value) },
         }),
       }))
     })
@@ -575,10 +620,7 @@
     const title = document.createElement('span')
     title.textContent = channel.label ?? channel.id ?? '通道'
     const small = document.createElement('small')
-    const floorText = finite(channel.outputFloorPercent) !== undefined && channel.outputFloorPercent > 0
-      ? ` · 最小非零≈${channel.outputFloorPercent}%`
-      : ''
-    small.textContent = `${channel.id ?? '—'} · ${channel.kind ?? '通道'}${floorText}`
+    small.textContent = `${channel.id ?? '—'} · ${channel.kind ?? '通道'}`
     name.append(title, small)
 
     const middle = document.createElement('div')
@@ -588,8 +630,11 @@
     const caps = document.createElement('div')
     caps.className = 'caps'
     caps.append(capRange(deviceId, channel, 'intensity', locked))
-    // 频率范围是策略的一部分，所有通道都展示；旧快照缺字段时显示 — 并禁用。
-    caps.append(capRange(deviceId, channel, 'frequency', locked))
+    // 频率范围只对有波形能力的通道有意义（目前只有郊狼）：其它后端根本没有
+    // 波形通道，给一个人拖了也不生效的滑杆属于误导，产品界面上不显示。
+    if (channel.supportsWaveform === true) {
+      caps.append(capRange(deviceId, channel, 'frequency', locked))
+    }
 
     const maxDuration = finite(channel.maxDurationSec)
     const dur = document.createElement('label')
@@ -622,8 +667,8 @@
       caps.append(wfLabel)
     }
 
-    // 运行中的效果给一个标签（预设 + 剩余时间）。没有效果时不再重复输出百分比：
-    // 强度条右侧的读数已经显示当前输出，两个「0%」并排没有信息量。
+    // 运行中的效果给一个标签（预设 + 剩余时间）；没有效果时不重复输出百分比，
+    // 强度条右侧的读数已经显示当前输出。
     const effect = channel.effect
     if (effect !== null && typeof effect === 'object') {
       const state = document.createElement('span')
@@ -639,7 +684,7 @@
     stop.className = 'mini'
     stop.type = 'button'
     stop.textContent = '停止'
-    stop.title = '立即停止该通道输出（0 = 停止）'
+    stop.title = '停止'
     stop.addEventListener('click', () => stopChannel(deviceId, channel.id))
     acts.append(stop)
 
@@ -725,7 +770,7 @@
         remove.textContent = '移除'
         remove.style.color = 'var(--bad)'
         remove.addEventListener('click', async () => {
-          if (!window.confirm(`移除 ${device.name}？输出会立即停止并断开连接。`)) return
+          if (!window.confirm(`移除 ${device.name}？`)) return
           for (const channel of Array.isArray(device.channels) ? device.channels : []) {
             const state = levels.get(`${device.id}:${channel.id}`)
             if (state !== undefined) releaseLevel(state, false)
@@ -747,7 +792,7 @@
       if (channels.length === 0) {
         const empty = document.createElement('div')
         empty.className = 'empty'
-        empty.textContent = device.canScan ? '未发现设备，点「扫描设备」' : '无可用通道'
+        empty.textContent = device.canScan ? '未发现设备' : '无可用通道'
         card.append(header, empty)
         return card
       }
@@ -758,7 +803,7 @@
     if (cards.length === 0) {
       const empty = document.createElement('div')
       empty.className = 'empty'
-      empty.textContent = '还没有设备。用左栏「添加设备」选择协议后手动连接。'
+      empty.textContent = '还没有设备'
       el.devDevices.replaceChildren(empty)
       return
     }
@@ -777,7 +822,7 @@
     if (waveforms.length === 0) {
       const empty = document.createElement('div')
       empty.className = 'empty'
-      empty.textContent = '还没有波形：粘贴帧序列导入，或让 agent 在会话里创作后「存入库」。'
+      empty.textContent = '还没有波形'
       el.devWfGrid.replaceChildren(empty)
       return
     }
@@ -794,9 +839,16 @@
       scope.textContent = entry.scope === 'session' ? '会话' : '库'
       row1.append(name, scope)
 
+      // 频率显示物理 Hz（宿主把波形帧的协议编码换算成 minFreqHz/maxFreqHz）；
+      // 旧宿主没有这两个字段时显示 —，不再退回「编码」。
+      const minHz = finite(entry.minFreqHz)
+      const maxHz = finite(entry.maxFreqHz)
+      const freqText = minHz !== undefined && maxHz !== undefined
+        ? `频率 ${Math.round(minHz)}–${Math.round(maxHz)} Hz`
+        : '频率 —'
       const meta = document.createElement('div')
       meta.className = 'meta'
-      meta.textContent = `${(entry.durationMs / 1000).toFixed(1)}s · 峰值 ${entry.peakIntensity} · 频率 ${entry.minFreq}-${entry.maxFreq}`
+      meta.textContent = `${(entry.durationMs / 1000).toFixed(1)}s · 峰值 ${entry.peakIntensity} · ${freqText}`
       const tags = document.createElement('div')
       tags.className = 'tags'
       for (const tag of entry.tags) {
@@ -823,175 +875,6 @@
     }))
   }
 
-  async function renderAudit() {
-    if (!auditOpen || !isDeviceView()) return
-    try {
-      const records = await api('/api/audit')
-      if (records.length === 0) {
-        const empty = document.createElement('div')
-        empty.className = 'hint'
-        empty.textContent = '（暂无审计记录）'
-        el.devAudit.replaceChildren(empty)
-        return
-      }
-      el.devAudit.replaceChildren(...records.slice().reverse().map(record => {
-        const line = document.createElement('div')
-        line.className = `r-${record.result ?? 'ok'} a-${record.actor ?? 'system'}`
-        const time = (record.ts ?? '').slice(11, 19)
-        const extra = record.reason ? ` — ${record.reason}` : ''
-        line.textContent = `${time} [${record.actor}] ${record.action} ${record.result}${extra}`
-        return line
-      }))
-    } catch (error) {
-      fail(error.message ?? String(error))
-    }
-  }
-
-  async function renderLogs() {
-    if (!logsOpen || !isDeviceView()) return
-    try {
-      const body = await api('/api/logs')
-      const lines = body.lines ?? []
-      if (lines.length === 0) {
-        const empty = document.createElement('div')
-        empty.className = 'hint'
-        empty.textContent = '（暂无日志）'
-        el.devLogs.replaceChildren(empty)
-      } else {
-        // 逐行一个 div，才能命中 style.css 里 .log > div 的等宽折行样式。
-        el.devLogs.replaceChildren(...lines.map(line => {
-          const row = document.createElement('div')
-          row.textContent = line
-          return row
-        }))
-      }
-      el.devLogs.scrollTop = el.devLogs.scrollHeight
-    } catch {
-      // The log panel must never take the console down with it.
-    }
-  }
-
-  async function renderErrors() {
-    if (!isDeviceView()) return
-    try {
-      const records = await api('/api/errors')
-      if (!records || records.length === 0) {
-        el.devErrorsPanel.style.display = 'none'
-        return
-      }
-      el.devErrorsPanel.style.display = ''
-      el.devErrors.replaceChildren(...records.slice().reverse().map(record => {
-        const line = document.createElement('div')
-        const time = new Date(record.ts).toLocaleTimeString()
-        line.textContent = `[${time}] ${record.message}`
-        return line
-      }))
-    } catch {
-      // The errors panel must never take the console down with it.
-    }
-  }
-
-  /** Availability/quality wording; no measured value ever appears here. */
-  const QUALITY_TEXT = {
-    ok: '可用', dim: '偏暗', bright: '过亮', blocked: '被遮挡', stale: '过旧', unavailable: '不可用',
-  }
-  const QUALITY_CLASS = {
-    ok: 'q-ok', dim: 'q-warn', bright: 'q-warn', blocked: 'q-bad', stale: 'q-warn', unavailable: 'q-bad',
-  }
-
-  function renderSensors(sources) {
-    if (!Array.isArray(sources) || sources.length === 0) {
-      const empty = document.createElement('span')
-      empty.className = 'hint'
-      empty.textContent = '未注册感知源'
-      el.devSensors.replaceChildren(empty)
-      return
-    }
-    el.devSensors.replaceChildren(...sources.map(source => {
-      const row = document.createElement('div')
-      row.className = 'sensor-row'
-      const label = document.createElement('span')
-      // 只显示源 id/kind 与质量词：默认控制台从不显示数值特征、probe 差值或解析命令。
-      label.textContent = `${source.id} · ${source.kind}`
-      const quality = document.createElement('span')
-      quality.className = QUALITY_CLASS[source.quality] ?? 'q-warn'
-      quality.textContent = QUALITY_TEXT[source.quality] ?? String(source.quality)
-      row.append(label, quality)
-      return row
-    }))
-  }
-
-  async function refreshSensors() {
-    if (!isDeviceView()) return
-    try {
-      const body = await api('/api/sensors')
-      renderSensors(body.sources ?? [])
-    } catch {
-      // The perception panel must never take the console down with it.
-    }
-  }
-
-  /** One debug row: probe numbers plus the resolved target it was dispatched to. */
-  function probeLine(probe) {
-    const row = document.createElement('div')
-    const delta = probe.delta
-      ? `Δ运动 ${Number(probe.delta.motion).toFixed(3)} · Δ音频 ${Number(probe.delta.audioPct).toFixed(1)}%`
-      : 'Δ 不可比'
-    const resolved = (probe.targets ?? [])
-      .map(target => `${target.deviceId}:${target.channelId}`)
-      .join(', ')
-    row.textContent = `${probe.probeId} · ${probe.beatId}/${probe.intentId} · ${probe.verdict} · 方向 ${probe.direction} · 幅度 ${probe.magnitude} · ${delta} · 解析 ${resolved || '无目标'}`
-    return row
-  }
-
-  function applyDebugState(enabled) {
-    debugEnabled = enabled === true
-    el.devDebugToggle.classList.toggle('active', debugEnabled)
-    el.devDebugToggle.setAttribute('aria-pressed', debugEnabled ? 'true' : 'false')
-    syncRailHome()
-  }
-
-  async function renderDebugProbes() {
-    if (!debugEnabled || !isDeviceView()) {
-      // Off means off: no request, no DOM nodes above this one, nothing to
-      // screenshot or copy out of the page by accident.
-      if (!debugEnabled) {
-        el.devDebugProbes.replaceChildren()
-        el.devDebugPanel.style.display = 'none'
-      }
-      return
-    }
-    el.devDebugPanel.style.display = ''
-    try {
-      const probes = await api('/api/debug/probes')
-      if (!debugEnabled) return
-      if (!Array.isArray(probes) || probes.length === 0) {
-        const empty = document.createElement('div')
-        empty.className = 'hint'
-        empty.textContent = '（暂无已结算的 probe）'
-        el.devDebugProbes.replaceChildren(empty)
-        return
-      }
-      el.devDebugProbes.replaceChildren(...probes.slice().reverse().map(probeLine))
-    } catch (error) {
-      // 另一个控制台把调试关掉时服务器返回 403：本页要跟着关，而不是每 2 秒刷一次错误。
-      if (error.status === 403) {
-        applyDebugState(false)
-        return
-      }
-      fail(error.message ?? String(error))
-    }
-  }
-
-  async function syncDebug() {
-    try {
-      applyDebugState((await api('/api/debug')).enabled)
-    } catch {
-      applyDebugState(false)
-    }
-    await renderDebugProbes()
-  }
-
   // ── 添加设备弹窗 ────────────────────────────────────────────────────────
   function openAddDialog() {
     el.devAddDialog.style.display = 'flex'
@@ -1014,8 +897,9 @@
     if (event.key === 'Escape') closeAddDialog()
   })
   el.devAddConfirm.addEventListener('click', async () => {
-    const checked = document.querySelector('input[name="addProto"]:checked')
-    const protocol = checked ? checked.value : 'coyote'
+    // 协议只来自对话框里被选中的单选项；没有选中时退回郊狼。
+    const checked = el.devAddDialog.querySelector('input[name="addProto"]:checked')
+    const protocol = checked !== null ? checked.value : 'coyote'
     closeAddDialog()
     try {
       const result = await api('/api/devices', {
@@ -1042,29 +926,6 @@
     }
   })
 
-  el.devLogsToggle.addEventListener('click', () => {
-    logsOpen = !logsOpen
-    el.devLogPanel.style.display = logsOpen ? '' : 'none'
-    el.devLogsToggle.classList.toggle('active', logsOpen)
-    el.devLogsToggle.setAttribute('aria-pressed', logsOpen ? 'true' : 'false')
-    syncRailHome()
-    if (logsOpen) renderLogs()
-  })
-
-  el.devAuditToggle.addEventListener('click', () => {
-    auditOpen = !auditOpen
-    el.devAuditPanel.style.display = auditOpen ? '' : 'none'
-    el.devAuditToggle.classList.toggle('active', auditOpen)
-    el.devAuditToggle.setAttribute('aria-pressed', auditOpen ? 'true' : 'false')
-    syncRailHome()
-    if (auditOpen) renderAudit()
-  })
-
-  // 右栏入口卡只是顶栏开关的快捷方式，不改变任何面板语义。
-  el.devRailOpenLogs.addEventListener('click', () => el.devLogsToggle.click())
-  el.devRailOpenAudit.addEventListener('click', () => el.devAuditToggle.click())
-  el.devRailOpenDebug.addEventListener('click', () => el.devDebugToggle.click())
-
   el.devWfImport.addEventListener('click', async () => {
     try {
       await call(api('/api/waveforms/import', {
@@ -1072,19 +933,6 @@
         body: JSON.stringify({ name: el.devWfName.value.trim(), frames: el.devWfFrames.value }),
       }))
       el.devWfFrames.value = ''
-    } catch (error) {
-      fail(error.message ?? String(error))
-    }
-  })
-
-  el.devDebugToggle.addEventListener('click', async () => {
-    try {
-      const state = await api('/api/debug', {
-        method: 'POST',
-        body: JSON.stringify({ enabled: !debugEnabled }),
-      })
-      applyDebugState(state.enabled)
-      await renderDebugProbes()
     } catch (error) {
       fail(error.message ?? String(error))
     }
@@ -1120,18 +968,10 @@
     }
   }
 
-  /** 切到设备视图时立即拉一次全部面板，不等下一个轮询窗口。 */
+  /** 切到设备视图时立即拉一次快照与波形库，不等下一个轮询窗口。 */
   async function activateDevice() {
     closeAddDialog()
-    await Promise.all([
-      refresh(),
-      refreshSensors(),
-      renderErrors(),
-      syncDebug(),
-      loadWaveforms(),
-    ])
-    if (auditOpen) await renderAudit()
-    if (logsOpen) await renderLogs()
+    await Promise.all([refresh(), loadWaveforms()])
   }
 
   window.addEventListener('viewchange', event => {
@@ -1164,17 +1004,12 @@
     if (token.length < 16) {
       el.devConnState.textContent = '缺少 token'
       el.devConnState.className = 'pill bad'
-      fail('URL 缺少 token 参数；请从启动日志打开应用地址')
+      fail('URL 缺少 token 参数；请从启动窗口打开应用地址')
       return
     }
     // 设备视图默认隐藏：先把轮询装上（回调里会检查视图），当前就在设备视图
     // 时才立即拉一次，避免游玩视图启动时白跑一整轮请求。
     setInterval(() => { void refresh() }, 500)
-    setInterval(() => { void renderAudit() }, 3_000)
-    setInterval(() => { void renderErrors() }, 3_000)
-    setInterval(() => { void renderLogs() }, 2_000)
-    setInterval(() => { void refreshSensors() }, 3_000)
-    setInterval(() => { void renderDebugProbes() }, 2_000)
     if (isDeviceView()) await activateDevice()
   })()
 })()

@@ -1,25 +1,24 @@
-// 单窗口视图切换（v3）。只做三件事：切 nav、显隐两个 <section>、记住当前
+// 单窗口视图切换（v3）。只做三件事：切 nav、显隐三个 <section>、记住当前
 // 视图（sessionStorage + 地址栏），供刷新后回到上次的位置。
 //
 // 约束（`设备范围与单窗口界面-设计说明.md` §4）：这里只允许使用
 // sessionStorage，而且读/写都必须包 try/catch —— 隐私模式或 file:// 下
 // 访问存储可能直接抛异常，不能因此让整个应用页起不来。
 //
-// 地址栏同步：`/play`、`/device` 都是同一页的别名，`show()` 用
+// 地址栏同步：`/play`、`/device`、`/settings` 都是同一页的别名，`show()` 用
 // history.replaceState 把路径改成当前视图（保留 ?token=）。这样「深链」与
 // 「刷新后回到刚才的视图」同时成立，不会出现路径与存储互相打回对方的循环。
 //
-// 切视图时派发 `viewchange`（detail.view = 'play' | 'device'）：play.js 与
-// app.js 监听它，离开时停掉自己的高频轮询（各自在 refresh 前检查
+// 切视图时派发 `viewchange`（detail.view = 'play' | 'device' | 'settings'）：
+// play.js 与 app.js 监听它，离开时停掉自己的高频轮询（各自在 refresh 前检查
 // document.body.dataset.view），切回时立即刷新一次。
 (() => {
   const STORAGE_KEY = 'embodied.view'
-  const VIEWS = ['play', 'device']
+  const VIEWS = ['play', 'device', 'settings']
   const DEFAULT_VIEW = 'play'
 
   const sections = Array.from(document.querySelectorAll('section[data-view]'))
   const tabs = Array.from(document.querySelectorAll('[data-view-target]'))
-  const label = document.getElementById('viewLabel')
 
   /** 读取 sessionStorage 里记住的视图；任何异常都当作没有记录。 */
   function rememberedView() {
@@ -31,11 +30,12 @@
     }
   }
 
-  /** 路径 → 视图（`/device`、`/play` 是深链入口）。 */
+  /** 路径 → 视图（`/device`、`/settings`、`/play` 都是深链入口）。 */
   function pathView() {
     try {
       const path = window.location.pathname.replace(/\/+$/u, '')
       if (path === '/device') return 'device'
+      if (path === '/settings') return 'settings'
       if (path === '/play') return 'play'
     } catch {
       // 取不到 pathname 就退回默认
@@ -60,11 +60,14 @@
     }
   }
 
+  /** 视图 → 地址栏路径（`/play` 是默认视图的规范路径）。 */
+  const VIEW_PATHS = { play: '/play', device: '/device', settings: '/settings' }
+
   /** 地址栏跟随当前视图（保留 search，也就是 token）。 */
   function syncPath(view) {
     try {
       const url = new URL(window.location.href)
-      const target = view === 'device' ? '/device' : '/play'
+      const target = VIEW_PATHS[view] ?? VIEW_PATHS[DEFAULT_VIEW]
       if (url.pathname !== target) {
         url.pathname = target
         window.history.replaceState({}, '', url)
@@ -92,7 +95,6 @@
       tab.classList.toggle('active', active)
       tab.setAttribute('aria-pressed', active ? 'true' : 'false')
     }
-    if (label !== null) label.textContent = view === 'device' ? '设备' : '游玩'
     current = view
   }
 
@@ -111,7 +113,7 @@
 
   // 初始视图（不派发 viewchange：play.js/app.js 还没接线，它们会读
   // document.body.dataset.view 决定首次启动要不要立刻拉数据）。地址栏只在
-  // 它已经是 /play 或 /device 深链时才跟随，避免把 `/` 改写成 `/play`。
+  // 它已经是 /play、/device 或 /settings 深链时才跟随，避免把 `/` 改写成 `/play`。
   const initial = initialView()
   paint(initial)
   if (pathView() !== undefined) syncPath(initial)

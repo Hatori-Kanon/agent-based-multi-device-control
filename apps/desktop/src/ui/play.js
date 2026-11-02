@@ -3,12 +3,14 @@
 // 请求头里 —— 不落本地存储、不写 DOM 文本、不进日志。
 //
 // 可见性规则（`导演与写作上下文契约.md`）：本视图只渲染玩家能看见的内容 ——
-// 台词、选项、阶段、时间；感知源只显示「可用/质量」；probe 数值与解析目标
-// 只在调试开关打开后才请求与显示。v3 的「软上限」是人类自己持有的边界，
-// 所以按 `设备范围与单窗口界面-设计说明.md` §3.3 在大厅与右轨直接可见、可改。
+// 台词、选项、阶段、时间。v3 的「软上限」是人类自己持有的边界，所以按
+// `设备范围与单窗口界面-设计说明.md` §3.3 在大厅与右轨直接可见、可改。
+// 强度按通道的原生单位显示（Coyote 0-200，其它 0-100%），频率显示物理 Hz；
+// 单位元数据由宿主快照给出，缺强度元数据时按百分比降级，读不到 Hz 则该行
+// 显示「—」并禁用。
 //
-// 轮询 2Hz：会话与台词每 500ms，设备/部位与软上限每 2s，感知每 3s。设备视图
-// 打开时（document.body.dataset.view === 'device'）本视图停止轮询；切回时
+// 轮询 2Hz：会话与台词每 500ms，设备/部位与软上限每 2s，内容包每 30s。设备/
+// 设置视图打开时（document.body.dataset.view !== 'play'）本视图停止轮询；切回时
 // `viewchange` 监听器立即刷新一次。所有失败都在页面上显示可读错误，不往
 // console 裸奔。
 
@@ -20,7 +22,6 @@
   const el = {
     conn: document.getElementById('conn'),
     panic: document.getElementById('panic'),
-    debugToggle: document.getElementById('debugToggle'),
     lockBanner: document.getElementById('lockBanner'),
     unlock: document.getElementById('unlock'),
     err: document.getElementById('err'),
@@ -30,7 +31,6 @@
     pause: document.getElementById('pause'),
     resume: document.getElementById('resume'),
     end: document.getElementById('end'),
-    startHint: document.getElementById('startHint'),
     lobby: document.getElementById('lobby'),
     sessionView: document.getElementById('sessionView'),
     sessionState: document.getElementById('sessionState'),
@@ -48,11 +48,8 @@
     send: document.getElementById('send'),
     status: document.getElementById('status'),
     devices: document.getElementById('devices'),
-    sensors: document.getElementById('sensors'),
     softCapsLobby: document.getElementById('softCapsLobby'),
     softCapsRail: document.getElementById('softCapsRail'),
-    debugPanel: document.getElementById('debugPanel'),
-    debugProbes: document.getElementById('debugProbes'),
     holdOverlay: document.getElementById('holdOverlay'),
     holdFill: document.getElementById('holdFill'),
   }
@@ -81,7 +78,6 @@
   let choiceSignature = '\u0000init'
   let deviceSignature = ''
   let packSignature = '\u0000init'
-  let debugEnabled = false
   /** A player action (start/message/choice/control) is in flight. */
   let busy = false
   let polling = false
@@ -110,23 +106,6 @@
     peak: '高峰',
     resolve: '收束',
     aftercare: '照料',
-  }
-  /** Availability/quality wording only; no measured value ever appears here. */
-  const QUALITY_TEXT = {
-    ok: '可用',
-    dim: '偏暗',
-    bright: '过亮',
-    blocked: '被遮挡',
-    stale: '过旧',
-    unavailable: '不可用',
-  }
-  const QUALITY_CLASS = {
-    ok: 'q-ok',
-    dim: 'q-warn',
-    bright: 'q-warn',
-    blocked: 'q-bad',
-    stale: 'q-warn',
-    unavailable: 'q-bad',
   }
   const LIFECYCLE_TEXT = {
     ready: '已连接',
@@ -283,7 +262,7 @@
     const lastLine = inSession && typeof current.lastLine === 'string' ? current.lastLine : ''
     const pendingShown = !ended && lastLine === '' ? pendingLine : ''
     const line = ended
-      ? '本局已结束。台词与选择已经留在下面的对话流里；要再开一局需要重启宿主。'
+      ? '已结束'
       : (lastLine !== '' ? lastLine : (pendingShown !== '' ? pendingShown : (inSession ? '（本回合还没有台词）' : '（尚未开局）')))
     // 只在内容真的变化时写 DOM：这个节点是 aria-live，重复赋值会让读屏器反复播报同一句。
     if (el.currentLine.textContent !== line) el.currentLine.textContent = line
@@ -300,7 +279,6 @@
     renderChoices(current === null ? undefined : current.choices)
     renderLock()
     renderControls()
-    renderStartHint()
   }
 
   /** 时间只进舞台头和状态卡；台词区不重复显示。 */
@@ -340,36 +318,17 @@
     if (el.sessionState.textContent !== text) el.sessionState.textContent = text
   }
 
-  /** One readable line under the start bar: why "开始" is (not) available. */
-  function renderStartHint() {
-    if (session === null) {
-      el.startHint.textContent = el.packSelect.value === ''
-        ? '没有可用的内容包：请先在设备视图导入并激活一个包。'
-        : '点「开局」后会以已激活版本的内容包开一局；各通道的强度/频率范围沿用「软上限」里的设置。'
-      return
-    }
-    el.startHint.textContent = session.state === 'ended'
-      ? '本局已结束：一次只能跑一局，重开需要重启宿主。'
-      : '本局进行中：一次只能跑一局；「结束」后需重启宿主才能再开。'
-  }
-
   /**
    * 右轨只放「本局」信息：阶段与时间已经在舞台头，重复一遍会把视线拆成两处。
-   * 边界是安全信息，必须一直在。
    */
   function statusNodes(current) {
     const pairs = current === null
-      ? [['状态', '未开局'], ['内容包', '—'], ['边界', '—']]
+      ? [['状态', '未开局'], ['内容包', '—']]
       : [
           ['状态', `${stateText(current.state)}${current.mustResolve === true ? '（下一回合收束）' : ''}`],
           ['内容包', typeof current.packId === 'string' && current.packId !== ''
             ? `${current.packId} @ ${current.packVersion ?? '?'}`
             : '—'],
-          // D-6: a pack may declare no boundaries; say so instead of leaving
-          // the player to assume the pack has none in force.
-          ['边界', Array.isArray(current.boundaries) && current.boundaries.length > 0
-            ? current.boundaries.join('、')
-            : '使用全局边界'],
         ]
     return pairs.flatMap(([label, value]) => {
       const dt = document.createElement('dt')
@@ -407,17 +366,15 @@
     el.message.disabled = !sendable
     el.send.disabled = !sendable
     for (const button of el.choices.querySelectorAll('button')) button.disabled = !sendable
-    el.message.placeholder = sendable
-      ? '说点什么…（Enter 发送，Shift+Enter 换行）'
-      : notSendableReason(state, running, locked)
+    el.message.placeholder = sendable ? '说点什么…' : notSendableReason(state, running, locked)
   }
 
   function notSendableReason(state, running, locked) {
-    if (!running) return '开局后可以发言…'
-    if (locked || state === 'locked') return '输出已锁定：解锁后可以发言…'
-    if (state === 'paused') return '已暂停：点「继续」后可以发言…'
-    if (state === 'ended') return '本局已结束…'
-    if (state === 'ending') return '本局正在收尾…'
+    if (!running) return '开局后可发言'
+    if (locked || state === 'locked') return '输出已锁定'
+    if (state === 'paused') return '已暂停'
+    if (state === 'ended') return '已结束'
+    if (state === 'ending') return '收尾中…'
     return '请稍候…'
   }
 
@@ -478,7 +435,7 @@
   }
 
   function resetStream() {
-    el.lines.replaceChildren(hintNode('（台词会依次累积在这里）'))
+    el.lines.replaceChildren(hintNode('还没有台词'))
     el.choicesPanel.style.display = 'none'
     el.choices.replaceChildren()
     lastTurnId = 0
@@ -501,7 +458,6 @@
       const button = document.createElement('button')
       button.type = 'button'
       button.className = 'choice'
-      button.title = '点选即是一句玩家发言'
       const number = document.createElement('span')
       number.className = 'choice-index'
       number.textContent = String(index + 1)
@@ -535,7 +491,7 @@
   function renderDevices() {
     const snap = snapshot
     if (snap === null || !Array.isArray(snap.devices) || snap.devices.length === 0) {
-      el.devices.replaceChildren(hintNode('未连接设备（可在控制台添加模拟设备）'))
+      el.devices.replaceChildren(hintNode('还没有设备'))
       return
     }
     el.devices.replaceChildren(...snap.devices.map(device => {
@@ -572,8 +528,7 @@
     const input = document.createElement('input')
     input.type = 'text'
     input.value = channel.region ?? regions[`${deviceId}:${channel.id}`] ?? ''
-    input.placeholder = '部位（空=全身）'
-    input.title = '输入部位标签后回车或失焦即写入；清空表示移除标签'
+    input.placeholder = '部位'
     input.addEventListener('change', () => { void applyRegion(deviceId, channel.id, input) })
     input.addEventListener('keydown', event => {
       if (event.isComposing || event.keyCode === 229) return
@@ -609,8 +564,16 @@
   // 大厅与舞台右轨各有一个挂载点，内容相同：按 设备 → 通道 列出强度/频率
   // 范围。数据来自 /api/snapshot；修改只由这里的滑杆 change 事件发出，走
   // POST /api/cap（只有人类能改边界，D4 不变）。
-  const MIN_FREQ = 10
-  const MAX_FREQ = 240
+  //
+  // 单位：强度用通道原生单位（DG-LAB Coyote 是 0-200 的「强度」，步进 2；
+  // 其它通道是 0-100%，步进 1），写入时换算回 percent；频率用宿主给出的
+  // 物理频率 Hz（1-100），写入时用 Hz 字段。缺强度元数据时沿用旧行为，按
+  // 百分比显示；旧宿主只给协议编码时读不到 Hz，频率行降级为「—」并禁用 ——
+  // 宁可不显示，也不把协议编码当 Hz 展示。
+  const MIN_FREQ_HZ = 1
+  const MAX_FREQ_HZ = 100
+  /** 百分比的满量程：/api/level 与 /api/cap 的 percent 域。 */
+  const PERCENT_MAX = 100
   /** 正在拖动/聚焦的软上限控件（key = device:channel:kind）。 */
   const capEditing = new Set()
   /** 每个挂载点各自的重绘签名；大厅与右轨互不影响。 */
@@ -629,19 +592,48 @@
     input.style.setProperty('--fill', `${Math.min(100, Math.max(0, pct))}%`)
   }
 
-  /** 通道的四个边界字段；缺失时返回 undefined，由 UI 显示「—」并禁用。 */
+  /**
+   * 通道强度的原生单位。
+   *
+   * Coyote 的强度是 0-200 的「力度」（intensityUnit='strength'），其它后端
+   * 仍是 0-100%。`scale` 是原生值对百分比的倍数（Coyote 2、其它 1），滑杆
+   * 的 step 也用它，于是原生值总与整数百分比一一对应。
+   * 缺字段时保持旧行为：没有 intensityUnit 按 percent 显示；没有
+   * intensityMax 时 strength 兜底 200、percent 固定 100。
+   */
+  function intensityUnitOf(channel) {
+    const unit = channel.intensityUnit === 'strength' ? 'strength' : 'percent'
+    const declared = finite(channel.intensityMax)
+    const maxNative = unit === 'strength'
+      ? (declared !== undefined && declared > 0 ? Math.round(declared) : PERCENT_MAX * 2)
+      : PERCENT_MAX
+    return { unit, maxNative, scale: maxNative / PERCENT_MAX }
+  }
+
+  /**
+   * 一个通道的边界字段。
+   *
+   * 强度：`minPercent/maxPercent`（0-100）是线上的百分比，界面按原生单位
+   * 显示；频率：`minFreqHz/maxFreqHz` 是物理频率，不是协议编码。频率字段
+   * 缺失时该行不可用，由 UI 显示「—」。
+   */
   function capsOf(channel) {
     const minPercent = finite(channel.minPercent)
     const maxPercent = finite(channel.maxPercent)
-    const minFreq = finite(channel.minFreq)
-    const maxFreq = finite(channel.maxFreq)
+    const minFreqHz = finite(channel.minFreqHz)
+    const maxFreqHz = finite(channel.maxFreqHz)
+    const { unit, maxNative, scale } = intensityUnitOf(channel)
     return {
       minPercent,
       maxPercent,
-      minFreq,
-      maxFreq,
+      minFreqHz,
+      maxFreqHz,
+      intensityUnit: unit,
+      intensityMax: maxNative,
+      scale,
       intensity: minPercent !== undefined && maxPercent !== undefined && maxPercent > minPercent,
-      frequency: minFreq !== undefined && maxFreq !== undefined && maxFreq > minFreq,
+      frequency: minFreqHz !== undefined && maxFreqHz !== undefined
+        && minFreqHz >= MIN_FREQ_HZ && maxFreqHz <= MAX_FREQ_HZ && maxFreqHz > minFreqHz,
     }
   }
 
@@ -654,7 +646,16 @@
         name: device.name,
         channels: (Array.isArray(device.channels) ? device.channels : []).map(channel => {
           const caps = capsOf(channel)
-          return [channel.id, channel.label, caps.minPercent, caps.maxPercent, caps.minFreq, caps.maxFreq]
+          return [
+            channel.id,
+            channel.label,
+            caps.minPercent,
+            caps.maxPercent,
+            caps.minFreqHz,
+            caps.maxFreqHz,
+            caps.intensityUnit,
+            caps.intensityMax,
+          ]
         }),
       })),
     })
@@ -679,16 +680,16 @@
   }
 
   function softCapNodes(snap) {
-    if (snap === null) return [hintNode('正在读取设备…')]
+    if (snap === null) return [hintNode('正在读取…')]
     const devices = Array.isArray(snap.devices) ? snap.devices : []
-    if (devices.length === 0) return [hintNode('先在设备视图添加并连接设备')]
+    if (devices.length === 0) return [hintNode('还没有设备')]
     const nodes = []
     for (const device of devices) {
       const channels = Array.isArray(device.channels) ? device.channels : []
       // 一台设备一张卡，卡里再按通道分段：重复设备名读起来像列表被复制了两遍。
       if (channels.length > 0) nodes.push(softCapCard(device, channels, snap.locked === true))
     }
-    if (nodes.length === 0) return [hintNode('设备还没有可用通道：先在设备视图连接设备')]
+    if (nodes.length === 0) return [hintNode('还没有通道')]
     return nodes
   }
 
@@ -715,7 +716,10 @@
         channel: channel.label ?? channel.id ?? '通道',
       }
       block.append(softCapRow(device.id, channel.id, 'intensity', caps, locked, names))
-      block.append(softCapRow(device.id, channel.id, 'frequency', caps, locked, names))
+      // 频率范围只有波形通道（郊狼）才有意义；其它后端的滑杆不生效，不显示。
+      if (channel.supportsWaveform === true) {
+        block.append(softCapRow(device.id, channel.id, 'frequency', caps, locked, names))
+      }
       card.append(block)
     }
     return card
@@ -729,58 +733,65 @@
     label.textContent = kind === 'intensity' ? '强度' : '频率'
     row.append(label)
 
-    const available = kind === 'intensity' ? caps.intensity : caps.frequency
+    const intensity = kind === 'intensity'
+    const available = intensity ? caps.intensity : caps.frequency
     if (!available) {
+      // 频率读不到 Hz（旧宿主只给协议编码）或缺 min/max：不猜、不换算，直接显示「—」。
       const readout = document.createElement('span')
       readout.className = 'val'
       readout.textContent = '—'
-      const hint = document.createElement('span')
-      hint.className = 'hint'
-      hint.textContent = '宿主尚未提供该通道范围'
-      row.append(readout, hint)
+      row.append(readout)
       return row
     }
 
-    const intensity = kind === 'intensity'
-    const loMin = intensity ? caps.minPercent : caps.minFreq
-    const hiMax = intensity ? caps.maxPercent : caps.maxFreq
-    const floor = intensity ? 0 : MIN_FREQ
-    const ceiling = intensity ? 100 : MAX_FREQ
-    // 强度用百分比，频率用协议编码单位（界面上直接写出来，别只藏在 title 里）。
+    // 原生单位域：强度 [0, intensityMax]（strength 步进 2，percent 步进 1）；
+    // 频率 [1, 100] Hz，步进 1。
+    const scale = intensity ? caps.scale : 1
+    const step = intensity ? scale : 1
+    const floor = intensity ? 0 : MIN_FREQ_HZ
+    const ceiling = intensity ? caps.intensityMax : MAX_FREQ_HZ
+    const loMin = intensity ? caps.minPercent * scale : caps.minFreqHz
+    const hiMax = intensity ? caps.maxPercent * scale : caps.maxFreqHz
     const rangeName = `${names?.device ?? deviceId} ${names?.channel ?? channelId} ${intensity ? '强度' : '频率'}`
 
     const lo = document.createElement('input')
     lo.type = 'range'
     lo.min = String(floor)
-    lo.max = String(hiMax - 1)
-    lo.step = '1'
+    lo.max = String(hiMax - step)
+    lo.step = String(step)
     lo.value = String(loMin)
     lo.disabled = locked
-    lo.title = intensity ? '强度下限（必须小于上限）' : '频率下限（编码单位，必须小于上限）'
+    lo.title = intensity ? '强度下限' : '频率下限'
     lo.setAttribute('aria-label', `${rangeName}下限`)
     const hi = document.createElement('input')
     hi.type = 'range'
-    hi.min = String(loMin + 1)
+    hi.min = String(loMin + step)
     hi.max = String(ceiling)
-    hi.step = '1'
+    hi.step = String(step)
     hi.value = String(hiMax)
     hi.disabled = locked
-    hi.title = intensity ? '强度上限（必须大于下限）' : '频率上限（编码单位，必须大于下限）'
+    hi.title = intensity ? '强度上限' : '频率上限'
     hi.setAttribute('aria-label', `${rangeName}上限`)
 
     const readout = document.createElement('span')
     readout.className = 'val soft-cap-val'
 
     const key = `${deviceId}:${channelId}:${kind}`
+    /** 原生强度 → 线上的 percent（strength 0-200 → 0-100）。 */
+    const toPercent = value => Math.round(value / scale)
     const sync = () => {
-      // 联动保证 min < max：下限滑杆的右端永远比上限少 1，反之亦然。
-      lo.max = String(Number(hi.value) - 1)
-      hi.min = String(Number(lo.value) + 1)
+      // 联动保证 min < max：下限滑杆的右端永远比上限少一个步进，反之亦然。
+      lo.max = String(Number(hi.value) - step)
+      hi.min = String(Number(lo.value) + step)
       if (Number(lo.value) > Number(lo.max)) lo.value = lo.max
       if (Number(hi.value) < Number(hi.min)) hi.value = hi.min
       paintRange(lo)
       paintRange(hi)
-      readout.textContent = intensity ? `${lo.value}%–${hi.value}%` : `${lo.value}–${hi.value}（编码）`
+      readout.textContent = intensity
+        ? (caps.intensityUnit === 'strength'
+            ? `${lo.value}–${hi.value}`
+            : `${lo.value}%–${hi.value}%`)
+        : `${lo.value}–${hi.value} Hz`
     }
     const begin = () => capEditing.add(key)
     const finish = () => capEditing.delete(key)
@@ -798,15 +809,15 @@
       finish()
       sync()
       void postCap(deviceId, channelId, intensity
-        ? { minPercent: Number(lo.value) }
-        : { minFreq: Number(lo.value) })
+        ? { minPercent: toPercent(Number(lo.value)) }
+        : { minFreqHz: Number(lo.value) })
     })
     hi.addEventListener('change', () => {
       finish()
       sync()
       void postCap(deviceId, channelId, intensity
-        ? { maxPercent: Number(hi.value) }
-        : { maxFreq: Number(hi.value) })
+        ? { maxPercent: toPercent(Number(hi.value)) }
+        : { maxFreqHz: Number(hi.value) })
     })
 
     sync()
@@ -830,86 +841,6 @@
       // 签名才能保证即使服务端值没变也会重画。
       capSignatures.clear()
       await refreshSnapshot()
-    }
-  }
-
-  // ── 感知 / 调试 ─────────────────────────────────────────────────────────
-  function renderSensors(sources) {
-    if (!Array.isArray(sources) || sources.length === 0) {
-      el.sensors.replaceChildren(hintNode('未注册感知源'))
-      return
-    }
-    el.sensors.replaceChildren(...sources.map(source => {
-      const row = document.createElement('div')
-      row.className = 'sensor-row'
-      const label = document.createElement('span')
-      // 源 id/kind 与质量词，仅此而已：默认视图不含任何测量值。
-      label.textContent = `${source.label ?? source.id} · ${source.kind ?? '源'}`
-      const quality = document.createElement('span')
-      quality.className = QUALITY_CLASS[source.quality] ?? 'q-warn'
-      quality.textContent = QUALITY_TEXT[source.quality] ?? String(source.quality ?? '未知')
-      row.append(label, quality)
-      return row
-    }))
-  }
-
-  function probeLine(probe) {
-    const row = document.createElement('div')
-    const motion = probe.delta && typeof probe.delta.motion === 'number' ? probe.delta.motion : undefined
-    const audio = probe.delta && typeof probe.delta.audioPct === 'number' ? probe.delta.audioPct : undefined
-    const delta = motion === undefined && audio === undefined
-      ? 'Δ 不可比'
-      : `Δ运动 ${motion === undefined ? '—' : motion.toFixed(3)} · Δ音频 ${audio === undefined ? '—' : `${audio.toFixed(1)}%`}`
-    const targets = (Array.isArray(probe.targets) ? probe.targets : [])
-      .map(target => `${target.deviceId}:${target.channelId}`)
-      .join(', ')
-    row.textContent = `${probe.probeId} · ${probe.beatId}/${probe.intentId} · ${probe.verdict} · 方向 ${probe.direction} · 幅度 ${probe.magnitude} · ${delta} · 解析 ${targets !== '' ? targets : '无目标'}`
-    return row
-  }
-
-  async function applyDebug(enabled) {
-    debugEnabled = enabled === true
-    el.debugToggle.classList.toggle('on', debugEnabled)
-    el.debugToggle.setAttribute('aria-pressed', debugEnabled ? 'true' : 'false')
-    el.debugToggle.textContent = debugEnabled ? '调试中' : '调试'
-    if (!debugEnabled) {
-      // 关就是关：面板收掉、节点清空、之后不再请求 probes。
-      el.debugPanel.style.display = 'none'
-      el.debugProbes.replaceChildren()
-      return
-    }
-    el.debugPanel.style.display = ''
-    await refreshProbes()
-  }
-
-  async function refreshProbes() {
-    if (!debugEnabled) return
-    try {
-      const probes = await api('/api/debug/probes')
-      if (!debugEnabled) return
-      clearError('probes')
-      const list = Array.isArray(probes) ? probes : []
-      if (list.length === 0) {
-        el.debugProbes.replaceChildren(hintNode('（暂无已结算的 probe）'))
-        return
-      }
-      el.debugProbes.replaceChildren(...list.slice().reverse().map(probeLine))
-    } catch (error) {
-      // 403 表示开关在别处被关掉了：跟随它关掉本页面板，而不是报错。
-      if (error.status === 403) {
-        await applyDebug(false)
-        return
-      }
-      noteError('probes', `读取调试 probe 失败：${describe(error)}`)
-    }
-  }
-
-  async function syncDebug() {
-    try {
-      const body = await api('/api/debug')
-      await applyDebug(body !== null && typeof body === 'object' && body.enabled === true)
-    } catch {
-      await applyDebug(false)
     }
   }
 
@@ -986,16 +917,6 @@
     }
   }
 
-  async function refreshSensors() {
-    try {
-      const body = await api('/api/sensors')
-      clearError('sensors')
-      renderSensors(body !== null && typeof body === 'object' ? body.sources : [])
-    } catch (error) {
-      noteError('sensors', `读取感知源失败：${describe(error)}`)
-    }
-  }
-
   async function refreshPacks() {
     try {
       const body = await api('/api/packs')
@@ -1039,12 +960,13 @@
       el.packSelect.selectedIndex = 0
     }
     renderControls()
-    renderStartHint()
   }
 
-  /** 游玩视图是否可见；设备视图打开时本视图停止高频轮询。 */
+  /** 游玩视图是否可见；设备/设置视图打开或标签页隐藏时本视图停止高频轮询。 */
   function playVisible() {
-    return document.body.dataset.view !== 'device'
+    if (document.hidden) return false
+    const view = document.body.dataset.view
+    return view === undefined || view === 'play'
   }
 
   /** 切回游玩视图时立即拉一次全部状态（不等下一个 500ms 窗口）。 */
@@ -1054,8 +976,6 @@
       refreshSession(),
       refreshTranscript(),
       refreshSnapshot(),
-      refreshSensors(),
-      refreshProbes(),
     ])
   }
 
@@ -1067,8 +987,7 @@
       await refreshSession()
       if (!playVisible()) return
       await refreshTranscript()
-      if (ticks % 4 === 0) await Promise.all([refreshSnapshot(), refreshSensors()])
-      if (ticks % 4 === 2) await refreshProbes()
+      if (ticks % 4 === 0) await refreshSnapshot()
       if (ticks % 60 === 0) await refreshPacks()
     } finally {
       polling = false
@@ -1127,7 +1046,7 @@
 
   async function endSession() {
     if (busy || session === null) return
-    if (!window.confirm('结束本局？结束后需要重启宿主才能再开一局。')) return
+    if (!window.confirm('结束本局？')) return
     if (busy) return
     busy = true
     renderControls()
@@ -1292,18 +1211,6 @@
     }
   })
 
-  el.debugToggle.addEventListener('click', async () => {
-    try {
-      const body = await api('/api/debug', {
-        method: 'POST',
-        body: JSON.stringify({ enabled: !debugEnabled }),
-      })
-      await applyDebug(body !== null && typeof body === 'object' && body.enabled === true)
-    } catch (error) {
-      showError(`切换调试失败：${describe(error)}`)
-    }
-  })
-
   el.devices.addEventListener('focusout', () => {
     // 输入框失焦后再补一次快照，避免“编辑期间跳过的渲染”一直不补。
     setTimeout(() => {
@@ -1329,7 +1236,7 @@
     if (document.hidden) cancelHold()
   })
 
-  // 设备视图打开时本视图停止轮询；切回来立即刷新一次，避免看到旧台词/旧边界。
+  // 设备/设置视图打开时本视图停止轮询；切回来立即刷新一次，避免看到旧台词/旧边界。
   window.addEventListener('viewchange', event => {
     const view = event.detail !== undefined && event.detail !== null ? event.detail.view : undefined
     if (view !== 'play') return
@@ -1353,8 +1260,6 @@
       refreshSession(),
       refreshTranscript(),
       refreshSnapshot(),
-      refreshSensors(),
-      syncDebug(),
     ])
     window.setInterval(() => { void poll() }, POLL_MS)
   }

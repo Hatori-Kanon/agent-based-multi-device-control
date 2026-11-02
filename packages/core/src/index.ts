@@ -174,6 +174,17 @@ export {
 } from './backends/coyote/backend.ts'
 export type { CoyoteBackendOptions, CoyoteChannelId, CoyoteFrequencyRange } from './backends/coyote/backend.ts'
 export {
+  codeToHz,
+  frequencyBandToHz,
+  hzBandToCode,
+  hzToCode,
+  MAX_FREQ_CODE,
+  MAX_FREQ_HZ,
+  MIN_FREQ_CODE,
+  MIN_FREQ_HZ,
+} from './backends/coyote/frequency.ts'
+export type { FrequencyBandCode, FrequencyBandHz } from './backends/coyote/frequency.ts'
+export {
   MONSTERPARTY_API_URL,
   MONSTERPARTY_ORIGIN,
   MonsterPartyBackend,

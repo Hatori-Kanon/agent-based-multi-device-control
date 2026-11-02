@@ -1,18 +1,20 @@
 /**
- * Electron half of the camera bridge.
+ * Electron half of the camera + microphone bridge.
  *
- * Deliberately thin, like the BLE side: the cadence, quality classification and
- * JPEG freshness logic live in `camera-host.ts` behind a testable interface.
- * What remains here is Electron-specific and cannot be exercised without a
- * display and a real camera.
+ * Deliberately thin, like the BLE side: the cadence, quality classification,
+ * JPEG freshness and audio-level clamping live in `camera-host.ts` /
+ * `audio-host.ts` behind testable interfaces. What remains here is
+ * Electron-specific and cannot be exercised without a display and real media
+ * devices.
  *
- * The hidden window runs `renderer/camera.html`, which loads a small esbuild
+ * One hidden window runs `renderer/camera.html`, which loads a small esbuild
  * bundle. That bundle imports the shared `@embodied/core` feature extractor, so
  * the renderer and the unit tests analyse 32x24 grey frames with the same code
- * (plan §4.1). The main process drives capture through `executeJavaScript`
- * (the same pattern as `createBleWorker`); feature samples and JPEGs come back
- * as the documented `{type:'features',sample}` / `{type:'jpeg',bytes}`
- * payloads, and unexpected stream ends arrive over the preload bridge.
+ * (plan §4.1), and it also exposes `window.__audio` for microphone capture. The
+ * main process drives both through `executeJavaScript` (the same pattern as
+ * `createBleWorker`); unexpected stream ends arrive over the preload bridge.
+ * Camera and microphone are independent streams in one window: the settings
+ * page can stop one without disturbing the other.
  */
 
 import { dirname, join } from 'node:path'
@@ -20,6 +22,12 @@ import { fileURLToPath } from 'node:url'
 import { BrowserWindow, ipcMain, type WebContents } from 'electron'
 import { systemClock } from '@embodied/core'
 import { log } from '../log.ts'
+import {
+  BridgedAudioHost,
+  type AudioBridge,
+  type AudioDeviceInfo,
+  type AudioHost,
+} from './audio-host.ts'
 import {
   BridgedCameraHost,
   type CameraBridge,
@@ -82,22 +90,73 @@ class ElectronCameraBridge implements CameraBridge {
   }
 }
 
+/**
+ * Audio half of the same hidden page.
+ *
+ * `window.__audio` is exposed by the bundle's microphone section; levels are
+ * 0-100 already normalised by the page, so this adapter is a pure transport.
+ */
+class ElectronAudioBridge implements AudioBridge {
+  private readonly endedListeners = new Set<(reason: string) => void>()
+
+  constructor(private readonly contents: WebContents) {}
+
+  private call<T>(expression: string): Promise<T> {
+    if (this.contents.isDestroyed()) return Promise.reject(new Error('the camera worker window is gone'))
+    return this.contents.executeJavaScript(expression, true) as Promise<T>
+  }
+
+  listDevices(): Promise<readonly AudioDeviceInfo[]> {
+    return this.call<readonly AudioDeviceInfo[]>('window.__audio.listDevices()')
+  }
+
+  async start(deviceId: string): Promise<void> {
+    await this.call<boolean>(`window.__audio.start(${literal(deviceId)})`)
+  }
+
+  sample(): Promise<number | null> {
+    return this.call<number | null>('window.__audio.sample()')
+  }
+
+  async stop(): Promise<void> {
+    if (this.contents.isDestroyed()) return
+    await this.call<boolean>('window.__audio.stop()')
+  }
+
+  onEnded(listener: (reason: string) => void): () => void {
+    this.endedListeners.add(listener)
+    return () => {
+      this.endedListeners.delete(listener)
+    }
+  }
+
+  /** Called when the worker page reports that its microphone stream ended. */
+  emitEnded(reason: string): void {
+    for (const listener of [...this.endedListeners]) listener(reason)
+  }
+}
+
 export interface CameraWorker {
   readonly host: CameraHost
+  /** Microphone host living in the same hidden window (settings page #5). */
+  readonly audioHost: AudioHost
   /** Stop capture, detach IPC, and destroy the hidden window. */
   close(): Promise<void>
 }
 
 /**
- * Create the hidden camera worker window and return its host.
+ * Create the hidden camera/microphone worker window and return both hosts.
  *
- * A camera-less machine is a supported state: `listDevices()` returns an empty
- * list and the wiring registers an `unavailable` source. Construction itself
- * only fails when Electron cannot create the window at all.
+ * A machine without a camera or a microphone is a supported state:
+ * `listDevices()` returns an empty list and the wiring reports the source as
+ * unavailable, so the settings page can say so instead of the host failing.
+ * Construction itself only fails when Electron cannot create the window.
  */
 export async function createCameraWorker(options: {
   readonly sourceId?: string
   readonly label?: string
+  readonly audioSourceId?: string
+  readonly audioLabel?: string
   readonly onError?: (error: unknown) => void
 } = {}): Promise<CameraWorker> {
   const window = new BrowserWindow({
@@ -122,6 +181,14 @@ export async function createCameraWorker(options: {
     ...(options.label === undefined ? {} : { label: options.label }),
     ...(options.onError === undefined ? {} : { onError: options.onError }),
   })
+  const audioBridge = new ElectronAudioBridge(contents)
+  const audioHost = new BridgedAudioHost({
+    clock: systemClock,
+    bridge: audioBridge,
+    ...(options.audioSourceId === undefined ? {} : { sourceId: options.audioSourceId }),
+    ...(options.audioLabel === undefined ? {} : { label: options.audioLabel }),
+    ...(options.onError === undefined ? {} : { onError: options.onError }),
+  })
 
   const routeEnded = (event: Electron.IpcMainEvent, payload: { reason?: string }): void => {
     if (event.sender !== contents) return
@@ -131,11 +198,20 @@ export async function createCameraWorker(options: {
     log(`[camera] ${reason}`)
     bridge.emitEnded(reason)
   }
+  const routeAudioEnded = (event: Electron.IpcMainEvent, payload: { reason?: string }): void => {
+    if (event.sender !== contents) return
+    const reason = typeof payload?.reason === 'string' && payload.reason.length > 0
+      ? payload.reason
+      : 'microphone capture ended'
+    log(`[camera] ${reason}`)
+    audioBridge.emitEnded(reason)
+  }
   const routeDiag = (event: Electron.IpcMainEvent, message: string): void => {
     if (event.sender !== contents) return
     log(`[camera] ${message}`)
   }
   ipcMain.on('camera:ended', routeEnded)
+  ipcMain.on('audio:ended', routeAudioEnded)
   ipcMain.on('camera:diag', routeDiag)
 
   // `here` is dist/, so the renderer sources sit one level up. The page loads
@@ -144,13 +220,16 @@ export async function createCameraWorker(options: {
 
   return {
     host,
+    audioHost,
     async close(): Promise<void> {
       ipcMain.off('camera:ended', routeEnded)
+      ipcMain.off('audio:ended', routeAudioEnded)
       ipcMain.off('camera:diag', routeDiag)
       try {
-        await host.stop()
+        await Promise.allSettled([host.stop(), audioHost.stop()])
       } finally {
         host.dispose()
+        audioHost.dispose()
         if (!window.isDestroyed()) window.destroy()
       }
     },
