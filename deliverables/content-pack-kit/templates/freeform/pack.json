@@ -1,0 +1,20 @@
+{
+  "id": "rainy-night",
+  "name": "雨夜便利店",
+  "version": "0.1.0",
+  "engine": ">=0.2 <1.0",
+  "mode": "freeform",
+  "rating": "all",
+  "language": "zh-CN",
+  "author": "你的名字",
+  "description": "一个可以自由发挥的雨夜相遇场景。",
+  "tags": ["日常", "温柔", "慢节奏"],
+  "boundaries": [
+    "不出现真实伤害或不可逆情节",
+    "不脱离角色设定",
+    "不替玩家决定行动"
+  ],
+  "aftercare": {
+    "text": "雨停了，把伞收好，慢慢走回去。"
+  }
+}

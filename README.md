@@ -56,6 +56,7 @@ v4 把界面收敛成面向用户的产品：游玩 / 设备 / 设置三个视�
 | `M2-实施计划.md` | M2 原子任务、接口契约、验收测试与并行度 |
 | `analysis/m2-design-audit.md` | M2 冻结前的独立一致性审计（9 阻塞 / 31 应修 / 7 可选） |
 | `analysis/ui-v4.md` | 产品化界面 v4：原生单位、设置页、麦克风、去说明文字与验收记录 |
+| [`deliverables/content-pack-kit/`](deliverables/content-pack-kit/README.md) | 内容包制作包：当前实现格式要求、可改模板、校验/打包/安装脚本 |
 | `analysis/` | 证据笔记：AI-for-Coyote 后端/产品面、己方基线、HW9 心率带与 RR 调研 |
 
 ## 五个真实后端，三种失效语义

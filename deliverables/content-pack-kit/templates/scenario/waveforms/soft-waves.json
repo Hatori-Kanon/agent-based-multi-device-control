@@ -1,0 +1,12 @@
+{
+  "id": "soft-waves",
+  "name": "软浪",
+  "sensation": "细密潮汐",
+  "tags": ["soft", "slow"],
+  "loop": true,
+  "segments": [
+    { "ms": 1200, "freq": 40, "intensity": { "from": 0, "to": 45 }, "curve": "easeIn" },
+    { "ms": 800, "freq": { "from": 40, "to": 25 }, "intensity": { "from": 45, "to": 20 }, "curve": "linear" },
+    { "ms": 600, "freq": 25, "intensity": { "from": 20, "to": 0 }, "curve": "easeOut" }
+  ]
+}

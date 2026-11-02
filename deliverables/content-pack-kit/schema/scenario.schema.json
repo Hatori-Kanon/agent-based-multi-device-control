@@ -1,0 +1,206 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "embodied-scenario.schema.json",
+  "title": "Embodied 剧本 scenario.json",
+  "type": "object",
+  "required": [
+    "session",
+    "regions",
+    "phases",
+    "feedbackIntents"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "host": {
+      "type": "string",
+      "minLength": 1,
+      "description": "引用包内 Markdown；缺失/不存在回退引擎默认 host"
+    },
+    "session": {
+      "type": "object",
+      "required": [
+        "plannedMinutes",
+        "phaseWindows",
+        "aftercareMin"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "plannedMinutes": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "exclusiveMinimum": 0
+        },
+        "phaseWindows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "phase",
+              "from",
+              "to"
+            ],
+            "additionalProperties": true,
+            "properties": {
+              "phase": {
+                "type": "string",
+                "minLength": 1
+              },
+              "from": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "to": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              }
+            }
+          }
+        },
+        "aftercareMin": {
+          "type": "number",
+          "minimum": 0,
+          "description": "结束前的最短收尾停留（分钟）；测试包建议 0"
+        }
+      }
+    },
+    "regions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "label"
+        ],
+        "additionalProperties": true,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,31}$"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "phases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "goal",
+          "next"
+        ],
+        "additionalProperties": true,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          },
+          "goal": {
+            "type": "string",
+            "minLength": 1
+          },
+          "advanceWhen": {
+            "type": "string"
+          },
+          "next": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "空数组 = 终局阶段"
+          }
+        }
+      }
+    },
+    "feedbackIntents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "meaning"
+        ],
+        "additionalProperties": true,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          },
+          "meaning": {
+            "type": "string",
+            "minLength": 1
+          },
+          "regions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "每个 region 必须在本文件 regions[] 声明"
+          },
+          "distribution": {
+            "enum": [
+              "synced",
+              "primary",
+              "round-robin"
+            ]
+          },
+          "suggest": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "preset": {
+                "enum": [
+                  "steady",
+                  "pulse",
+                  "wave",
+                  "random",
+                  "ramp"
+                ]
+              },
+              "waveform": {
+                "type": "string",
+                "minLength": 1,
+                "description": "包内 id、<id> 或 builtin:<id>"
+              },
+              "durationSec": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "strength": {
+                "enum": [
+                  "low",
+                  "med",
+                  "high"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "opening": {
+      "type": "string",
+      "description": "兼容字段；当前运行期未注入，建议写进 setting.md"
+    },
+    "npcs": {
+      "type": "array",
+      "description": "兼容字段；当前运行期未使用"
+    },
+    "secrets": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "兼容字段；当前运行期未使用"
+    }
+  }
+}

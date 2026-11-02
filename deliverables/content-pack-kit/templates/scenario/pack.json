@@ -1,0 +1,31 @@
+{
+  "id": "lighthouse-night",
+  "name": "灯塔与海",
+  "version": "0.1.0",
+  "engine": ">=0.2 <1.0",
+  "mode": "scenario",
+  "rating": "all",
+  "language": "zh-CN",
+  "author": "你的名字",
+  "description": "在灯塔值守的最后一夜，和一个话不多的人一起等风停。",
+  "tags": ["海", "慢热", "对话"],
+  "boundaries": [
+    "不出现真实伤害或不可逆情节",
+    "不脱离角色设定",
+    "不替玩家决定行动"
+  ],
+  "aftercare": {
+    "text": "风小了，把灯调暗，慢慢收好工具。"
+  },
+  "history": {
+    "read": true,
+    "lastN": 1,
+    "windowHours": 72
+  },
+  "metaReactions": [
+    {
+      "when": { "endReason": ["left_early"] },
+      "opening": { "tone": "留有余地", "firstIntent": "soothe" }
+    }
+  ]
+}

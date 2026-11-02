@@ -1,0 +1,165 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "embodied-pack.schema.json",
+  "title": "Embodied 内容包清单 pack.json",
+  "type": "object",
+  "required": [
+    "id",
+    "name",
+    "version",
+    "engine",
+    "mode",
+    "rating"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "小写字母/数字/连字符"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$"
+    },
+    "engine": {
+      "type": "string",
+      "minLength": 1,
+      "examples": [
+        ">=0.2 <1.0"
+      ]
+    },
+    "mode": {
+      "enum": [
+        "freeform",
+        "scenario"
+      ]
+    },
+    "rating": {
+      "enum": [
+        "all",
+        "18+"
+      ]
+    },
+    "language": {
+      "type": "string"
+    },
+    "author": {
+      "type": "string"
+    },
+    "homepage": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "license": {
+      "type": "string"
+    },
+    "boundaries": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "硬约束；只在 pack.json 声明"
+    },
+    "aftercare": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "description": "默认收尾文案（时长在 scenario.session.aftercareMin）"
+    },
+    "history": {
+      "type": "object",
+      "required": [
+        "read"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "read": {
+          "type": "boolean"
+        },
+        "windowHours": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "lastN": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "metaReactions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "when",
+          "opening"
+        ],
+        "additionalProperties": true,
+        "properties": {
+          "when": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "endReason": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "enum": [
+                    "completed",
+                    "left_early",
+                    "paused",
+                    "panic",
+                    "stop",
+                    "unexpected_exit"
+                  ]
+                }
+              },
+              "aftercare": {
+                "type": "boolean"
+              }
+            }
+          },
+          "opening": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "tone": {
+                "type": "string",
+                "minLength": 1
+              },
+              "firstIntent": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "requires": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "M2 只实现 region/waveform，其他能力仅告警"
+    }
+  }
+}

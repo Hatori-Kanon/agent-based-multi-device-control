@@ -1,0 +1,66 @@
+{
+  "host": "host.md",
+  "session": {
+    "plannedMinutes": 30,
+    "phaseWindows": [
+      { "phase": "arrival", "from": 0.0, "to": 0.25 },
+      { "phase": "keep-watch", "from": 0.2, "to": 0.7 },
+      { "phase": "resolve", "from": 0.7, "to": 1.0 }
+    ],
+    "aftercareMin": 0
+  },
+  "regions": [
+    { "id": "hands", "label": "手" },
+    { "id": "shoulders", "label": "肩背" },
+    { "id": "whole-body", "label": "全身" }
+  ],
+  "phases": [
+    {
+      "id": "arrival",
+      "goal": "把潮湿和风关在门外，建立这一夜的安静",
+      "advanceWhen": "对方愿意留下并开始说一点自己的事",
+      "next": ["keep-watch"]
+    },
+    {
+      "id": "keep-watch",
+      "goal": "一起守灯，在日常的小事里靠近",
+      "advanceWhen": "风势转小，或有人提起明天",
+      "next": ["resolve"]
+    },
+    {
+      "id": "resolve",
+      "goal": "收束这一夜，把没说完的话留下",
+      "next": []
+    }
+  ],
+  "feedbackIntents": [
+    {
+      "id": "probe-touch",
+      "meaning": "短促试探",
+      "regions": ["hands"],
+      "distribution": "primary",
+      "suggest": { "preset": "pulse", "durationSec": 2, "strength": "low" }
+    },
+    {
+      "id": "ambient-field",
+      "meaning": "持续环境",
+      "regions": ["whole-body"],
+      "distribution": "synced",
+      "suggest": { "preset": "wave", "waveform": "builtin:tide", "durationSec": 20, "strength": "low" }
+    },
+    {
+      "id": "escalate-step",
+      "meaning": "加一档",
+      "regions": ["shoulders"],
+      "distribution": "primary",
+      "suggest": { "durationSec": 8, "strength": "med" }
+    },
+    {
+      "id": "soothe",
+      "meaning": "安抚/降档",
+      "regions": ["whole-body"],
+      "distribution": "synced",
+      "suggest": { "preset": "wave", "waveform": "soft-waves", "durationSec": 15, "strength": "low" }
+    }
+  ]
+}

@@ -143,3 +143,6 @@ analysis/hw9-capture/_tools/_pkgs/
 
 # Local UI screenshots / preview harness (never shipped)
 .ui-shots/
+
+# Content-pack kit: source lives in deliverables/content-pack-kit/, the zip is a build artifact.
+deliverables/*.zip
