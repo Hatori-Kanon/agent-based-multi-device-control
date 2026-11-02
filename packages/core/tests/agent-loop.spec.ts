@@ -96,6 +96,69 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 describe('runTurn (single-call turn)', () => {
+  it('retries once when the model returns neither prose nor a plan', async () => {
+    const { executor } = recordingExecutor()
+    const narration = '（触手从暗处浮出，贴着腰侧停住。）咕啾~'
+    const requests: ModelTurnRequest[] = []
+    const runner: ModelRunner = {
+      async run(request) {
+        requests.push(request)
+        if (requests.length === 1) {
+          // The failure mode seen with DeepSeek: only a read-only tool call (or
+          // nothing at all) and an empty content field.
+          return { text: '', toolCalls: [], finishReason: 'stop' }
+        }
+        const call: ToolCall = {
+          id: 'call_after_reminder',
+          name: 'apply_plan',
+          arguments: { ...PLAN_ARGS, narration },
+        }
+        request.onToolCall?.(call)
+        return { text: '', toolCalls: [call], finishReason: 'tool-calls' }
+      },
+    }
+
+    const result = await runTurn({
+      runner,
+      tools: M2_MODEL_TOOLS,
+      executor,
+      input: inputFixture(),
+      clock: new FakeClock(),
+    })
+    expect(requests).toHaveLength(2)
+    expect(requests[1]?.messages.at(-1)).toMatchObject({ role: 'user' })
+    expect((requests[1]?.messages.at(-1)?.content ?? '')).toContain('narration')
+    expect(result.line).toBe(narration)
+    expect(result.warnings.some(warning => warning.includes('empty model reply'))).toBe(true)
+  })
+
+  it('uses apply_plan.narration when the provider sends no content text', async () => {
+    const { executor } = recordingExecutor()
+    const narration = '（暗室的湿冷裹上来，触手从阴影里浮出。）咕啾~……'
+    const call: ToolCall = {
+      id: 'call_plan_narration',
+      name: 'apply_plan',
+      arguments: { ...PLAN_ARGS, narration },
+    }
+    const runner: ModelRunner = {
+      async run(request) {
+        // DeepSeek-style tool call: no content delta, prose only in arguments.
+        request.onToolCall?.(call)
+        return { text: '', toolCalls: [call], finishReason: 'tool-calls' }
+      },
+    }
+
+    const result = await runTurn({
+      runner,
+      tools: M2_MODEL_TOOLS,
+      executor,
+      input: inputFixture(),
+      clock: new FakeClock(),
+    })
+    expect(result.line).toBe(narration)
+    expect(result.plan?.beats).toHaveLength(1)
+  })
+
   it('dispatches as soon as the tool call completes, before the text stream ends', async () => {
     const order: string[] = []
     const { calls, executor } = recordingExecutor({ onDispatch: () => order.push('dispatch') })

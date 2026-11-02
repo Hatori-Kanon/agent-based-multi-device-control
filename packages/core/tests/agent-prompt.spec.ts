@@ -23,6 +23,7 @@ function promptFor(
     readonly scene?: string
     readonly briefs?: readonly string[]
     readonly world?: readonly string[]
+    readonly protocol?: readonly string[]
   },
   budgetChars = 100_000,
 ): string {
@@ -33,6 +34,7 @@ function promptFor(
     ...(parts.scene === undefined ? {} : { scene: parts.scene }),
     ...(parts.briefs === undefined ? {} : { briefs: parts.briefs }),
     ...(parts.world === undefined ? {} : { world: parts.world }),
+    ...(parts.protocol === undefined ? {} : { protocol: parts.protocol }),
     budgetChars,
   })
 }
@@ -56,7 +58,7 @@ describe('buildSystemPrompt', () => {
     const indexes = anchors.map(anchor => prompt.indexOf(anchor))
     expect(indexes.every(index => index >= 0)).toBe(true)
     expect([...indexes].sort((a, b) => a - b)).toEqual(indexes)
-    expect(PROMPT_SECTION_ORDER).toEqual(['boundaries', 'host', 'persona', 'scene', 'briefs', 'world'])
+    expect(PROMPT_SECTION_ORDER).toEqual(['boundaries', 'host', 'persona', 'scene', 'briefs', 'world', 'protocol'])
     expect(PROMPT_SACRIFICE_ORDER).toEqual(['briefs', 'scene', 'persona', 'host'])
   })
 
@@ -153,10 +155,27 @@ describe('buildSystemPrompt', () => {
     })
     for (const line of WORLD) expect(prompt).toContain(line)
     expect(prompt).toContain('## 本回合可用（意图与部位）')
-    expect(prompt.endsWith(WORLD[WORLD.length - 1] ?? '')).toBe(true)
+    expect(prompt.indexOf(WORLD[WORLD.length - 1] ?? '')).toBeGreaterThan(0)
     expect(prompt.length).toBeGreaterThan(120)
     // The budgeted narrative blocks lost the sacrifice race, not the menu.
     expect(prompt).not.toContain(BRIEFS[0] ?? '')
+  })
+
+  it('keeps the mandatory protocol block after the world menu when over budget', () => {
+    const protocol = ['正文写进 apply_plan 的 narration 字段。']
+    const prompt = buildSystemPrompt({
+      boundaries: BOUNDARIES,
+      persona: '长'.repeat(5_000),
+      scene: SCENE,
+      briefs: BRIEFS,
+      world: WORLD,
+      protocol,
+      budgetChars: 120,
+    })
+    expect(prompt).toContain('## 工具与输出协议（本回合必须）')
+    expect(prompt).toContain(protocol[0] ?? '')
+    expect(prompt.indexOf(protocol[0] ?? '')).toBeGreaterThan(prompt.indexOf(WORLD[0] ?? ''))
+    expect(prompt.endsWith(protocol[0] ?? '')).toBe(true)
   })
 
   it('keeps whole briefs and drops the tail ones first', () => {

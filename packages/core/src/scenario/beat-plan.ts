@@ -201,6 +201,7 @@ const KNOWN_TOP_LEVEL = new Set([
   'beats',
   'choices',
   'lineGuidance',
+  'narration',
   'nextTurnAfterSec',
   'pacing',
   'phase',

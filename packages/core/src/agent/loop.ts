@@ -65,6 +65,10 @@ const MAX_LOOKS_PER_TURN = 1
 /** One retry after a transport-class failure (D12). */
 const MAX_ATTEMPTS = 2
 
+/** Corrective user turn when the model answers with neither prose nor a plan. */
+const EMPTY_TURN_REMINDER = '你刚才的回复既没有正文，也没有调用 apply_plan。'
+  + '单轮调用不会执行查询工具；现在请直接调用 apply_plan，并把给玩家看的完整正文写进 narration 字段。'
+
 /**
  * Everything `runTurn` needs that the engine already owns.
  *
@@ -185,6 +189,8 @@ export async function runTurn(options: TurnLoopOptions): Promise<TurnResult> {
   }
 
   const lineParts: string[] = []
+  /** `apply_plan.narration`: prose carried inside the tool call (single-call models). */
+  let narration = ''
   const warnings: string[] = []
   const handledToolCallIds = new Set<string>()
   let plan: BeatPlan | undefined
@@ -212,6 +218,11 @@ export async function runTurn(options: TurnLoopOptions): Promise<TurnResult> {
       return
     }
     applied = true
+    // Some providers (notably DeepSeek tool-calling) put an empty `content`
+    // when the assistant answers with a tool call. The single-call schema stores
+    // the player-visible prose in `narration`, so read it from the raw arguments
+    // before the plan parser (which ignores unknown top-level keys).
+    narration = narrationOf(call.arguments)
     const validation: PlanValidation = parseBeatPlan(call.arguments, planContextOf())
     plan = validation.plan
     dropped = validation.dropped
@@ -300,15 +311,40 @@ export async function runTurn(options: TurnLoopOptions): Promise<TurnResult> {
       lineParts.length = 0 // discard a partially streamed line from the failed attempt
     }
     if (result === undefined) throw new ModelError('the model produced no result', { code: 'invalid-response' })
-    // A non-streaming runner fills `result.text` instead of emitting deltas;
-    // dropping it would silently mute the turn (wave-4 review S-7).
-    if (lineParts.length === 0 && result.text !== '') lineParts.push(result.text)
     if (timedOut) throw timeoutError(timeoutMs)
     if (isAborted(callerSignal)) throw abortedError()
 
-    // A runner that only fills `result.toolCalls` (no callback) still works.
-    for (const call of result.toolCalls) onToolCall(call)
+    /** Fold one model result into the turn's line/plan state. */
+    const consume = (turnResult: ModelTurnResult): void => {
+      // A non-streaming runner fills `result.text` instead of emitting deltas;
+      // dropping it would silently mute the turn (wave-4 review S-7).
+      if (lineParts.length === 0 && turnResult.text !== '') lineParts.push(turnResult.text)
+      // A runner that only fills `toolCalls` (no callback) still works.
+      for (const call of turnResult.toolCalls) onToolCall(call)
+      // DeepSeek-style tool calls carry no `content`; the schema's `narration`
+      // is the player-visible prose. Prefer streamed/plain text when a provider
+      // supplies both so the same sentence is not duplicated.
+      if (lineParts.length === 0 && narration !== '') lineParts.push(narration)
+    }
+    consume(result)
     await settleDispatch()
+
+    // Some providers (or a model that decides to inspect devices first) answer
+    // with neither prose nor a plan. In the single-call MVP read-only tools have
+    // no follow-up request, so that would settle as a silent turn. Retry once
+    // with an explicit correction before giving up; effects are still untouched
+    // because `applied` is false and no dispatch started.
+    if (lineParts.length === 0 && plan === undefined && !applied
+      && !timedOut && !isAborted(callerSignal)) {
+      warnings.push('empty model reply retried with the narration reminder')
+      const retryRequest: ModelTurnRequest = {
+        ...request,
+        messages: [...input.messages, { role: 'user', content: EMPTY_TURN_REMINDER }],
+      }
+      const retry = await Promise.race([runner.run(retryRequest), abortRace])
+      consume(retry)
+      await settleDispatch()
+    }
     // A late dispatch that resolves after the deadline must not be reported as
     // a successful turn.
     if (timedOut) throw timeoutError(timeoutMs)
@@ -328,6 +364,15 @@ export async function runTurn(options: TurnLoopOptions): Promise<TurnResult> {
     controller.signal.removeEventListener('abort', abortReject)
     callerSignal?.removeEventListener('abort', forwardAbort)
   }
+}
+
+/** Read `apply_plan.narration` when present; models may omit it in other modes. */
+function narrationOf(argumentsValue: unknown): string {
+  if (typeof argumentsValue !== 'object' || argumentsValue === null || Array.isArray(argumentsValue)) {
+    return ''
+  }
+  const value = (argumentsValue as Record<string, unknown>).narration
+  return typeof value === 'string' ? value.trim() : ''
 }
 
 /** Narrow an optional cancellation signal to its aborted state. */

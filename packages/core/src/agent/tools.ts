@@ -203,7 +203,7 @@ const WAVEFORM_SEGMENT_SCHEMA: Record<string, unknown> = {
 export const M2_TOOL_SCHEMAS: readonly ToolDefinition[] = [
   {
     name: 'apply_plan',
-    description: '本回合的动作计划。turnId 与 phase 由引擎注入，不要自己写。一回合只能调用一次。强度只用 low/med/high，系统会按人类设定的通道范围换算。',
+    description: '本回合的动作计划。turnId 与 phase 由引擎注入，不要自己写。一回合只能调用一次。强度只用 low/med/high，系统会按人类设定的通道范围换算。给玩家看的正文写进 narration 字段。',
     parameters: {
       type: 'object',
       required: ['pacing', 'beats'],
@@ -219,6 +219,11 @@ export const M2_TOOL_SCHEMAS: readonly ToolDefinition[] = [
         },
         choices: { type: 'array', maxItems: 3, items: PLAYER_CHOICE_SCHEMA },
         lineGuidance: LINE_GUIDANCE_SCHEMA,
+        narration: {
+          type: 'string',
+          minLength: 1,
+          description: '给玩家看的本回合正文（完整叙事：环境/动作/身体反应/台词；不是计划摘要，不能为空）。',
+        },
       },
     },
   },

@@ -129,8 +129,11 @@ describe('M2 model tool surface', () => {
     const parameters = parametersOf(applyPlan)
     const properties = asRecord(parameters['properties'])
 
-    // BeatPlan top level minus the engine-injected fields (§4.3).
-    expect(objectKeys(properties)).toEqual(['beats', 'choices', 'lineGuidance', 'nextTurnAfterSec', 'pacing'])
+    // BeatPlan top level minus the engine-injected fields (§4.3), plus the
+    // single-call `narration` extension (prose travels in the tool call).
+    expect(objectKeys(properties)).toEqual([
+      'beats', 'choices', 'lineGuidance', 'narration', 'nextTurnAfterSec', 'pacing',
+    ])
     expect(parameters['required']).toEqual(['pacing', 'beats'])
     for (const engineField of BEAT_PLAN_ENGINE_FIELDS) {
       expect(properties).not.toHaveProperty(engineField)

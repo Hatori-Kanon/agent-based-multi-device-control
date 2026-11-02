@@ -129,6 +129,32 @@ const RECENT_LINE_LIMIT = 8
 /** Pack ids follow `内容包规范.md` §3: lowercase slug. */
 const PACK_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/u
 
+/**
+ * Single-call model discipline, appended outside the prompt budget.
+ *
+ * DeepSeek tool-calling answers with an empty `content` (the prose can only
+ * travel in the tool arguments), and a model that first calls read-only tools
+ * gets no follow-up request in this single-call MVP — the turn would settle
+ * with no line and no plan. So the protocol is explicit: no query tools, one
+ * `apply_plan`, and the player-visible prose in its `narration` field.
+ */
+const TURN_PROTOCOL = [
+  '本回合是单轮调用：devices_list、state_get、look、sensors_list、waveform_list 不会返回结果，不要调用它们。',
+  '必须调用 apply_plan 恰好一次；intentId 和 regions 只能取自「本回合可用」，不要发明 id。',
+  '本端点工具调用不携带正文 content：给玩家看的完整正文必须写进 apply_plan 的 narration 字段（非空，篇幅遵循人设），不能只写在 reasoning 里，也不能只调用工具。',
+  'narration 是玩家会看到的正文，不是计划摘要；环境/动作/身体反应用（）包裹，台词不加括号，不出现设备硬件词。',
+] as const
+
+/** Additional protocol lines for turn 1: the opening must establish the scene. */
+const OPENING_PROTOCOL = [
+  '这是开场回合：narration 第一段先交代场景/背景（环境、玩家姿态、角色如何出现），再进入互动；不能只写一句空泛台词。',
+] as const
+
+/** Auto mode has no player to pick options, so it must not stall on a menu. */
+const AUTOPILOT_PROTOCOL = [
+  '当前会话处于自动运行：不要生成 choices；玩家不会选择，用 narration 直接推进本回合。',
+] as const
+
 /** Stable failure vocabulary for the HTTP layer (all map to 400). */
 export type SessionErrorCode =
   | 'NO_SESSION'
@@ -530,19 +556,20 @@ export class PlaySession {
       },
     })
 
+    // Apply the lobby's autopilot choice before the opening turn: the prompt
+    // builder reads `engine.autopilotEnabled` to suppress player choices in
+    // auto mode, and the opening turn is the first place that matters. A tick
+    // that fires while the opening turn runs is dropped by the engine.
+    if (autopilot !== undefined) {
+      if (autopilot.intervalSec !== undefined) engine.setAutopilotInterval(autopilot.intervalSec)
+      engine.setAutopilot(autopilot.enabled)
+    }
     // The scheduler's P2 vocabulary has no `opening` kind (B2-T4 owns it);
     // `resume` is the session-level "begin/continue" trigger and starts
     // immediately because the engine is idle.
     engine.startSession()
     engine.submit({ priority: 'session', kind: OPENING_TRIGGER_KIND, at: this.env.clock.now() })
     await engine.whenIdle()
-    // Apply the lobby's autopilot choice after the opening turn: an enabled
-    // timer controls only *subsequent* P3 turns, and starting it earlier would
-    // only arm a tick that the opening turn immediately drops.
-    if (autopilot !== undefined) {
-      if (autopilot.intervalSec !== undefined) engine.setAutopilotInterval(autopilot.intervalSec)
-      engine.setAutopilot(autopilot.enabled)
-    }
     return this.requireSnapshot()
   }
 
@@ -839,7 +866,11 @@ export class PlaySession {
     // Build the prompt (the opening brief, when present, is part of it), then
     // consume the brief: it belongs to the opening turn only, even if that
     // request ends in a fallback.
-    const messages = this.messagesFor(request, phases, pack, snapshot)
+    const opening = request.turnId === 1
+      && request.playerText === undefined
+      && request.choiceId === undefined
+    const autopilot = this.engine?.autopilotEnabled === true
+    const messages = this.messagesFor(request, phases, pack, snapshot, opening)
     this.openingBrief = undefined
     const result = await runTurn({
       runner: this.modelRunnerFor(),
@@ -878,7 +909,7 @@ export class PlaySession {
     // Ledger/archive facts for this turn: dispatched percentages (B2-T8
     // `maxCapUsed`, never a cap) and the intent ids of the last two turns.
     this.recordTurnFacts(result)
-    const choices = result.plan?.choices
+    const choices = autopilot ? undefined : result.plan?.choices
     return {
       line,
       ...(choices === undefined ? {} : { choices }),
@@ -981,8 +1012,9 @@ export class PlaySession {
     phases: PhaseMachine,
     pack: LoadedPack,
     snapshot: RegistrySnapshot,
+    opening: boolean,
   ): readonly LlmMessage[] {
-    const system = this.systemPrompt(phases, pack, snapshot)
+    const system = this.systemPrompt(phases, pack, snapshot, opening)
     const playerText = playerTextOf(request)
     return buildTurnMessages({
       ...(system === '' ? {} : { system }),
@@ -991,7 +1023,12 @@ export class PlaySession {
     })
   }
 
-  private systemPrompt(phases: PhaseMachine, pack: LoadedPack, snapshot: RegistrySnapshot): string {
+  private systemPrompt(
+    phases: PhaseMachine,
+    pack: LoadedPack,
+    snapshot: RegistrySnapshot,
+    opening: boolean,
+  ): string {
     const note = pack.phaseNotes.get(phases.current)
     const scene = [pack.setting, note, phases.currentPhase.goal]
       .filter((part): part is string => part !== undefined && part.trim() !== '')
@@ -1002,13 +1039,14 @@ export class PlaySession {
     // `firstIntent` is filtered against the effective intent table: validation
     // only warns when it is unknown (and freeform packs are unchecked), so a
     // stale id must not contradict the `apply_plan` enum the model is given.
-    const opening = this.openingBrief === undefined ? '' : openingBriefText(this.openingBrief, this.intentIds())
+    const brief = this.openingBrief === undefined ? '' : openingBriefText(this.openingBrief, this.intentIds())
     // The world facts are the mandatory playable menu: buildSystemPrompt keeps
     // them even when persona/scene/briefs consume the whole budget, because a
     // plan without intent/region ids would be dropped by the parser. They are
     // appended after the budgeted blocks, keeping the cacheable prefix stable.
     const facts = this.worldFacts(snapshot)
-    const briefs = [opening, sensor].filter(part => part !== '')
+    const briefs = [brief, sensor].filter(part => part !== '')
+    const autopilot = this.engine?.autopilotEnabled === true
     return buildSystemPrompt({
       ...(pack.manifest.boundaries === undefined ? {} : { boundaries: pack.manifest.boundaries }),
       ...(pack.host === undefined ? {} : { host: pack.host }),
@@ -1016,6 +1054,14 @@ export class PlaySession {
       ...(scene === '' ? {} : { scene }),
       ...(facts.length === 0 ? {} : { world: facts }),
       ...(briefs.length === 0 ? {} : { briefs }),
+      // Mandatory, like `world`: appended after the budget so a long persona
+      // cannot drop the narration field / tool discipline that makes the model
+      // actually speak on this provider.
+      protocol: [
+        ...TURN_PROTOCOL,
+        ...(opening ? OPENING_PROTOCOL : []),
+        ...(autopilot ? AUTOPILOT_PROTOCOL : []),
+      ],
     })
   }
 

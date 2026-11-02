@@ -9,7 +9,7 @@
  * reads it as the highest-priority block.
  *
  * ```
- * boundaries 最前 → host → persona → scene → briefs → world（mandatory）
+ * boundaries 最前 → host → persona → scene → briefs → world → protocol（后两者 mandatory）
  * ```
  *
  * ## Budget and truncation order
@@ -30,9 +30,10 @@
  * `boundaries` is **never** truncated or dropped: if the boundaries alone
  * exceed the budget the assembled prompt is over budget on purpose, because a
  * cut boundary is a safety regression rather than a style regression.
- * `world` (the single-call playable menu) gets the same treatment and is
- * appended after the budgeted blocks, so a long persona cannot hide the intent
- * and region ids that `apply_plan` requires.
+ * `world` (the single-call playable menu) and `protocol` (tool/output discipline)
+ * get the same treatment and are appended after the budgeted blocks, so a long
+ * persona cannot hide the intent/region ids or the narration contract that
+ * `apply_plan` requires.
  *
  * ## No numbers
  *
@@ -53,7 +54,7 @@ export const DEFAULT_SYSTEM_PROMPT_BUDGET_CHARS = 4_000
 export const PROMPT_TRUNCATION_MARK = '…'
 
 /** One block of the layered system prompt. */
-export type PromptSectionKey = 'boundaries' | 'host' | 'persona' | 'scene' | 'briefs' | 'world'
+export type PromptSectionKey = 'boundaries' | 'host' | 'persona' | 'scene' | 'briefs' | 'world' | 'protocol'
 
 /**
  * Canonical block order: hard constraints first, this turn's facts last.
@@ -72,11 +73,13 @@ export const PROMPT_SECTION_ORDER: readonly PromptSectionKey[] = [
   'scene',
   'briefs',
   'world',
+  'protocol',
 ]
 
 /**
  * Sacrifice order used when over budget: the first entry is dropped first.
- * `boundaries` and `world` are absent on purpose — they are never truncated.
+ * `boundaries`, `world` and `protocol` are absent on purpose — they are never
+ * truncated.
  */
 export const PROMPT_SACRIFICE_ORDER: readonly PromptSectionKey[] = ['briefs', 'scene', 'persona', 'host']
 
@@ -100,6 +103,11 @@ export interface SystemPromptInput {
    * total over `budgetChars` by its own length, exactly like `boundaries`.
    */
   readonly world?: readonly string[]
+  /**
+   * Single-call tool/output discipline for this turn (tool choice, narration
+   * field, opening). Mandatory like `world`: never truncated, appended last.
+   */
+  readonly protocol?: readonly string[]
   /** Character budget; defaults to {@link DEFAULT_SYSTEM_PROMPT_BUDGET_CHARS}. */
   readonly budgetChars?: number
 }
@@ -135,6 +143,7 @@ const SECTION_HEADERS: Readonly<Record<PromptSectionKey, string>> = {
   scene: '## 场景',
   briefs: '## 本回合事实（叙事化，不含数值）',
   world: '## 本回合可用（意图与部位）',
+  protocol: '## 工具与输出协议（本回合必须）',
 }
 
 /**
@@ -144,21 +153,23 @@ const SECTION_HEADERS: Readonly<Record<PromptSectionKey, string>> = {
  * blocks in {@link PROMPT_SECTION_ORDER}, joined by a blank line. An empty
  * input produces an empty string (the caller then omits the system message).
  *
- * The `world` block is mandatory and is appended after the budgeted loop: if
- * host/persona/scene/briefs consume the whole budget (or a block is cut and
- * the loop breaks), the playable menu still reaches the model. The total may
- * therefore exceed `budgetChars` by the world block's length — the same
- * exception `boundaries` already has, and for the same reason (a missing
- * boundary or menu is a correctness regression, not a style one).
+ * The `world` and `protocol` blocks are mandatory and are appended after the
+ * budgeted loop: if host/persona/scene/briefs consume the whole budget (or a
+ * block is cut and the loop breaks), the playable menu and the output contract
+ * still reach the model. The total may therefore exceed `budgetChars` by these
+ * blocks' length — the same exception `boundaries` already has, and for the same
+ * reason (a missing boundary, menu or narration contract is a correctness
+ * regression, not a style one).
  */
 export function buildSystemPrompt(input: SystemPromptInput): string {
   const budget = resolveBudget(input.budgetChars)
   const sections = promptSections(input)
   const world = sections.find(section => section.key === 'world')
+  const protocol = sections.find(section => section.key === 'protocol')
   const parts: string[] = []
   let used = 0
   for (const section of sections) {
-    if (section.key === 'world') continue
+    if (section.key === 'world' || section.key === 'protocol') continue
     const separator = parts.length === 0 ? 0 : SECTION_SEPARATOR.length
     const available = budget - used - separator
     const full = renderSection(section)
@@ -194,6 +205,7 @@ export function buildSystemPrompt(input: SystemPromptInput): string {
     break
   }
   if (world !== undefined) parts.push(renderSection(world))
+  if (protocol !== undefined) parts.push(renderSection(protocol))
   return parts.join(SECTION_SEPARATOR)
 }
 
@@ -240,6 +252,8 @@ function promptSections(input: SystemPromptInput): PromptSection[] {
   if (briefs.length > 0) sections.push(sectionOf('briefs', briefs))
   const world = cleanLines(input.world)
   if (world.length > 0) sections.push(sectionOf('world', world))
+  const protocol = cleanLines(input.protocol)
+  if (protocol.length > 0) sections.push(sectionOf('protocol', protocol))
   return sections
 }
 

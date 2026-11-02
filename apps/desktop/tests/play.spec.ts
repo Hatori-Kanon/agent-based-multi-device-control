@@ -962,6 +962,42 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
     await h.host.end('stop')
   })
 
+  it('suppresses player choices in autopilot mode', async () => {
+    const h = await createHarness([scriptedTurn('自动推进。', [choicePlanCall()])])
+    const started = await h.host.start({
+      packId: 'demo',
+      plannedMinutes: 30,
+      autopilot: { enabled: true, intervalSec: 60 },
+    })
+    expect(started.choices).toBeUndefined()
+    const system = h.runner.requests[0]?.messages.find(message => message.role === 'system')?.content ?? ''
+    expect(system).toContain('自动运行')
+    expect(system).toContain('不要生成 choices')
+    await h.host.end('completed')
+  })
+
+  it('adds the single-call narration protocol and the opening scene instruction', async () => {
+    const h = await createHarness([scriptedTurn('第一句。'), scriptedTurn('第二句。')])
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+
+    const opening = h.runner.requests[0]?.messages.find(message => message.role === 'system')?.content ?? ''
+    expect(opening).toContain('## 工具与输出协议（本回合必须）')
+    expect(opening).toContain('narration')
+    expect(opening).toContain('开场回合')
+    expect(opening).toContain('不要调用它们')
+    const applyPlan = h.runner.requests[0]?.tools.find(tool => tool.name === 'apply_plan')
+    const properties = (applyPlan?.parameters as { properties: Record<string, unknown> }).properties
+    expect(properties).toHaveProperty('narration')
+
+    // The scene/background requirement is opening-only; later turns still get
+    // the narration contract but not the opening instruction.
+    await h.host.message('继续。')
+    const second = h.runner.requests[1]?.messages.find(message => message.role === 'system')?.content ?? ''
+    expect(second).toContain('narration')
+    expect(second).not.toContain('开场回合')
+    await h.host.end('stop')
+  })
+
   it('adds player-named parts to the session vocabulary', async () => {
     const h = await createHarness([scriptedTurn('好。', [planCall()])], await narrativePack())
     // v6: the player may name a part freely; it becomes a region key the model
