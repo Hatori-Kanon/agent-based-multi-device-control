@@ -1,9 +1,10 @@
 // 波形柱状图纯函数的真行为测试。
 //
-// 图表几何的计算规则（细柱、柱高只跟波形 intensity 走、频率决定疏密、
-// phase 滚动循环）全部在 `src/ui/chart-math.js` 里。这里不用 grep 源码冒充
-// 行为测试：用 node:vm 在一个只有 `window` 的干净上下文里执行整份 classic
-// script（没有 DOM、没有时钟），再对 computeBars 的输出做几何断言。
+// 图表几何的计算规则（1px 细柱、柱高只跟波形 intensity 走、绝对频率决定
+// 疏密、显示用升采样、phase 滚动循环）全部在 `src/ui/chart-math.js` 里。
+// 这里不用 grep 源码冒充行为测试：用 node:vm 在一个只有 `window` 的干净
+// 上下文里执行整份 classic script（没有 DOM、没有时钟），再对 computeBars /
+// upsampleLinear 的输出做几何断言。
 
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -26,8 +27,14 @@ interface ComputeBarsInput {
   [extra: string]: unknown
 }
 
+interface Upsampled {
+  freq: number[]
+  intensity: number[]
+}
+
 interface ChartMath {
   computeBars: (input: ComputeBarsInput) => Bar[]
+  upsampleLinear: (freq: readonly number[], intensity: readonly number[], factor?: number) => Upsampled
 }
 
 interface ChartMathWindow {
@@ -76,8 +83,12 @@ function gaps(computed: readonly Bar[]): number[] {
   return out
 }
 
+function mean(values: readonly number[]): number {
+  return values.reduce((sum, value) => sum + value, 0) / values.length
+}
+
 describe('chart-math', () => {
-  it('is a pure classic script: one frozen window API, no extra entries', () => {
+  it('is a pure classic script: one frozen window API, no DOM/clock', () => {
     const source = readFileSync(fileURLToPath(SOURCE_URL), 'utf8')
     // 纯计算：不碰 document / performance / Date —— vm 上下文里本来也没有，
     // 能执行成功就说明没有偷偷依赖它们。
@@ -88,20 +99,21 @@ describe('chart-math', () => {
       { window: {} },
     ) as ChartMath
     expect(typeof chartMathWindow.computeBars).toBe('function')
+    expect(typeof chartMathWindow.upsampleLinear).toBe('function')
     expect(Object.isFrozen(chartMathWindow)).toBe(true)
   })
 
-  it('draws thin 2px bars and never widens them to fill the spacing', () => {
+  it('draws thin 1px bars and never widens them to fill the spacing', () => {
     const sparse = uniform(10, 10, 60)
     const dense = uniform(10, 240, 60)
     expect(sparse.length).toBeGreaterThan(0)
     expect(dense.length).toBeGreaterThan(0)
     for (const bar of [...sparse, ...dense]) {
-      expect(bar.width).toBe(2)
+      expect(bar.width).toBe(1)
     }
-    // 高、低频两种疏密下柱宽都一样：宽度不随 spacing 变。
-    expect(new Set(sparse.map(bar => bar.width))).toEqual(new Set([2]))
-    expect(new Set(dense.map(bar => bar.width))).toEqual(new Set([2]))
+    // 最疏/最密两种柱距下柱宽都一样：宽度不随 spacing 变。
+    expect(new Set(sparse.map(bar => bar.width))).toEqual(new Set([1]))
+    expect(new Set(dense.map(bar => bar.width))).toEqual(new Set([1]))
     // 输出只有可 fillRect 的三个字段（没有 y、没有可传通道强度的字段）。
     expect(Object.keys(sparse[0] ?? {}).sort()).toEqual(['height', 'width', 'x'])
   })
@@ -111,7 +123,7 @@ describe('chart-math', () => {
     const half = uniform(10, 125, 50)
     const fullHeight = full[0]?.height ?? 0
     const halfHeight = half[0]?.height ?? 0
-    // 34px 画布：height-3 = 31px 可用高度。
+    // 34px 逻辑高：height-3 = 31px 可用高度。
     expect(fullHeight).toBe(Math.round(1 * (HEIGHT - 3)))
     expect(halfHeight).toBe(Math.round(0.5 * (HEIGHT - 3)))
     expect(Math.abs(halfHeight * 2 - fullHeight)).toBeLessThanOrEqual(1)
@@ -140,85 +152,133 @@ describe('chart-math', () => {
     expect(base.map(bar => bar.height).slice(0, 4)).toEqual([16, 31, 16, 1])
   })
 
-  it('normalizes spacing to the preview frequency range so density is visible', () => {
-    // 真实波形的频率常只覆盖协议域一小段（例如 20–80）。按「本帧 min/max」
-    // 归一化后：最低频 ≈ MAX_SPACING(22px)、最高频 ≈ MIN_SPACING(3px)。
-    const narrow = bars({
+  it('maps absolute frequency to 1/f spacing: high frequency visibly denser', () => {
+    // 绝对协议频率（不按本帧 min/max 归一化）：spacing = clamp(1,20,200/freq)。
+    expect(new Set(gaps(uniform(10, 10, 60)))).toEqual(new Set([20]))
+    expect(new Set(gaps(uniform(10, 50, 60)))).toEqual(new Set([4]))
+    expect(new Set(gaps(uniform(10, 240, 60)))).toEqual(new Set([1]))
+    // 80 → 200/80 = 2.5px；整数 x 取整后相邻差在 2–3 之间、均值≈2.5。
+    const gaps80 = gaps(uniform(10, 80, 60))
+    expect(new Set(gaps80)).toEqual(new Set([2, 3]))
+    expect(Math.abs(mean(gaps80) - 2.5)).toBeLessThan(0.5)
+    // 高频明显比低频密（v15 的归一化会把两者都拉满到 3–22，已撤销）。
+    expect(mean(gaps(uniform(10, 10, 60))) - mean(gaps(uniform(10, 240, 60)))).toBeGreaterThan(10)
+
+    // 0/非有限频率 fallback 到最疏 20px，不产生 NaN。
+    const fallback = bars({
+      freq: [0, Number.NaN, 0],
+      intensity: [60, 60, 60],
+      width: WIDTH,
+      height: HEIGHT,
+      phase: 0,
+    })
+    expect(new Set(gaps(fallback))).toEqual(new Set([20]))
+    for (const bar of fallback) {
+      expect(Number.isFinite(bar.x)).toBe(true)
+      expect(bar.width).toBe(1)
+    }
+
+    // 窄域 [20,20,80,80]：绝对映射下柱距约 10px 与 2–3px，不再被归一化拉满。
+    const narrow = gaps(bars({
       freq: [20, 20, 80, 80],
       intensity: [60, 60, 60, 60],
       width: WIDTH,
       height: HEIGHT,
       phase: 0,
-    })
-    const narrowGaps = gaps(narrow)
-    expect(narrowGaps.length).toBeGreaterThan(6)
-    expect(Math.max(...narrowGaps)).toBe(22)
-    expect(Math.min(...narrowGaps)).toBe(3)
-    expect(new Set(narrowGaps)).toEqual(new Set([3, 22]))
-    // 不再是「全等且疏」：最疏与最密差 > 15px。
-    expect(Math.max(...narrowGaps) - Math.min(...narrowGaps)).toBeGreaterThan(15)
+    }))
+    expect(Math.max(...narrow)).toBe(10)
+    expect(Math.min(...narrow)).toBeLessThanOrEqual(3)
+    expect(Math.max(...narrow) - Math.min(...narrow)).toBeGreaterThan(6)
 
-    // 恒定频率（min==max）：固定中间柱距，等距、无 NaN、不除零。
-    const constantGaps = gaps(uniform(10, 40, 60))
-    expect(constantGaps.length).toBeGreaterThan(3)
-    expect(new Set(constantGaps)).toEqual(new Set([13]))
-    expect(constantGaps.every(gap => Number.isFinite(gap))).toBe(true)
-
-    // 宽域 10–240 仍覆盖到两个极值。
-    const wide = bars({
+    // 宽域 [10,240] 覆盖两个极值（整数 x 下正好是 20px / 1px）。
+    const wide = gaps(bars({
       freq: [10, 10, 240, 240],
       intensity: [60, 60, 60, 60],
       width: WIDTH,
       height: HEIGHT,
       phase: 0,
-    })
-    expect(new Set(gaps(wide))).toEqual(new Set([3, 22]))
+    }))
+    expect(new Set(wide)).toEqual(new Set([1, 20]))
   })
 
-  it('shows visible density for real pack frequency ranges (cilia/tide/climb)', () => {
-    // 真实内容包/内置波形的频率大多只覆盖协议域的一小段：cilia 50–80、
-    // tide 25–70、climb 90–170。归一化后每段都要有明显疏→密对比。
-    const cases = [
-      { name: 'cilia 50–80', values: [50, 56, 62, 68, 74, 80] },
-      { name: 'tide 25–70', values: [25, 34, 43, 52, 61, 70] },
-      { name: 'climb 90–170', values: [90, 106, 122, 138, 154, 170] },
-    ]
-    for (const { values } of cases) {
-      const caseGaps = gaps(bars({
-        freq: values,
-        intensity: values.map(() => 60),
-        width: WIDTH,
-        height: HEIGHT,
-        phase: 0,
-      }))
-      expect(caseGaps.length).toBeGreaterThan(8)
-      const dense = Math.min(...caseGaps)
-      const sparse = Math.max(...caseGaps)
-      expect(dense).toBeLessThanOrEqual(4)
-      expect(sparse).toBeGreaterThanOrEqual(21)
-      expect(sparse - dense).toBeGreaterThan(15)
-    }
+  it('gives real pack frequency ranges their physical density (cilia/tide/climb)', () => {
+    // 绝对域下真实波形不再“全等且疏”：cilia 50–80 ≈2–4px、tide 25–70 ≈3–8px、
+    // climb 18–90 ≈2–11px（整数 x 取整后相邻差会 ±1）。
+    const cilia = gaps(bars({
+      freq: [50, 56, 62, 68, 74, 80],
+      intensity: [60, 60, 60, 60, 60, 60],
+      width: WIDTH,
+      height: HEIGHT,
+      phase: 0,
+    }))
+    expect(Math.min(...cilia)).toBeGreaterThanOrEqual(2)
+    expect(Math.max(...cilia)).toBeLessThanOrEqual(5)
+
+    const tide = gaps(bars({
+      freq: [25, 34, 43, 52, 61, 70],
+      intensity: [60, 60, 60, 60, 60, 60],
+      width: WIDTH,
+      height: HEIGHT,
+      phase: 0,
+    }))
+    expect(Math.min(...tide)).toBeGreaterThanOrEqual(2)
+    expect(Math.max(...tide)).toBeGreaterThanOrEqual(7)
+    expect(Math.max(...tide) - Math.min(...tide)).toBeGreaterThan(3)
+
+    const climb = gaps(bars({
+      freq: [18, 34, 50, 66, 82, 90],
+      intensity: [60, 60, 60, 60, 60, 60],
+      width: WIDTH,
+      height: HEIGHT,
+      phase: 0,
+    }))
+    expect(Math.min(...climb)).toBeLessThanOrEqual(3)
+    expect(Math.max(...climb)).toBeGreaterThanOrEqual(9)
+    // 高频端（90）比低频端（18）密得多：绝对体感而不是等距。
+    expect(Math.max(...climb) - Math.min(...climb)).toBeGreaterThan(6)
+  })
+
+  it('linearly upsamples the preview for smoother display (2x/4x)', () => {
+    // 2x：相邻 slot 之间插中点；最后一根回到第一根（loop 首尾连续）。
+    const doubled = chartMath.upsampleLinear([10, 20, 30, 40], [0, 40, 80, 120], 2)
+    expect(doubled.freq).toHaveLength(8)
+    expect(doubled.intensity).toHaveLength(8)
+    expect(doubled.freq).toEqual([10, 15, 20, 25, 30, 35, 40, 25])
+    expect(doubled.intensity).toEqual([0, 20, 40, 60, 80, 100, 120, 60])
+
+    // 4x：每个 slot 后插 3 个插值点，长度翻 4 倍。
+    const quadrupled = chartMath.upsampleLinear([10, 20], [0, 100], 4)
+    expect(quadrupled.freq).toHaveLength(8)
+    expect(quadrupled.freq).toEqual([10, 12.5, 15, 17.5, 20, 17.5, 15, 12.5])
+    expect(quadrupled.intensity).toEqual([0, 25, 50, 75, 100, 75, 50, 25])
+
+    // 空数组 / 非有限值：不崩、不产生 NaN。
+    expect(chartMath.upsampleLinear([], [], 2)).toEqual({ freq: [], intensity: [] })
+    const safe = chartMath.upsampleLinear([Number.NaN, 20], [10, 40], 2)
+    expect(safe.freq).toHaveLength(4)
+    expect(safe.freq.every(value => Number.isFinite(value))).toBe(true)
+    expect(safe.intensity.every(value => Number.isFinite(value))).toBe(true)
   })
 
   it('scrolls with phase and wraps around the frame cycle', () => {
-    const base = uniform(10, 125, 60, 0)
-    // 恒定频率用固定 13px 柱距：一帧总柱距 = 10 * 13 = 130px，是滚动周期。
-    const cycle = 130
-    // 最右一根柱贴住画布右缘（2px 柱 → x = width - 2）。
-    expect(base[0]?.x).toBe(WIDTH - 2)
-    // phase 增加 → 所有柱整体左移 5px（仍在画布内的那些）。
-    const shifted = uniform(10, 125, 60, 5)
+    // 恒定频率 40 → 绝对 5px 柱距：一帧总柱距 = 10 * 5 = 50px，是滚动周期。
+    const base = uniform(10, 40, 60, 0)
+    const cycle = 50
+    // 最右一根柱贴住画布右缘（1px 柱 → x = width - 1）。
+    expect(base[0]?.x).toBe(WIDTH - 1)
+    // phase 增加 → 所有柱整体左移 2px（仍在画布内的那些；2 不是 5px 柱距的整数倍）。
+    const shifted = uniform(10, 40, 60, 2)
     const shiftedXs = new Set(shifted.map(bar => bar.x))
     for (const bar of base) {
-      if (bar.x - 5 >= 0) expect(shiftedXs.has(bar.x - 5)).toBe(true)
+      if (bar.x - 2 >= 0) expect(shiftedXs.has(bar.x - 2)).toBe(true)
     }
     expect(shifted).not.toEqual(base)
     // phase 取模循环：相差整数个周期的相位输出完全一致（含负数相位）。
-    expect(uniform(10, 125, 60, cycle)).toEqual(base)
-    expect(uniform(10, 125, 60, cycle * 2)).toEqual(base)
-    expect(uniform(10, 125, 60, -cycle)).toEqual(base)
+    expect(uniform(10, 40, 60, cycle)).toEqual(base)
+    expect(uniform(10, 40, 60, cycle * 2)).toEqual(base)
+    expect(uniform(10, 40, 60, -cycle)).toEqual(base)
     // 确定性：同一输入重复调用结果不变。
-    expect(uniform(10, 125, 60, 5)).toEqual(shifted)
+    expect(uniform(10, 40, 60, 2)).toEqual(shifted)
   })
 
   it('never lets a bar exceed the canvas height', () => {

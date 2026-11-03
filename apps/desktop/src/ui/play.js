@@ -37,6 +37,11 @@
   const AUTO_MIN_SEC = 10
   const AUTO_MAX_SEC = 60
   const AUTO_DEFAULT_SEC = 20
+  /** 波形图 canvas 的 CSS 逻辑高度与内部设备像素倍率（2x 绘制，1px 柱更清晰）。 */
+  const WAVE_CANVAS_HEIGHT = 34
+  const WAVE_DEVICE_SCALE = 2
+  /** 预览显示用线性升采样倍率：硬件仍是 25ms slot，只影响画面平滑度。 */
+  const WAVE_UPSCALE = 2
 
   const el = {
     conn: document.getElementById('conn'),
@@ -916,9 +921,10 @@
     if (channel.supportsWaveform === true) {
       canvas = document.createElement('canvas')
       canvas.className = 'live-wave'
-      canvas.width = 300
-      // 和 .live-wave 的 CSS 高度一致：细柱（2px）才不会被纵向拉伸糊掉。
-      canvas.height = 34
+      // 内部分辨率 2x（CSS 逻辑高度 34px）：1px CSS 柱 = 2 device px，细柱更清晰。
+      // 实际宽度在 drawLiveWave 里按 clientWidth 同步，rail 变宽不会被拉伸。
+      canvas.width = 600
+      canvas.height = 68
       canvas.setAttribute('aria-label', `${channel.label ?? channel.id ?? '通道'} 实时波形`)
       row.append(canvas)
       // 波形图下方的小字：柱状图只能看出疏密，名字才说明这是哪个波形、有没有
@@ -1021,36 +1027,56 @@
     }
   }
 
+  /** 把 canvas 内部 buffer 同步成「CSS 宽度 × 2，34px × 2」；尺寸没变不重设。 */
+  function syncLiveWaveSize(canvas) {
+    const cssWidth = Math.max(1, Math.round(canvas.clientWidth) || 300)
+    const deviceWidth = cssWidth * WAVE_DEVICE_SCALE
+    const deviceHeight = WAVE_CANVAS_HEIGHT * WAVE_DEVICE_SCALE
+    if (canvas.width !== deviceWidth || canvas.height !== deviceHeight) {
+      canvas.width = deviceWidth
+      canvas.height = deviceHeight
+    }
+  }
+
   /**
-   * 波形柱状图：从右往左滚；频率越低柱距越大（疏），越高越密。
+   * 波形柱状图：从右往左滚；绝对频率越高柱距越小（密），越低越疏。
    *
-   * 几何计算全在 `/chart-math.js` 的纯函数里：柱宽固定 2px；柱高只跟波形
-   * 自身 intensity 走；柱距跟每个采样点的协议频率走。当前通道强度只影响
-   * 设备输出，不再缩放这张图（旧版把柱高乘上通道百分比，整片柱子会随
-   * 强度缩水，用户看到的「高度跟强度走」就是它）。这里只负责取 preview、
-   * 无 preview 时画基线、以及把算好的矩形 fillRect 出来。
+   * 几何计算全在 `/chart-math.js` 的纯函数里：柱宽固定 1px；柱高只跟波形
+   * 自身 intensity 走；柱距按 `200/freq` 的绝对映射（脉冲间隔 ∝ 1/频率）。
+   * 当前通道强度只影响设备输出，不缩放这张图。这里只负责取 preview、
+   * 显示用升采样、2x 内部分辨率、无 preview 时画基线、以及 fillRect。
    */
   function drawLiveWave(view) {
     const canvas = view.canvas
     if (canvas === null || view.row.offsetParent === null) return
+    // 1px 柱要靠更高内部分辨率才清晰：按当前 CSS 宽度 2x 同步 buffer。
+    syncLiveWaveSize(canvas)
     const context = canvas.getContext('2d')
     if (context === null) return
-    const width = canvas.width
-    const height = canvas.height
+    const scale = WAVE_DEVICE_SCALE
+    // 逻辑坐标仍按 CSS px 计算：1px 柱在 2x buffer 里是 2 device px。
+    context.setTransform(scale, 0, 0, scale, 0, 0)
+    const width = canvas.width / scale
+    const height = canvas.height / scale
     context.clearRect(0, 0, width, height)
     const preview = view.waveformId === '' ? undefined : waveformPreviews.get(view.waveformId)
     if (preview === undefined || window.EmbodiedChartMath === undefined) {
       context.strokeStyle = 'rgba(247, 217, 122, 0.18)'
-      context.lineWidth = 1
+      // 0.5 CSS px = 1 device px：基线保持一条细线。
+      context.lineWidth = 0.5
       context.beginPath()
       context.moveTo(0, height - 1)
       context.lineTo(width, height - 1)
       context.stroke()
       return
     }
+    // 显示用线性升采样（2x）：硬件帧仍是 25ms 一个 slot，这里只让画面细节更平滑。
+    const smooth = typeof window.EmbodiedChartMath.upsampleLinear === 'function'
+      ? window.EmbodiedChartMath.upsampleLinear(preview.freq, preview.intensity, WAVE_UPSCALE)
+      : preview
     const bars = window.EmbodiedChartMath.computeBars({
-      freq: preview.freq,
-      intensity: preview.intensity,
+      freq: smooth.freq,
+      intensity: smooth.intensity,
       width,
       height,
       // 28px/s 的滚动速度；相位取模交给纯函数，滚动是无缝循环的。
