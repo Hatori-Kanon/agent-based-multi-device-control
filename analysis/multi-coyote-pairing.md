@@ -99,13 +99,17 @@
   应用内确认 → `已配对` 标记消失（POST rebind 命中）；0 page/console error。截图
   `01-device-view-initial.png` / `02-device-view-renamed.png` / `03-device-view-rebound.png`。
   它只证明 UI 线路与请求命中，**不证明** rebind 真的断链/停输出——那部分由 core 单测 +
-  `registry.disconnect` 覆盖，真机整局仍待回归。
+  `registry.disconnect` 覆盖。
+- **真机验收（2026-11-04 04:07，用户确认通过）**：两台郊狼同时连接成功，各自绑定不同地址：
+  `coyote → CC:E3:81:07:09:3D`、`coyote-2 → D4:04:F3:8E:CC:A6`（与 Chrome/xtoys 列表中的两个地址一致）。
+  审计 `settings_change(scope=device-paired)` 两条不同 `platformId`；`state/devices.json` 里两个 `bleId`
+  不同。用户反馈："真机验收完成，两台机器同时连接也可以了。"
 
 ## 4. 残余 / 注意
 
-1. **真机未回归**：本环境没有 BLE 硬件；`BluetoothDevice.id`（Chromium 对地址派生的 per-origin id）在
-   Windows 上通常稳定，但换 USB 蓝牙适配器/设备改用随机可解析地址后可能变化，届时旧 pin 会报
-   "找不到已绑定设备"，用「重新配对」恢复即可。
+1. **真机验收已通过（2026-11-04，两台同时连接）**：配对/重连/地址区分均在真机确认。仍需注意
+   `bleId` 是 OS 的 BLE 地址（Windows 上通常稳定）；换 USB 蓝牙适配器、设备改用随机可解析地址或
+   删除系统配对后，旧 pin 可能报"找不到已绑定设备"，用「重新配对」恢复即可。
 2. **首次配对无选择弹窗**：两台都未绑定时，先连接的卡拿"未被占用且未被其他卡保留"里的第一台
    （按广告顺序），操作者用重命名把卡片标成实际那台；连错顺序可用「重新配对」换。要做"从列表挑选"
    需要新的 chooser 交互（后续可加）。**已绑定卡的盒子不会再被未绑定卡抢走**（host 把其他卡
