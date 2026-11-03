@@ -97,6 +97,8 @@ interface Harness {
 
 interface HarnessOptions {
   readonly channels?: readonly Channel[]
+  /** Overrides the harness policy (e.g. a narrow 0-20 band for request tests). */
+  readonly policy?: ChannelPolicy
   /**
    * Builds the registry after the harness clock/audit/policy exist, so a test
    * can inject a `DeviceRegistry` subclass for failure-path coverage.
@@ -117,7 +119,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
   const audit = new AuditLog(store, clock, error => {
     errors.push(error)
   })
-  const policy = new PolicyStore(TEST_POLICY)
+  const policy = new PolicyStore(options.policy ?? TEST_POLICY)
   const onError = (error: unknown): void => {
     errors.push(error)
   }
@@ -277,6 +279,46 @@ describe('dispatch', () => {
     expect(detail['warnings']).toContain('parser note')
     expect(detail['warnings']).toEqual(expect.arrayContaining([expect.stringContaining('disconnected')]))
     expect(detail['warnings']).toEqual(expect.arrayContaining([expect.stringContaining('superseded')]))
+  })
+
+  it('records the model request next to the mapped percent', async () => {
+    const harness = createHarness({
+      channels: WAVEFORM_CHANNELS,
+      policy: { ...TEST_POLICY, minPercent: 0, maxPercent: 20 },
+    })
+    await connect(harness)
+
+    const result = await harness.executor.dispatch(makePlan([
+      levelBeat('b1', {
+        intentId: 'plain',
+        strength: 'med',
+        targets: [{ deviceId: 'toy', channelId: 'a' }],
+        change: { kind: 'level', targetPercent: 50, durationSec: 2 },
+      }),
+      levelBeat('b2', {
+        intentId: 'plain',
+        strength: 'low',
+        targets: [{ deviceId: 'toy', channelId: 'b' }],
+        change: { kind: 'waveform', waveformId: 'tide', durationSec: 4 },
+      }),
+    ]), context(harness))
+
+    expect(result.actions).toHaveLength(2)
+    // 50 interval-% on a 0-20 band maps to 10 output-%; the audit keeps both.
+    expect(result.actions[0]).toMatchObject({
+      percent: 10,
+      request: { strength: 'med', targetPercent: 50, requestedPercent: 50 },
+    })
+    // The waveform attempt fails (no registry waveform library), the plain
+    // retry succeeds; the request still records what the model asked for.
+    expect(result.actions[1]).toMatchObject({
+      status: 'degraded',
+      percent: 8,
+      request: { strength: 'low', requestedPercent: 40 },
+    })
+
+    const detail = planResolvedRecords(harness)[0]?.detail as Record<string, unknown>
+    expect(detail['actions']).toEqual(result.actions)
   })
 
   it('reports dispatched and clamped for single-channel commands', async () => {

@@ -1474,8 +1474,28 @@ describe('play page (B2-T12)', () => {
     expect(js).toContain('embodiedConfirm')
     expect(js).toContain('is-latest')
     expect(js).toContain('line-effects')
+    // v14: 效果小框显示「区间请求% → 实际输出%」（软上限映射一眼可见）；
+    // 旧宿主没有 requestedPercent 时退回旧格式，rejected 记录不展示。
+    expect(js).toContain('requestedPercent')
+    expect(js).toContain('区间 ${requested}%')
+    expect(js).toContain('实际 ${actual}%')
+    expect(js).toContain('requested === actual')
+    expect(js).toContain("effect.status === 'rejected'")
+    // 去重 key 必须把 requestedPercent 和 percent 都算进去，否则
+    // 「区间 40% → 实际 8%」与「区间 70% → 实际 8%」会被误合并成一条。
+    expect(js).toContain('percentValues.requested')
+    expect(js).toContain('percentValues.actual')
+    expect(js).toContain("join('|')")
     expect(js).toContain('channel-live')
     expect(js).toContain('/api/waveforms/preview')
+    // v13: 波形图下方有一行波形名小字（用户靠它判断波形有没有变）。
+    // 名字来自 snapshot channel.waveform（id+name），由 updateChannelLive 每轮
+    // 刷新；没有波形时固定「波形：未选择」。
+    expect(js).toContain('live-wave-name')
+    expect(js).toContain('波形：未选择')
+    expect(js).toContain('波形：${waveformName}')
+    expect(js).toContain('channel.waveform')
+    expect(js).toContain('waveformLabel')
     // v11: 右轨柱状图只调用纯几何函数；柱高只跟波形自身 intensity 走，
     // 旧实现乘当前通道强度的 `view.level / 100` 必须消失（用户反馈「高度
     // 不要根据强度」）。

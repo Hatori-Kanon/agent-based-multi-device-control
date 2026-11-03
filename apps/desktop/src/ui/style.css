@@ -1269,6 +1269,11 @@ body.in-session .main-play {
 
 .line-effect {
   white-space: nowrap;
+  /* 文案变长（部位 · 区间 40% → 实际 8% · 波形名）后仍是一格一行、整体换行；
+     极端长的部位/波形名单行截断，不许一个小框把旁白撑出屏幕。 */
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* 右轨通道实时预览：部位输入与软上限滑条之间的一条强度条 + 波形柱状图。 */
@@ -1323,6 +1328,19 @@ body.in-session .main-play {
   background: rgba(12, 15, 21, 0.6);
   /* 画布按容器宽度缩放：柱宽只有 2px，线性插值会糊成一片，像素化才看得清。 */
   image-rendering: pixelated;
+}
+
+/* 波形图下方一行波形名：柱状图只能看出疏密，名字才说明是哪个波形。
+   单行 + ellipsis：长名字（内容包命名空间 id）不允许把右轨撑破。 */
+.live-wave-name {
+  display: block;
+  max-width: 100%;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .line--player {

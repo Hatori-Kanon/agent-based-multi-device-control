@@ -65,13 +65,15 @@ const LEVEL_CHANGE_SCHEMA: Record<string, unknown> = {
       type: 'number',
       minimum: 0,
       maximum: 100,
-      description: '0–100 的相对量：100% = 人类设定的通道上限；0 = 停止。',
+      description:
+        '0–100 的区间百分比：100 = 玩家设定的通道上限，50 = 区间中点；'
+        + '请直接给普通强度 40–70 这类值，不要用 5–20 表达普通强度；具体上限数值对模型不可见。',
     },
     deltaPercent: {
       type: 'number',
       minimum: -20,
       maximum: 20,
-      description: '在当前输出位置上的相对变化量，同一 0–100 相对尺度。',
+      description: '区间百分点微调（±20 相当于区间的 20%），只用于微调；普通强度请用 targetPercent/strength。',
     },
     durationSec: { type: 'number', minimum: 1, maximum: 600 },
   },
@@ -81,6 +83,9 @@ const WAVEFORM_CHANGE_SCHEMA: Record<string, unknown> = {
   type: 'object',
   required: ['kind', 'waveformId', 'durationSec'],
   additionalProperties: false,
+  // 波形动作的幅度由 beat.strength 决定；本 change 不接受 targetPercent /
+  // deltaPercent（additionalProperties:false，写了会被解析器忽略并告警）。
+  description: '波形动作的幅度由 beat.strength 决定；不要在 waveform change 里期待 targetPercent/deltaPercent 生效。',
   properties: {
     kind: { const: 'waveform' },
     waveformId: { type: 'string' },
@@ -96,6 +101,7 @@ const BEAT_CHANGE_SCHEMA: Record<string, unknown> = {
 const BEAT_STRENGTH_SCHEMA: Record<string, unknown> = {
   type: 'string',
   enum: ['low', 'med', 'high'],
+  description: 'low = 40%、med = 70%、high = 100%（100% = 玩家设定的通道上限；具体数值不向模型暴露）。',
 }
 
 const TEXTURE_SCHEMA: Record<string, unknown> = {

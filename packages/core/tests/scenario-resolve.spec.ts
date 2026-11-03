@@ -316,6 +316,108 @@ describe('one turn drives each channel once', () => {
   })
 })
 
+describe('loop output ordering on a shared channel', () => {
+  function loopWaveformBeat(id: string, waveformId: string): Beat {
+    return levelBeat(id, {
+      intentId: 'plain',
+      regions: ['chest'],
+      change: { kind: 'waveform', waveformId, durationSec: 4 },
+    })
+  }
+
+  function fixedLevelBeat(id: string): Beat {
+    return levelBeat(id, {
+      intentId: 'plain',
+      regions: ['chest'],
+      change: { kind: 'level', durationSec: 5 },
+    })
+  }
+
+  it('warns when a superseded earlier beat is a loop', () => {
+    const { lookup } = sustainLookup()
+    const registry = snapshot(device('toy', [channel('a', 'chest', { supportsWaveform: true })]))
+    const resolved = resolvePlan(
+      plan([loopWaveformBeat('b1', 'loop-sustain'), fixedLevelBeat('b2')]),
+      { ...context(registry, PLAIN_INTENT_MAP), waveforms: lookup },
+    )
+
+    expect(resolved.commands).toHaveLength(1)
+    expect(firstCommand(resolved.commands).beatId).toBe('b2')
+    expect(resolved.warnings).toContain(
+      'beat b1: loop output must be the last beat on toy/a; earlier beats need a fixed duration',
+    )
+  })
+
+  it('does not warn when the loop is the final beat', () => {
+    const { lookup } = sustainLookup()
+    const registry = snapshot(device('toy', [channel('a', 'chest', { supportsWaveform: true })]))
+    const resolved = resolvePlan(
+      plan([fixedLevelBeat('b1'), loopWaveformBeat('b2', 'loop-sustain')]),
+      { ...context(registry, PLAIN_INTENT_MAP), waveforms: lookup },
+    )
+
+    expect(resolved.commands).toHaveLength(1)
+    expect(firstCommand(resolved.commands).beatId).toBe('b2')
+    expect(
+      resolved.warnings.some(warning => warning.includes('loop output must be the last beat')),
+    ).toBe(false)
+  })
+
+  it('does not warn when the loop is terminated by a stop', () => {
+    const { lookup } = sustainLookup()
+    const registry = snapshot(device('toy', [channel('a', 'chest', { supportsWaveform: true })]))
+    const resolved = resolvePlan(
+      plan([
+        levelBeat('b1', {
+          regions: ['chest'],
+          change: { kind: 'waveform', waveformId: 'loop-sustain', durationSec: 4 },
+        }),
+        levelBeat('b2', { intentId: 'stop', regions: ['chest'] }),
+      ]),
+      { ...context(registry), waveforms: lookup },
+    )
+
+    expect(resolved.commands).toHaveLength(1)
+    const command = firstCommand(resolved.commands)
+    expect(command.beatId).toBe('b2')
+    expect(command.body).toEqual({ kind: 'level', percent: 0, durationSec: 0 })
+    // loop → stop is the legal termination, not an ordering mistake.
+    expect(
+      resolved.warnings.some(warning => warning.includes('loop output must be the last beat')),
+    ).toBe(false)
+  })
+
+  it('does not warn across different channels', () => {
+    const { lookup } = sustainLookup()
+    const registry = snapshot(device('toy', [
+      channel('a', 'chest', { supportsWaveform: true }),
+      channel('b', 'chest', { supportsWaveform: true }),
+    ]))
+    const resolved = resolvePlan(
+      plan([
+        levelBeat('b1', {
+          intentId: 'plain',
+          regions: ['chest'],
+          targets: [{ deviceId: 'toy', channelId: 'a' }],
+          change: { kind: 'waveform', waveformId: 'loop-sustain', durationSec: 4 },
+        }),
+        levelBeat('b2', {
+          intentId: 'plain',
+          regions: ['chest'],
+          targets: [{ deviceId: 'toy', channelId: 'b' }],
+          change: { kind: 'level', durationSec: 5 },
+        }),
+      ]),
+      { ...context(registry, PLAIN_INTENT_MAP), waveforms: lookup },
+    )
+
+    expect(resolved.commands).toHaveLength(2)
+    expect(
+      resolved.warnings.some(warning => warning.includes('loop output must be the last beat')),
+    ).toBe(false)
+  })
+})
+
 describe('clamping and the strength conversion', () => {
   it('maps a 100% request to the channel ceiling', () => {
     const registry = snapshot(device('toy', [channel('a', 'chest')]))
@@ -403,6 +505,54 @@ describe('clamping and the strength conversion', () => {
     const over = hold(600)
     expect(over.body).toEqual({ kind: 'level', percent: 14, durationSec: 10 })
     expect(over.clamped).toBe(true)
+  })
+})
+
+describe('resolved commands carry the pre-mapping request', () => {
+  it('records targetPercent and the requested interval percentage', () => {
+    const registry = snapshot(device('toy', [channel('a', 'chest', { maxPercent: 20 })]))
+    const command = firstCommand(resolvePlan(
+      plan([levelBeat('b1', {
+        intentId: 'plain',
+        regions: ['chest'],
+        strength: 'med',
+        change: { kind: 'level', targetPercent: 50 },
+      })]),
+      context(registry, PLAIN_INTENT_MAP),
+    ).commands)
+
+    expect(command.body).toEqual({ kind: 'level', percent: 10, durationSec: 2 })
+    // The audit keeps what the model asked for (50) next to what it became (10).
+    expect(command.request).toEqual({ strength: 'med', targetPercent: 50, requestedPercent: 50 })
+  })
+
+  it('records the strength request behind a waveform change', () => {
+    const registry = snapshot(device('toy', [
+      channel('a', 'chest', { supportsWaveform: true, maxPercent: 20 }),
+    ]))
+    const command = firstCommand(resolvePlan(
+      plan([levelBeat('b1', {
+        intentId: 'plain',
+        regions: ['chest'],
+        strength: 'low',
+        change: { kind: 'waveform', waveformId: 'climb', durationSec: 4 },
+      })]),
+      context(registry, PLAIN_INTENT_MAP),
+    ).commands)
+
+    expect(command.request).toEqual({ strength: 'low', requestedPercent: 40 })
+    expect(command.body.kind).toBe('pattern')
+    if (command.body.kind === 'pattern') expect(command.body.envelope.maxPercent).toBe(8)
+  })
+
+  it('keeps a zero request for the stop intent', () => {
+    const registry = snapshot(device('toy', [channel('a', 'chest')]))
+    const command = firstCommand(resolvePlan(
+      plan([levelBeat('b1', { intentId: 'stop', regions: ['chest'], strength: 'high' })]),
+      context(registry),
+    ).commands)
+
+    expect(command.request).toEqual({ strength: 'high', targetPercent: 0, requestedPercent: 0 })
   })
 })
 

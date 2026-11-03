@@ -642,6 +642,39 @@
       .replaceAll('\\t', '  ')
   }
 
+  /**
+   * 效果小框强度格的数值（都已四舍五入到界面上显示的值）。
+   *
+   * `requestedPercent` 是模型在软上限区间里请求的 0–100%；`percent` 是映射
+   * 到通道软上限后的实际输出。缺失/非有限值一律 undefined，旧宿主没有
+   * `requestedPercent` 时退回旧的单数字格式。
+   */
+  function effectPercentValues(effect) {
+    return {
+      requested: typeof effect.requestedPercent === 'number' && Number.isFinite(effect.requestedPercent)
+        ? Math.round(effect.requestedPercent)
+        : undefined,
+      actual: typeof effect.percent === 'number' && Number.isFinite(effect.percent)
+        ? Math.round(effect.percent)
+        : undefined,
+    }
+  }
+
+  /**
+   * 效果小框里强度那一格：区间请求 vs 实际输出。
+   *
+   * 软上限 0–20 时「区间 40% → 实际 8%」能一眼看出「不是模型只敢要 8%」。
+   * 软上限就是满量程时区间=实际，两个数字是同一件事：只留一个（和旧格式
+   * 一致），不写「区间 40% → 实际 40%」这种重复。
+   */
+  function effectPercentText(effect) {
+    const { requested, actual } = effectPercentValues(effect)
+    if (requested === undefined) return actual === undefined ? '' : `${actual}%`
+    if (actual === undefined) return `区间 ${requested}%`
+    if (requested === actual) return `${actual}%`
+    return `区间 ${requested}% → 实际 ${actual}%`
+  }
+
   /** 小框：本回合实际下发的部位 / 强度 / 波形（来自宿主 dispatch 结果）。 */
   function renderEffects(effects) {
     const list = Array.isArray(effects) ? effects.filter(effect => effect !== null && typeof effect === 'object') : []
@@ -650,17 +683,21 @@
     box.className = 'line-effects'
     const seen = new Set()
     for (const effect of list) {
+      // rejected 是下发失败的记录：小框只展示真正生效的效果。
+      if (effect.status === 'rejected') continue
       const part = typeof effect.regionLabel === 'string' && effect.regionLabel !== ''
         ? effect.regionLabel
         : (typeof effect.region === 'string' && effect.region !== '' ? effect.region : '未指定部位')
-      const percent = typeof effect.percent === 'number' && Number.isFinite(effect.percent)
-        ? `${Math.round(effect.percent)}%`
-        : ''
+      const percentValues = effectPercentValues(effect)
+      const percentText = effectPercentText(effect)
       const waveform = typeof effect.waveformName === 'string' && effect.waveformName !== ''
         ? effect.waveformName
         : ''
-      const text = [part, percent, waveform].filter(partText => partText !== '').join(' · ')
-      const key = [part, percent, waveform].join('\u0000')
+      const text = [part, percentText, waveform].filter(partText => partText !== '').join(' · ')
+      // 去重 key 必须含「区间请求」和「实际输出」两个数：只按最终文案/实际值
+      // 去重会把「区间 40% → 实际 8%」和「区间 70% → 实际 8%」误吞成一条。
+      // strength 不参与展示，所以也不进 key。
+      const key = [part, percentValues.requested ?? '', percentValues.actual ?? '', waveform].join('|')
       if (text === '' || seen.has(key)) continue
       seen.add(key)
       const chip = document.createElement('span')
@@ -874,6 +911,7 @@
     row.append(level)
 
     let canvas = null
+    let waveName = null
     if (channel.supportsWaveform === true) {
       canvas = document.createElement('canvas')
       canvas.className = 'live-wave'
@@ -882,6 +920,12 @@
       canvas.height = 34
       canvas.setAttribute('aria-label', `${channel.label ?? channel.id ?? '通道'} 实时波形`)
       row.append(canvas)
+      // 波形图下方的小字：柱状图只能看出疏密，名字才说明这是哪个波形、有没有
+      // 换过。只有波形通道才有这一行；文案由 updateChannelLive 按快照刷新。
+      waveName = document.createElement('span')
+      waveName.className = 'live-wave-name'
+      waveName.textContent = '波形：未选择'
+      row.append(waveName)
     }
 
     channelLiveViews.set(regionKey(device.id, channel.id), {
@@ -891,8 +935,10 @@
       fill,
       percent,
       canvas,
+      waveName,
       level: 0,
       waveformId: '',
+      waveformLabel: '',
     })
     return row
   }
@@ -919,7 +965,22 @@
       view.level = level
       view.fill.style.width = `${level}%`
       view.percent.textContent = `${Math.round(level)}%`
-      const waveformId = typeof channel.waveform?.id === 'string' ? channel.waveform.id : ''
+      const waveform = channel.waveform !== null && typeof channel.waveform === 'object'
+        ? channel.waveform
+        : undefined
+      const waveformId = typeof waveform?.id === 'string' ? waveform.id : ''
+      const waveformName = typeof waveform?.name === 'string' && waveform.name !== ''
+        ? waveform.name
+        : waveformId
+      // 名字和 id 一起进签名：同 id 改名、同名换 id 都必须刷新，不能缓存旧值。
+      const waveformLabel = `${waveformId}\u0000${waveformName}`
+      if (view.waveformLabel !== waveformLabel && view.waveName !== null) {
+        view.waveformLabel = waveformLabel
+        view.waveName.textContent = waveformName === '' ? '波形：未选择' : `波形：${waveformName}`
+        view.waveName.title = waveformId === ''
+          ? '波形：未选择'
+          : `波形：${waveformName}（id：${waveformId}）`
+      }
       if (view.waveformId !== waveformId) {
         view.waveformId = waveformId
         if (waveformId !== '') void ensureWaveformPreview(waveformId)

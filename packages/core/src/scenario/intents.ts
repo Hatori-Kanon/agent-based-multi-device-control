@@ -141,6 +141,21 @@ export type ResolvedCommandBody =
     }
   | { readonly kind: 'waveform'; readonly waveformId: string }
 
+/**
+ * The model's pre-mapping intensity request, carried into dispatch and audit.
+ *
+ * `requestedPercent` is the 0-100 interval percentage the model asked for,
+ * *before* `mapPercentThroughRange` turns it into the channel's absolute
+ * output. Recording it lets operators answer "did the model ask for 15, or did
+ * the engine map a larger request down?" without exposing the cap itself.
+ */
+export interface ResolvedIntensityRequest {
+  readonly strength: BeatStrength
+  readonly targetPercent?: number
+  readonly deltaPercent?: number
+  readonly requestedPercent: number
+}
+
 export interface ResolvedCommand {
   readonly beatId: string
   readonly deviceId: string
@@ -148,6 +163,8 @@ export interface ResolvedCommand {
   readonly body: ResolvedCommandBody
   readonly clamped: boolean
   readonly degraded?: 'offline' | 'no-region-match' | 'unsupported-waveform' | 'unknown-waveform'
+  /** Effective intensity request behind this command (not the mapped output). */
+  readonly request?: ResolvedIntensityRequest
 }
 
 export interface ResolvedPlan {
@@ -179,6 +196,7 @@ interface BodyResult {
   readonly body: ResolvedCommandBody
   readonly clamped: boolean
   readonly degraded: ResolvedCommand['degraded']
+  readonly request: ResolvedIntensityRequest
 }
 
 /** A beat's resolved channel matches plus how they were found. */
@@ -212,7 +230,7 @@ export function resolvePlan(plan: BeatPlan, ctx: ResolveContext): ResolvedPlan {
     resolveBeat(beat, ctx, commands, narrativeOnly, warnings)
   }
 
-  const merged = mergeChannelCommands(commands, warnings)
+  const merged = mergeChannelCommands(commands, warnings, ctx)
   // Sustain applies to the *surviving* command only: doing it before the merge
   // let a sustained loop's hold leak into a later non-loop/level body through
   // the merge's duration=max (ui-v12-review §P2-1).
@@ -253,9 +271,18 @@ interface ChannelMerge {
  *
  * The merge keeps the surviving command in the slot where it was generated and
  * records one warning per superseded command, so the audit explains why a
- * beat's command is absent from `commands`.
+ * beat's command is absent from `commands`. A superseded command that was
+ * playing a looping texture also gets an ordering warning: a loop must be the
+ * last beat on its channel (future queue constraint), because an earlier
+ * duplicate on the same channel would be cut by the later body. A loop
+ * followed by a stop on the same channel is the legal termination, so it is
+ * exempt from that warning.
  */
-function mergeChannelCommands(commands: readonly ResolvedCommand[], warnings: string[]): ResolvedCommand[] {
+function mergeChannelCommands(
+  commands: readonly ResolvedCommand[],
+  warnings: string[],
+  ctx: ResolveContext,
+): ResolvedCommand[] {
   const groups = new Map<string, ChannelMerge>()
   for (const command of commands) {
     const key = matchKey(command.deviceId, command.channelId)
@@ -278,6 +305,23 @@ function mergeChannelCommands(commands: readonly ResolvedCommand[], warnings: st
         `beat ${command.beatId}: command on ${command.deviceId}/${command.channelId}`
         + ` superseded by beat ${group.last.beatId} in the same turn`,
       )
+      // A looping texture cannot share its channel with a later beat: the
+      // later body wins and the loop would have been cut. Surface the ordering
+      // mistake now so a future queue can reject it before dispatch. Ending a
+      // loop with a stop is the legal termination, not an ordering mistake.
+      const supersededBody = command.body
+      const finalIsStop = isStopBody(group.last.body)
+      if (
+        !finalIsStop
+        && supersededBody.kind === 'pattern'
+        && supersededBody.waveformId !== undefined
+        && ctx.waveforms.get(supersededBody.waveformId)?.loop === true
+      ) {
+        warnings.push(
+          `beat ${command.beatId}: loop output must be the last beat on`
+          + ` ${command.deviceId}/${command.channelId}; earlier beats need a fixed duration`,
+        )
+      }
       continue
     }
     merged.push(withMergedDuration(command, group.maxDurationSec))
@@ -286,10 +330,15 @@ function mergeChannelCommands(commands: readonly ResolvedCommand[], warnings: st
 }
 
 /** Requested hold, or 0 for a stop (which clears the channel instead). */
+/** True when the body is a stop (`setLevel(percent: 0)` clears the channel). */
+function isStopBody(body: ResolvedCommand['body']): boolean {
+  return body.kind === 'level' && body.percent === 0
+}
+
 function nonStopDurationSec(command: ResolvedCommand): number {
   const body = command.body
   if (body.kind === 'waveform') return 0
-  if (body.kind === 'level' && body.percent === 0) return 0
+  if (isStopBody(body)) return 0
   return Number.isFinite(body.durationSec) && body.durationSec > 0 ? body.durationSec : 0
 }
 
@@ -298,7 +347,7 @@ function withMergedDuration(command: ResolvedCommand, durationSec: number): Reso
   const body = command.body
   if (body.kind === 'waveform') return command
   // `setLevel(percent: 0)` is a stop; it ignores duration and must stay one.
-  if (body.kind === 'level' && body.percent === 0) return command
+  if (isStopBody(body)) return command
   if (body.durationSec === durationSec) return command
   return { ...command, body: { ...body, durationSec } }
 }
@@ -570,6 +619,7 @@ function buildCommand(
     channelId: channel.id,
     body: result.body,
     clamped: result.clamped,
+    request: result.request,
     ...(degraded === undefined ? {} : { degraded }),
   }
 }
@@ -598,6 +648,9 @@ function buildBody(
       body: { kind: 'level', percent: 0, durationSec: 0 },
       clamped: false,
       degraded: undefined,
+      // A stop is an explicit zero request; keep it in the same shape so the
+      // audit shows why no intensity was applied.
+      request: { strength, targetPercent: 0, requestedPercent: 0 },
     }
   }
 
@@ -615,6 +668,9 @@ function buildBody(
       },
       clamped: timing.clamped,
       degraded: waveform.degraded,
+      // A waveform change's amplitude comes from the beat strength; there is
+      // no targetPercent/deltaPercent for this branch.
+      request: { strength, requestedPercent: strengthRelativePercent(strength) },
     }
   }
 
@@ -633,12 +689,19 @@ function buildBody(
       body: { kind: 'level', percent, durationSec: timing.durationSec },
       clamped: requested < 0 || requested > 100 || timing.clamped,
       degraded: undefined,
+      request: {
+        strength,
+        requestedPercent: requested,
+        ...(change.targetPercent === undefined ? {} : { targetPercent: change.targetPercent }),
+        ...(change.deltaPercent === undefined ? {} : { deltaPercent: change.deltaPercent }),
+      },
     }
   }
 
   // No change: fall back to the intent's suggestion (§4.4 step 3).
   const suggest = intent.suggest
   const percent = strengthTargetPercent(policy, strength)
+  const requestedPercent = strengthRelativePercent(strength)
   const timing = clampDuration(suggest?.durationSec, channel, beat.id, warnings)
   const waveform = resolveWaveform(suggest?.waveform, channel, ctx, beat.id, warnings)
 
@@ -653,6 +716,7 @@ function buildBody(
       },
       clamped: timing.clamped,
       degraded: waveform.degraded,
+      request: { strength, requestedPercent },
     }
   }
 
@@ -667,6 +731,7 @@ function buildBody(
       },
       clamped: timing.clamped,
       degraded: waveform.degraded,
+      request: { strength, requestedPercent },
     }
   }
 
@@ -674,6 +739,7 @@ function buildBody(
     body: { kind: 'level', percent, durationSec: timing.durationSec },
     clamped: timing.clamped,
     degraded: undefined,
+    request: { strength, requestedPercent },
   }
 }
 

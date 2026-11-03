@@ -169,6 +169,22 @@ describe('M2 model tool surface', () => {
     ])
     expect(objectKeys(asRecord(branches[1])['properties'])).toEqual(['durationSec', 'kind', 'waveformId'])
 
+    // Intensity semantics are spelled out so the model picks interval values
+    // instead of writing tiny "absolute-looking" numbers (task-16).
+    const levelProperties = asRecord(branches[0])['properties']
+    const targetPercent = asRecord(asRecord(levelProperties)['targetPercent'])
+    expect(targetPercent['description']).toContain('50 = 区间中点')
+    expect(targetPercent['description']).toContain('不要用 5–20')
+    // Caps are never exposed to the model, so no concrete cap example may leak.
+    expect(targetPercent['description']).not.toContain('上限 20')
+    expect(targetPercent['description']).toContain('具体上限数值对模型不可见')
+    const deltaPercent = asRecord(asRecord(levelProperties)['deltaPercent'])
+    expect(deltaPercent['description']).toContain('只用于微调')
+    expect(asRecord(branches[1])['description']).toContain('beat.strength')
+    const strengthSchema = asRecord(beatProperties['strength'])
+    expect(strengthSchema['description']).toContain('low = 40%')
+    expect(strengthSchema['description']).toContain('具体数值不向模型暴露')
+
     // Per-target override: device/channel plus the same change/strength fields.
     const target = asRecord(asRecord(beatProperties['targets'])['items'])
     expect(objectKeys(asRecord(target['properties']))).toEqual(['change', 'channelId', 'deviceId', 'strength'])

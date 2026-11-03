@@ -37,7 +37,7 @@ import type { DispatchEvent } from '../devices/events.ts'
 import { DeviceRegistry } from '../devices/registry.ts'
 import type { Clock } from '../ports/clock.ts'
 import type { BeatPlan, PlanDrop, PlanValidation } from '../scenario/beat-plan.ts'
-import { resolvePlan, type ResolveContext, type ResolvedCommand, type WaveformLookup } from '../scenario/intents.ts'
+import { resolvePlan, type ResolveContext, type ResolvedCommand, type ResolvedIntensityRequest, type WaveformLookup } from '../scenario/intents.ts'
 import type { WaveformLibrary } from '../waveform/library.ts'
 
 // The probe shape is owned by the recorder (A2-T1); duplicating it here made
@@ -82,6 +82,14 @@ export interface DispatchStatus {
   readonly percent?: number
   /** Safety refusal code or message; only for `'rejected'`. */
   readonly reason?: string
+  /**
+   * The model's pre-mapping intensity request behind this command.
+   *
+   * `percent` is what the engine produced after mapping; this records what the
+   * model asked for (0-100 interval percentage) so the audit can tell a low
+   * request from an over-aggressive download of it. Still contains no cap.
+   */
+  readonly request?: ResolvedIntensityRequest
 }
 
 export interface DispatchResult {
@@ -349,6 +357,12 @@ export class PlanExecutor {
     signal: AbortSignal | undefined,
   ): Promise<{ status: DispatchStatus; accepted: boolean }> {
     const base = { beatId: command.beatId, deviceId: command.deviceId, channelId: command.channelId }
+    // Every outcome carries the model's pre-mapping request, including a
+    // rejected one: that is what the operator needs to explain low output.
+    const statusBase = {
+      ...base,
+      ...(command.request === undefined ? {} : { request: command.request }),
+    }
     const body = command.body
     try {
       if (body.kind === 'level') {
@@ -360,7 +374,7 @@ export class PlanExecutor {
           percent: body.percent,
           durationSec: body.durationSec,
         })
-        return { status: { ...base, status: statusOf(command), percent: body.percent }, accepted: true }
+        return { status: { ...statusBase, status: statusOf(command), percent: body.percent }, accepted: true }
       }
       if (body.kind === 'pattern') {
         const waveformId = this.checkedWaveformId(body.waveformId, warnings)
@@ -371,7 +385,7 @@ export class PlanExecutor {
             envelope: body.envelope,
             durationSec: body.durationSec,
           })
-          return { status: { ...base, status: statusOf(command), percent: body.envelope.maxPercent }, accepted: true }
+          return { status: { ...statusBase, status: statusOf(command), percent: body.envelope.maxPercent }, accepted: true }
         }
         try {
           await this.options.registry.runPattern(PLAN_ACTOR, {
@@ -381,7 +395,7 @@ export class PlanExecutor {
             durationSec: body.durationSec,
             waveformId,
           })
-          return { status: { ...base, status: statusOf(command), percent: body.envelope.maxPercent }, accepted: true }
+          return { status: { ...statusBase, status: statusOf(command), percent: body.envelope.maxPercent }, accepted: true }
         } catch (error) {
           // Only a waveform-stage failure can be salvaged by dropping the
           // texture. A channel/registry refusal (NOT_CONNECTED, LOCKED,
@@ -394,7 +408,7 @@ export class PlanExecutor {
           // abort handling take it from there.
           if (isAborted(signal)) {
             return {
-              status: { ...base, status: 'rejected', reason: describeError(error) },
+              status: { ...statusBase, status: 'rejected', reason: describeError(error) },
               accepted: false,
             }
           }
@@ -410,7 +424,7 @@ export class PlanExecutor {
           })
           return {
             status: {
-              ...base,
+              ...statusBase,
               status: 'degraded',
               percent: body.envelope.maxPercent,
               reason: `waveform "${waveformId}" failed (${describeError(error)}); ran a plain pattern`,
@@ -420,10 +434,10 @@ export class PlanExecutor {
         }
       }
       await this.options.registry.setWaveform(PLAN_ACTOR, command.deviceId, command.channelId, body.waveformId)
-      return { status: { ...base, status: statusOf(command) }, accepted: true }
+      return { status: { ...statusBase, status: statusOf(command) }, accepted: true }
     } catch (error) {
       return {
-        status: { ...base, status: 'rejected', reason: describeError(error) },
+        status: { ...statusBase, status: 'rejected', reason: describeError(error) },
         accepted: false,
       }
     }

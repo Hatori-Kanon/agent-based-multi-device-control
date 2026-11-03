@@ -9,12 +9,14 @@ import {
   MemoryContentSource,
   MemoryDocumentStore,
   MockBackend,
+  PlanExecutor,
   PolicyStore,
   SensorRegistry,
   WaveformLibrary,
   type AuditRecord,
   type Channel,
   type DispatchStatus,
+  type EngineConfig,
   type EngineEvent,
   type LoadedPack,
   type ModelRunner,
@@ -44,6 +46,69 @@ function planCall(id = 'call_1'): ToolCall {
     arguments: {
       pacing: 'probe',
       beats: [{ id: 'b1', intentId: 'probe-touch', regions: ['whole-body'], strength: 'low' }],
+    },
+  }
+}
+
+/** One beat using an intent's own suggestion (envelope/waveform/duration). */
+function suggestPlanCall(intentId: string, id = 'call_suggest'): ToolCall {
+  return {
+    id,
+    name: 'apply_plan',
+    arguments: {
+      pacing: 'probe',
+      beats: [{ id: 'b1', intentId, regions: ['whole-body'], strength: 'low' }],
+    },
+  }
+}
+
+/** An explicit stop of every ready channel (the only way to end a body). */
+function stopPlanCall(id = 'call_stop'): ToolCall {
+  return {
+    id,
+    name: 'apply_plan',
+    arguments: {
+      pacing: 'probe',
+      beats: [{ id: 'b1', intentId: 'stop', regions: ['whole-body'], strength: 'low' }],
+    },
+  }
+}
+
+/** A level change at an explicit band percentage (0–100 of the soft range). */
+function targetPercentPlanCall(targetPercent: number, id = 'call_target'): ToolCall {
+  return {
+    id,
+    name: 'apply_plan',
+    arguments: {
+      pacing: 'probe',
+      beats: [{
+        id: 'b1',
+        intentId: 'ambient-field',
+        regions: ['whole-body'],
+        strength: 'med',
+        change: { kind: 'level', targetPercent, durationSec: 10 },
+      }],
+    },
+  }
+}
+
+/** A level change that only gives the strength bucket (no explicit percent). */
+function strengthLevelPlanCall(
+  strength: 'low' | 'med' | 'high',
+  id = 'call_strength',
+): ToolCall {
+  return {
+    id,
+    name: 'apply_plan',
+    arguments: {
+      pacing: 'probe',
+      beats: [{
+        id: 'b1',
+        intentId: 'ambient-field',
+        regions: ['whole-body'],
+        strength,
+        change: { kind: 'level', durationSec: 10 },
+      }],
     },
   }
 }
@@ -180,27 +245,6 @@ function holdPlanCall(targetPercent: number, durationSec = 3, id = 'call_level')
   }
 }
 
-/** One turn that raises every channel and then stops them again. */
-function levelThenStopPlanCall(id = 'call_level_stop'): ToolCall {
-  return {
-    id,
-    name: 'apply_plan',
-    arguments: {
-      pacing: 'probe',
-      beats: [
-        {
-          id: 'b1',
-          intentId: 'ambient-field',
-          regions: ['whole-body'],
-          strength: 'low',
-          change: { kind: 'level', targetPercent: 100, durationSec: 10 },
-        },
-        { id: 'b2', intentId: 'stop', regions: ['whole-body'], strength: 'low' },
-      ],
-    },
-  }
-}
-
 /** Registry commands issued by the continuity hold (host, `system` actor). */
 function holdRecords(records: readonly AuditRecord[]): readonly AuditRecord[] {
   return records.filter(record => record.actor === 'system'
@@ -231,16 +275,24 @@ class ScriptedRunner implements ModelRunner {
   readonly requests: ModelTurnRequest[] = []
   private readonly turns: ModelTurnResult[]
   private readonly planFirst: boolean
+  /** Optional per-request hook, run just before the scripted tool calls. */
+  private readonly beforeCall: ((request: ModelTurnRequest) => void) | undefined
 
-  constructor(turns: readonly ModelTurnResult[], planFirst = true) {
+  constructor(
+    turns: readonly ModelTurnResult[],
+    planFirst = true,
+    beforeCall?: (request: ModelTurnRequest) => void,
+  ) {
     this.turns = [...turns]
     this.planFirst = planFirst
+    this.beforeCall = beforeCall
   }
 
   async run(request: ModelTurnRequest): Promise<ModelTurnResult> {
     this.requests.push(request)
     const turn = this.turns.shift()
     if (turn === undefined) throw new Error('ScriptedRunner ran out of scripted turns')
+    this.beforeCall?.(request)
     if (this.planFirst) {
       // The plan arrives before the prose: planning -> executing -> writing.
       for (const call of turn.toolCalls) request.onToolCall?.(call)
@@ -408,6 +460,10 @@ interface Harness {
 interface HarnessOptions {
   /** Mock device channels; defaults to the two plain pulse channels. */
   readonly channels?: readonly Channel[]
+  /** Hook run by the scripted runner before its tool calls (fault injection). */
+  readonly beforeCall?: (request: ModelTurnRequest) => void
+  /** Engine tuning forwarded to the session environment. */
+  readonly engineConfig?: Partial<EngineConfig>
 }
 
 /** Build a real registry (mock devices) + scripted model + in-memory audit. */
@@ -441,7 +497,7 @@ async function createHarness(
   }))
   await registry.connect('mock-pulse', new AbortController().signal)
 
-  const runner = new ScriptedRunner(turns)
+  const runner = new ScriptedRunner(turns, true, options?.beforeCall)
   const policySaves: number[] = []
   const states: string[] = []
   const env: PlaySessionEnvironment = {
@@ -453,6 +509,7 @@ async function createHarness(
     sensors: new SensorRegistry({ clock }),
     runner,
     savePolicy: async (): Promise<void> => { policySaves.push(clock.now()) },
+    ...(options?.engineConfig === undefined ? {} : { engineConfig: options.engineConfig }),
     onEvent: (event: EngineEvent): void => {
       if (event.type === 'state') states.push((event.detail as { state: string }).state)
     },
@@ -1466,6 +1523,22 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
     expect(opening).toContain('不要使用 beats[].targets')
     expect(opening).toContain('写错设备 id 的 beat 会回退到 regions')
     expect(opening).toContain('只写正文')
+    // Band-percent semantics, continuation-by-default and the loop-order
+    // rule are global directives (manual and auto mode both need them). The
+    // model's own percentage scale is 0–100 with no concrete cap number: the
+    // mapping into the human's soft range happens client-side.
+    expect(opening).toContain('strength 档位：low=40%、med=70%、high=100%')
+    expect(opening).toContain('100% = 玩家设定的通道上限')
+    expect(opening).toContain('具体数值不向模型暴露')
+    expect(opening).toContain('普通接触用 med')
+    expect(opening).toContain('targetPercent 是 0–100 的区间百分比')
+    expect(opening).toContain('请直接给普通强度 40–70 这样的区间百分比')
+    expect(opening).toContain('不要用 5–20 这类过小值')
+    expect(opening).toContain('deltaPercent 只用于微调')
+    expect(opening).not.toContain('上限 20 时输出 10')
+    expect(opening).toContain('本回合未提及的通道默认延续上一回合输出')
+    expect(opening).toContain('不再刺激某个部位时必须用 stop 意图')
+    expect(opening).toContain('loop 输出只能放在最后一拍')
     // The one-beat-per-channel rule is a *global* director constraint (manual
     // mode hits duplicate merges too), so it lives in the mandatory turn
     // protocol — not in the autopilot-only block.
@@ -1487,6 +1560,7 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
     expect(second).toContain('narration')
     expect(second).toContain('同一通道一回合最多一个 beat')
     expect(second).toContain('设备/通道 id 对模型不可见')
+    expect(second).toContain('本回合未提及的通道默认延续上一回合输出')
     expect(second).not.toContain('nextTurnAfterSec')
     expect(second).not.toContain('自动运行节奏区间')
     expect(second).not.toContain('开场回合')
@@ -1580,7 +1654,8 @@ describe('packed waveforms, player parts and true effect rows (audit fixes)', ()
         status: 'dispatched',
         waveformId: 'tentacle:saw-spin',
         waveformName: '回旋锯齿',
-        percent: expect.any(Number),
+        // `strength: 'low'` is 40 % of the channel's soft band (0–20) → 8 %.
+        percent: 8,
       })
     }
     expect(planActions(h.records()).every(action => action.status !== 'rejected')).toBe(true)
@@ -1654,8 +1729,8 @@ describe('packed waveforms, player parts and true effect rows (audit fixes)', ()
       channelId: 'a',
       region: '阴蒂',
       regionLabel: '阴蒂',
-      // 20 % relative through the channel's default 0-20 interval: the safety
-      // mapping is unchanged, only the *route* is new.
+      // targetPercent 20 is 20 % of the soft band (0–20) → 4 % actual output;
+      // only the *route* (alias) is new.
       percent: 4,
       status: 'dispatched',
     })
@@ -1850,8 +1925,8 @@ describe('continuity hold while the model thinks', () => {
       scriptedTurn('（第二回合。）', [planCall('call_2')]),
     ])
     await h.host.start({ packId: 'demo', plannedMinutes: 30 })
-    // 100 % relative maps through each channel's 0–20 % handler interval; the
-    // synced ambient intent drove both ready channels.
+    // targetPercent 100 is the top of the soft band → the channel's 20 % cap;
+    // the synced ambient intent drove both ready channels.
     expect(h.host.transcript()[0]!.effects.map(effect => effect.percent)).toEqual([20, 20])
 
     // Let the plan's own 3 s hold expire: only then is there a gap for the
@@ -1861,7 +1936,8 @@ describe('continuity hold while the model thinks', () => {
 
     const records = h.records()
     const holds = holdRecords(records)
-    // One hold per channel, bounded by min(30, channel.maxDurationSec).
+    // One hold per channel, bounded by min(30, channel.maxDurationSec), and it
+    // replays the original body (a 20 % level), not a host-made value.
     expect(holds.length).toBeGreaterThanOrEqual(2)
     for (const hold of holds.slice(0, 2)) {
       expect(hold.action).toBe('set_level')
@@ -1879,27 +1955,34 @@ describe('continuity hold while the model thinks', () => {
     expect(firstPlanCommand).toBeGreaterThan(firstHold)
 
     // The new plan overrides the held channel: `probe-touch` is `primary`, so
-    // it drives channel a only, at the low strength mapped through the interval.
+    // it drives channel a only; low strength is 40 % of the band → 8 %.
     const second = h.host.transcript()[1]!
     expect(second.effects).toHaveLength(1)
     expect(second.effects[0]).toMatchObject({ channelId: 'a', percent: 8 })
   })
 
-  it('does not hold a channel that the previous turn stopped', async () => {
+  it('does not hold a channel that was explicitly stopped', async () => {
     const h = await createHarness([
-      scriptedTurn('（起又停。）', [levelThenStopPlanCall()]),
-      scriptedTurn('（下一回合。）', [planCall('call_2')]),
+      // Turn 1 raises both channels for 60 s (still running at turn 2, so no
+      // hold is needed there); turn 2 stops them explicitly; turn 3 must not
+      // revive anything.
+      scriptedTurn('（起。）', [holdPlanCall(100, 60)]),
+      scriptedTurn('（停。）', [stopPlanCall('call_stop')]),
+      scriptedTurn('（下一回合。）', [planCall('call_3')]),
     ])
     await h.host.start({ packId: 'demo', plannedMinutes: 30 })
-    const opening = h.host.transcript()[0]!
-    // Both channels were raised and then stopped in the same turn (two level
-    // rows plus two stop rows, the stop ones at percent 0).
-    expect(opening.effects.filter(effect => effect.percent === 0)).toHaveLength(2)
+    expect(holdRecords(h.records())).toHaveLength(0)
 
     await h.host.message('继续。')
-    // A stop clears the remembered output: the next turn must not revive it.
+    // The explicit stop is recorded in the effect box as percent 0 on both
+    // channels (the level was still running, hence no hold at this turn start).
+    const stopped = h.host.transcript()[1]!
+    expect(stopped.effects.map(effect => effect.percent)).toEqual([0, 0])
+
+    await h.host.message('继续。')
+    // A stop removes the continuation state: the next turn must not revive it.
     expect(holdRecords(h.records())).toHaveLength(0)
-    expect(h.host.transcript()).toHaveLength(2)
+    expect(h.host.transcript()).toHaveLength(3)
   })
 
   it('does not restart an effect that still covers the think time', async () => {
@@ -1924,29 +2007,30 @@ describe('continuity hold while the model thinks', () => {
     expect(holdRecords(short.records()).length).toBeGreaterThanOrEqual(2)
   })
 
-  it('does not revive a plan output older than the TTL', async () => {
+  it('keeps continuing an unmentioned channel past the old 90 s TTL', async () => {
     const h = await createHarness([
       scriptedTurn('（很旧的一拍。）', [holdPlanCall(100, 3)]),
       scriptedTurn('（很久以后。）', [planCall('call_2')]),
     ])
     await h.host.start({ packId: 'demo', plannedMinutes: 30 })
-    // The turn that produced the output settled long ago; the narration may
-    // already describe 放开/退出, so the effect must not come back.
+    // User rule: unmentioned channels continue until an explicit stop — there
+    // is no age limit, so an old body is still replayed.
     h.clock.advance(91_000)
     await h.host.message('继续。')
-    expect(holdRecords(h.records())).toHaveLength(0)
+    expect(holdRecords(h.records()).length).toBeGreaterThanOrEqual(2)
   })
 
   it('does not replay human direct control', async () => {
     const h = await createHarness([
-      // Opening turn settles with prose only: no plan, no dispatch.
-      scriptedTurn('（只有正文。）'),
-      scriptedTurn('（仍然没有计划。）'),
+      scriptedTurn('（起。）', [holdPlanCall(100, 3)]),
       scriptedTurn('（下一回合。）', [planCall('call_2')]),
     ])
     await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    h.clock.advance(4_000)
 
-    // The human drives a channel from the device page while no plan is running.
+    // The human drives channel a from the device page after the plan ran: that
+    // becomes the channel's truth, so its plan body must be dropped and the
+    // next turn must not overwrite the human's level.
     await h.registry.setLevel('human', {
       deviceId: 'mock-pulse',
       channelId: 'a',
@@ -1957,43 +2041,186 @@ describe('continuity hold while the model thinks', () => {
       record.action === 'set_level' && record.actor === 'human')).toBe(true)
 
     await h.host.message('继续。')
-    // Human output is not a plan command: the next turn must not hold it.
-    expect(holdRecords(h.records())).toHaveLength(0)
+    // Only channel b still continues the plan's 20 %; a keeps the human level.
+    const holds = holdRecords(h.records())
+    expect(holds).toHaveLength(1)
+    expect(holds[0]!.detail).toMatchObject({ channelId: 'b', percent: 20 })
     expect(h.host.transcript()).toHaveLength(2)
   })
 
-  it('holds a waveform channel with a steady pattern', async () => {
+  it('keeps the previous continuation when a plan is blocked', async () => {
+    let lockSpy: ReturnType<typeof vi.spyOn> | undefined
+    let harnessRef: Harness | undefined
+    let modelCalls = 0
     const h = await createHarness(
       [
-        // `waveformPlanCall` requests 5 s of the packed waveform.
-        scriptedTurn('（带纹理的一拍。）', [waveformPlanCall('saw-spin')]),
+        scriptedTurn('（起。）', [holdPlanCall(100, 3)]),
+        scriptedTurn('（被锁的一拍。）', [targetPercentPlanCall(50, 'call_blocked')]),
+        scriptedTurn('（继续。）', [planCall('call_3')]),
+      ],
+      undefined,
+      {
+        beforeCall: () => {
+          // Lock the registry only for the second dispatch, after the engine
+          // already accepted the turn: the executor must report a blocked plan.
+          modelCalls += 1
+          if (modelCalls === 2 && harnessRef !== undefined) {
+            lockSpy = vi.spyOn(harnessRef.registry, 'isLocked', 'get').mockReturnValue(true)
+          }
+        },
+      },
+    )
+    harnessRef = h
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    h.clock.advance(4_000)
+
+    await h.host.message('继续。')
+    lockSpy?.mockRestore()
+    const blocked = h.records().filter(record => record.action === 'plan_resolved').at(-1)
+    expect((blocked?.detail as { readonly blocked?: boolean } | undefined)?.blocked).toBe(true)
+    // A blocked plan drives nothing and must not become the continuation.
+    expect(h.host.transcript()[1]!.effects).toHaveLength(0)
+
+    await h.host.message('继续。')
+    // The old 20 % body is still the only continuation (never the blocked 50 %).
+    const holds = holdRecords(h.records())
+    expect(holds.length).toBeGreaterThan(0)
+    expect(holds.every(hold =>
+      (hold.detail as { readonly percent?: number }).percent === 20)).toBe(true)
+  })
+
+  it('does not continue a command the registry rejected', async () => {
+    const h = await createHarness([
+      scriptedTurn('（部分失败。）', [holdPlanCall(100, 3)]),
+      scriptedTurn('（下一回合。）', [planCall('call_2')]),
+    ])
+    const original = h.registry.setLevel
+    const spy = vi.spyOn(h.registry, 'setLevel').mockImplementation(
+      async (...args: Parameters<typeof original>) => {
+        const [actor, command] = args
+        if (actor === 'model' && command.channelId === 'a') throw new Error('channel offline')
+        return await original.apply(h.registry, args)
+      },
+    )
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    spy.mockRestore()
+
+    // Channel a's command was rejected, so only b actually ran/continues.
+    expect(h.host.transcript()[0]!.effects.map(effect => effect.channelId)).toEqual(['b'])
+    h.clock.advance(4_000)
+    await h.host.message('继续。')
+    const holds = holdRecords(h.records())
+    expect(holds).toHaveLength(1)
+    expect(holds[0]!.detail).toMatchObject({ channelId: 'b', percent: 20 })
+  })
+
+  it('keeps the old body when an explicit stop is rejected', async () => {
+    const h = await createHarness([
+      scriptedTurn('（起。）', [holdPlanCall(100, 60)]),
+      scriptedTurn('（假停。）', [stopPlanCall('call_stop')]),
+      scriptedTurn('（继续。）', [planCall('call_3')]),
+    ])
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    const original = h.registry.setLevel
+    const spy = vi.spyOn(h.registry, 'setLevel').mockImplementation(
+      async (...args: Parameters<typeof original>) => {
+        const [actor, command] = args
+        if (actor === 'model' && command.percent === 0) throw new Error('stop offline')
+        return await original.apply(h.registry, args)
+      },
+    )
+    await h.host.message('继续。')
+    spy.mockRestore()
+
+    // The rejected stop never reached the registry, so it must not erase the
+    // continuation body: a later turn still continues the 20 % level.
+    expect(h.host.transcript()[1]!.effects).toHaveLength(0)
+    h.clock.advance(60_000)
+    await h.host.message('继续。')
+    const holds = holdRecords(h.records())
+    expect(holds.length).toBeGreaterThan(0)
+    expect(holds.every(hold =>
+      (hold.detail as { readonly percent?: number }).percent === 20)).toBe(true)
+  })
+
+  it('carries the turn abort signal into the executor', async () => {
+    let harnessRef: Harness | undefined
+    const h = await createHarness(
+      [scriptedTurn('（被抢占。）', [planCall()])],
+      undefined,
+      {
+        engineConfig: { turnTimeoutMs: 1_000 },
+        // Advance past the turn budget right before the plan is dispatched: the
+        // timeout aborts the turn controller (without locking the registry), so
+        // a passed-through signal must make the executor record a preempted,
+        // non-dispatched plan.
+        beforeCall: () => {
+          harnessRef?.clock.advance(2_000)
+        },
+      },
+    )
+    harnessRef = h
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    // The executor's audit write races the aborted turn; give it a tick to land.
+    for (let i = 0; i < 5; i += 1) {
+      await new Promise(resolve => setTimeout(resolve, 0))
+    }
+
+    // The aborted signal reached the executor (P1-2): the plan is recorded as
+    // preempted and nothing was dispatched.
+    const resolved = h.records().filter(record => record.action === 'plan_resolved')
+    expect(resolved.length).toBeGreaterThanOrEqual(1)
+    expect((resolved.at(-1)?.detail as { readonly preempted?: boolean } | undefined)?.preempted)
+      .toBe(true)
+    expect(planActions(h.records())).toHaveLength(0)
+    expect(h.registry.snapshot().devices
+      .flatMap(device => device.channels)
+      .every(channel => channel.percent === 0)).toBe(true)
+  })
+
+  it('holds a loop waveform with its original envelope and texture', async () => {
+    const h = await createHarness(
+      [
+        // `cilia-tickle` suggests a `wave` envelope over the loop asset
+        // (`saw-spin`), so the resolved body is NOT a steady hold.
+        scriptedTurn('（循环的一拍。）', [suggestPlanCall('cilia-tickle')]),
         scriptedTurn('（下一回合。）', [planCall('call_2')]),
       ],
       await tentaclePack(),
       { channels: waveformChannels },
     )
     await h.host.start({ packId: 'tentacle', plannedMinutes: 30 })
-    // `saw-spin` is `loop: true`, so the resolver sustains it to 60 s; the
-    // hold only bridges the gap once that window has nearly run out.
+
+    // Capture what the plan actually dispatched: the continuation must replay
+    // this exact body, not a host-made steady envelope.
+    const modelPatterns = h.records().filter(record =>
+      record.action === 'run_pattern' && record.actor === 'model')
+    expect(modelPatterns).toHaveLength(2)
+    const body = modelPatterns[0]!.detail as {
+      readonly envelope?: Record<string, unknown>
+      readonly waveformId?: string
+      readonly durationSec?: number
+    }
+    expect(body.waveformId).toBe('tentacle:saw-spin')
+    expect(body.envelope?.['preset']).toBe('wave')
+    // `saw-spin` is loop:true, so the resolver sustains the 10 s suggestion.
+    expect(body.durationSec).toBe(60)
+
     h.clock.advance(61_000)
     await h.host.message('继续。')
 
-    // The held texture must be re-issued as a steady pattern carrying the
-    // waveform, not as a plain level (which would drop the texture).
-    const patterns = holdRecords(h.records()).filter(record => record.action === 'run_pattern')
-    expect(patterns).toHaveLength(2)
-    for (const hold of patterns) {
-      expect(hold.detail).toMatchObject({
-        waveformId: 'tentacle:saw-spin',
-        durationSec: 30,
-        envelope: {
-          preset: 'steady',
-          minPercent: 8,
-          maxPercent: 8,
-          periodMs: 1_000,
-          jitter: 0,
-        },
-      })
+    const holds = holdRecords(h.records()).filter(record => record.action === 'run_pattern')
+    expect(holds).toHaveLength(2)
+    for (const hold of holds) {
+      const detail = hold.detail as {
+        readonly envelope?: Record<string, unknown>
+        readonly waveformId?: string
+        readonly durationSec?: number
+      }
+      // Same envelope + same waveform; only the bridge duration is bounded.
+      expect(detail.envelope).toEqual(body.envelope)
+      expect(detail.waveformId).toBe('tentacle:saw-spin')
+      expect(detail.durationSec).toBe(30)
     }
   })
 
@@ -2065,6 +2292,67 @@ describe('continuity hold while the model thinks', () => {
     const warnings = (resolved?.detail as { readonly warnings?: readonly string[] } | undefined)?.warnings ?? []
     expect(warnings.join('\n')).toContain('using the session default waveform "tentacle:saw-spin"')
     expect(holdRecords(h.records())).toHaveLength(0)
+  })
+})
+
+// ── Effect box: requested band percent → actual output (task-17) ──────────
+
+describe('effect requested percent transparency', () => {
+  it('shows the requested band percent next to the mapped actual percent', async () => {
+    const h = await createHarness([scriptedTurn('（半档。）', [targetPercentPlanCall(50)])])
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+
+    // The channel's soft band is 0–20: targetPercent 50 (band midpoint) maps
+    // to 10, and the effect carries both numbers for the UI.
+    const effects = h.host.transcript()[0]!.effects
+    expect(effects).toHaveLength(2)
+    for (const effect of effects) {
+      expect(effect).toMatchObject({
+        requestedPercent: 50,
+        percent: 10,
+        status: 'dispatched',
+      })
+    }
+  })
+
+  it('reports the strength bucket as its band percent', async () => {
+    const h = await createHarness([scriptedTurn('（轻触。）', [strengthLevelPlanCall('low')])])
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+
+    // `strength: 'low'` is 40 % of the soft band → actual 8 on a 0–20 band.
+    const effects = h.host.transcript()[0]!.effects
+    expect(effects).toHaveLength(2)
+    for (const effect of effects) {
+      expect(effect).toMatchObject({ requestedPercent: 40, strength: 'low', percent: 8 })
+    }
+  })
+
+  it('omits the request fields when the executor provides no request', async () => {
+    // Simulate an old dispatch path: strip the new `request` field from every
+    // action. The effect must keep working and simply omit both fields.
+    const originalDispatch = PlanExecutor.prototype.dispatch
+    const spy = vi.spyOn(PlanExecutor.prototype, 'dispatch').mockImplementation(
+      async function (this: PlanExecutor, ...args: Parameters<typeof originalDispatch>) {
+        const result = await originalDispatch.apply(this, args)
+        return {
+          ...result,
+          actions: result.actions.map(action => {
+            const { request: _request, ...rest } = action
+            return rest
+          }),
+        }
+      },
+    )
+    try {
+      const h = await createHarness([scriptedTurn('（旧路径。）', [planCall()])])
+      await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+      const effect = h.host.transcript()[0]!.effects[0]!
+      expect(effect.percent).toBe(8)
+      expect(effect).not.toHaveProperty('requestedPercent')
+      expect(effect).not.toHaveProperty('strength')
+    } finally {
+      spy.mockRestore()
+    }
   })
 })
 
