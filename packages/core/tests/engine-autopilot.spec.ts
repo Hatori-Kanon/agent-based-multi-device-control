@@ -61,20 +61,58 @@ describe('autopilot pacing (B2-T5)', () => {
       intervalSec: 20,
       minSec: 10,
       maxSec: 60,
+      windowMinSec: 20,
+      windowMaxSec: 20,
     })
 
     h.engine.setAutopilot(true)
     expect(h.engine.snapshot().autopilot.enabled).toBe(true)
-    // Human interval changes are clamped and re-arm the pending tick.
+    // Human interval changes are clamped and re-arm the pending tick. The
+    // legacy fixed API collapses the window to one point.
     expect(h.engine.setAutopilotInterval(5)).toBe(10)
-    expect(h.engine.snapshot().autopilot.intervalSec).toBe(10)
+    expect(h.engine.snapshot().autopilot).toMatchObject({
+      intervalSec: 10,
+      windowMinSec: 10,
+      windowMaxSec: 10,
+    })
     expect(h.clock.pendingCount).toBe(1)
     expect(h.engine.setAutopilotInterval(999)).toBe(60)
-    expect(h.engine.snapshot().autopilot.intervalSec).toBe(60)
+    expect(h.engine.snapshot().autopilot).toMatchObject({
+      intervalSec: 60,
+      windowMinSec: 60,
+      windowMaxSec: 60,
+    })
 
     h.engine.setAutopilot(false)
     expect(h.engine.snapshot().autopilot.enabled).toBe(false)
     expect(h.clock.pendingCount).toBe(0)
+  })
+
+  it('clamps a range into the absolute bounds and rejects an invalid one', () => {
+    const h = createHarness(immediateRunner())
+
+    h.engine.setAutopilotRange(-100, 999)
+    expect(h.engine.snapshot().autopilot).toMatchObject({
+      minSec: 10,
+      maxSec: 60,
+      windowMinSec: 10,
+      windowMaxSec: 60,
+    })
+
+    // A window entirely above the absolute ceiling collapses onto it.
+    h.engine.setAutopilotRange(70, 80)
+    expect(h.engine.snapshot().autopilot).toMatchObject({
+      intervalSec: 60,
+      windowMinSec: 60,
+      windowMaxSec: 60,
+    })
+
+    expect(() => h.engine.setAutopilotRange(30, 10)).toThrow(RangeError)
+    expect(() => h.engine.setAutopilotRange(Number.NaN, 20)).toThrow(RangeError)
+    expect(() => h.engine.setAutopilotRange(10, Number.POSITIVE_INFINITY)).toThrow(RangeError)
+    // Failed calls must not mutate the window.
+    expect(h.engine.snapshot().autopilot).toMatchObject({ windowMinSec: 60, windowMaxSec: 60 })
+    h.engine.dispose()
   })
 
   it('runs one autopilot turn per interval and skips a busy slot', async () => {
@@ -127,7 +165,7 @@ describe('autopilot pacing (B2-T5)', () => {
     expect(h.clock.pendingCount).toBe(0)
   })
 
-  it('clamps a plan nextTurnAfterSec into the configured range', async () => {
+  it('clamps a plan nextTurnAfterSec into the current window', async () => {
     const suggestions = [3, 999]
     const paced: number[] = []
     let calls = 0
@@ -138,35 +176,162 @@ describe('autopilot pacing (B2-T5)', () => {
         return nextTurnAfterSec === undefined ? { line: 'ok' } : { line: 'ok', nextTurnAfterSec }
       },
     }
-    const h = createHarness(runner, { onPlanPacing: seconds => paced.push(seconds) })
+    const h = createHarness(runner, {
+      // Random 0 selects the window floor whenever there is no suggestion.
+      config: { random: () => 0 },
+      onPlanPacing: seconds => paced.push(seconds),
+    })
 
+    h.engine.setAutopilotRange(10, 60)
     h.engine.setAutopilot(true)
-    expect(h.engine.autopilotIntervalSec).toBe(20)
-
-    h.clock.advance(20_000)
-    expect(calls).toBe(1)
-    await h.engine.whenIdle()
-    // 3s is below the 10s floor, so the engine adopts 10s.
     expect(h.engine.autopilotIntervalSec).toBe(10)
-    expect(paced).toEqual([10])
 
-    h.clock.advance(9_999)
+    h.clock.advance(10_000)
     expect(calls).toBe(1)
-    h.clock.advance(1)
+    await h.engine.whenIdle()
+    // 3s is below the window floor, so the suggestion is clamped to 10s.
+    expect(h.engine.autopilotIntervalSec).toBe(10)
+
+    h.clock.advance(10_000)
     expect(calls).toBe(2)
     await h.engine.whenIdle()
-    // 999s is above the 60s ceiling, so the engine adopts 60s.
+    // 999s is above the window ceiling, so it is clamped to 60s.
     expect(h.engine.autopilotIntervalSec).toBe(60)
-    expect(paced).toEqual([10, 60])
+    // The adopted delays were published: 20 (initial window clamp), the floor
+    // sampled when autopilot turned on, and the two model suggestions.
+    expect(paced).toEqual([20, 10, 60])
 
-    h.clock.advance(59_999)
-    expect(calls).toBe(2)
-    h.clock.advance(1)
+    h.clock.advance(60_000)
     expect(calls).toBe(3)
     await h.engine.whenIdle()
 
     h.engine.stopAutopilot()
     expect(h.clock.pendingCount).toBe(0)
+  })
+
+  it('samples a different integer each time across a variable window', async () => {
+    // One sample per timer arm: the tick schedules one before the turn settles
+    // and the settle path schedules again; the later value is the adopted one.
+    const samples = [0, 0, 0.5, 0, 0.9, 0]
+    let index = 0
+    let calls = 0
+    const runner: TurnRunner = {
+      async run() {
+        calls += 1
+        return { line: 'ok' }
+      },
+    }
+    const h = createHarness(runner, {
+      config: { random: () => samples[index++ % samples.length] ?? 0 },
+    })
+
+    h.engine.setAutopilotRange(10, 30)
+    h.engine.setAutopilot(true)
+    expect(h.engine.autopilotIntervalSec).toBe(10)
+    expect(h.engine.snapshot().autopilot).toMatchObject({ windowMinSec: 10, windowMaxSec: 30 })
+
+    h.clock.advance(10_000)
+    await h.engine.whenIdle()
+    expect(calls).toBe(1)
+    // 0.5 across 10-30 -> 20, and the next timer uses it.
+    expect(h.engine.autopilotIntervalSec).toBe(20)
+
+    h.clock.advance(20_000)
+    await h.engine.whenIdle()
+    expect(calls).toBe(2)
+    // 0.9 across 10-30 -> 28.
+    expect(h.engine.autopilotIntervalSec).toBe(28)
+
+    h.engine.stopAutopilot()
+    expect(h.clock.pendingCount).toBe(0)
+  })
+
+  it('does not sample random for a fixed window', async () => {
+    let randomCalls = 0
+    const h = createHarness(immediateRunner(), {
+      config: {
+        random: () => {
+          randomCalls += 1
+          return 0.5
+        },
+      },
+    })
+
+    h.engine.setAutopilotInterval(20)
+    h.engine.setAutopilot(true)
+    expect(h.engine.snapshot().autopilot).toMatchObject({ windowMinSec: 20, windowMaxSec: 20 })
+
+    h.clock.advance(20_000)
+    await h.engine.whenIdle()
+    expect(randomCalls).toBe(0)
+    expect(h.engine.autopilotIntervalSec).toBe(20)
+
+    h.engine.stopAutopilot()
+    expect(h.clock.pendingCount).toBe(0)
+  })
+
+  it('drops a pending plan suggestion when autopilot is switched off', async () => {
+    const h = createHarness({
+      async run() {
+        return { line: 'ok', nextTurnAfterSec: 30 }
+      },
+    }, { config: { random: () => 0.5 } })
+
+    h.engine.setAutopilotRange(10, 30)
+    await h.engine.submitPlayerMessage('继续')
+    // A manual turn recorded 30s as the next-tick suggestion while auto is off.
+    h.engine.setAutopilot(false)
+    h.engine.setAutopilot(true)
+
+    // The stale 30s must be gone: the window samples 0.5 -> 20 instead.
+    expect(h.engine.autopilotIntervalSec).toBe(20)
+
+    h.engine.stopAutopilot()
+    expect(h.clock.pendingCount).toBe(0)
+  })
+
+  it('does not arm autopilot timers while paused and recovers on resume', async () => {
+    const h = createHarness(immediateRunner())
+    h.engine.setAutopilot(true)
+    await h.engine.pause()
+    expect(h.clock.pendingCount).toBe(0)
+
+    // Re-arm attempts that arrive while paused must not create a tick.
+    h.engine.setAutopilotInterval(30)
+    h.engine.setAutopilotRange(10, 30)
+    expect(h.clock.pendingCount).toBe(0)
+
+    await h.engine.resume()
+    expect(h.clock.pendingCount).toBe(1)
+
+    h.engine.stopAutopilot()
+    expect(h.clock.pendingCount).toBe(0)
+  })
+
+  it('rounds the autopilot window to whole seconds', () => {
+    const h = createHarness(immediateRunner())
+
+    h.engine.setAutopilotRange(12.4, 29.6)
+    expect(h.engine.snapshot().autopilot).toMatchObject({
+      windowMinSec: 12,
+      windowMaxSec: 30,
+      intervalSec: 20,
+    })
+
+    h.engine.setAutopilotRange(10.6, 10.7)
+    expect(h.engine.snapshot().autopilot).toMatchObject({
+      windowMinSec: 11,
+      windowMaxSec: 11,
+      intervalSec: 11,
+    })
+
+    expect(h.engine.setAutopilotInterval(12.6)).toBe(13)
+    expect(h.engine.snapshot().autopilot).toMatchObject({
+      windowMinSec: 13,
+      windowMaxSec: 13,
+      intervalSec: 13,
+    })
+    h.engine.dispose()
   })
 
   it('forces a resolve turn after plannedMinutes plus five minutes', async () => {

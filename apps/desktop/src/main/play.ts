@@ -143,6 +143,17 @@ const HOLD_TTL_MS = 90_000
  */
 const HOLD_REMAINING_THRESHOLD_MS = 6_000
 
+/**
+ * Seconds a `loop: true` waveform keeps playing on its own (user idea 2: a
+ * loop texture should keep running through the model's thinking time instead
+ * of being restarted by the continuity hold).
+ *
+ * The resolver raises a loop-waveform pattern's duration to
+ * `min(this, channel.maxDurationSec)`; stop/level actions are untouched and a
+ * non-loop asset (e.g. a stinger) keeps its short authored duration.
+ */
+const SUSTAIN_LOOP_SEC = 60
+
 /** Pack ids follow `内容包规范.md` §3: lowercase slug. */
 const PACK_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/u
 
@@ -159,7 +170,9 @@ const TURN_PROTOCOL = [
   '本回合是单轮调用：devices_list、state_get、look、sensors_list、waveform_list 不会返回结果，不要调用它们。',
   '必须调用 apply_plan 恰好一次；intentId 和 regions 只能取自「本回合可用」，不要发明 id。',
   'regions 只能取「已就位部位」里列出的名字（whole-body 例外）；不要使用没有出现在「已就位部位」里的内容包 id。',
+  '设备/通道 id 对模型不可见：不要使用 beats[].targets，只用 regions 指定部位；写错设备 id 的 beat 会回退到 regions。',
   '有已就位部位时，beats 里至少有一个动作带 regions；只写正文、不调用 apply_plan 的回合不会有任何设备输出。',
+  '同一通道一回合最多一个 beat；需要连续动作请拆到下一回合（重复 beat 会被合并，后一条生效并记 superseded 审计）。',
   '本端点工具调用不携带正文 content：给玩家看的完整正文必须写进 apply_plan 的 narration 字段（非空，篇幅遵循人设），不能只写在 reasoning 里，也不能只调用工具。',
   'narration 是玩家会看到的正文，不是计划摘要；环境/动作/身体反应用（）包裹，台词不加括号，不出现设备硬件词。',
   'narration 必须写清本回合 beats 实际作用的玩家部位（用这些名字）和动作，不能写没有下发动作的部位，也不能写成与部位无关的泛泛台词。',
@@ -280,11 +293,22 @@ export interface PlaySessionEnvironment {
   readonly engineConfig?: Partial<EngineConfig>
 }
 
-/** Human-facing autopilot request: enable flag plus an optional interval. */
+/** Human-facing autopilot request: enable flag plus an optional pacing window. */
 export interface PlayAutopilotInput {
   readonly enabled: boolean
-  /** Seconds; clamped by the engine into its configured bounds. */
+  /**
+   * Fixed interval, kept for compatibility. When no window is given the engine
+   * treats it as the fixed `[intervalSec, intervalSec]` window.
+   */
   readonly intervalSec?: number
+  /**
+   * Pacing window: the engine picks each auto-turn delay inside it (an AI
+   * suggestion may narrow it for one turn, otherwise it is random). Both
+   * bounds are required together and clamped by the engine into its absolute
+   * `autopilot.minSec`/`maxSec` bounds.
+   */
+  readonly windowMinSec?: number
+  readonly windowMaxSec?: number
 }
 
 /** `start` input: the human's pack, time budget and optional ceiling. */
@@ -700,7 +724,13 @@ export class PlaySession {
     // auto mode, and the opening turn is the first place that matters. A tick
     // that fires while the opening turn runs is dropped by the engine.
     if (autopilot !== undefined) {
-      if (autopilot.intervalSec !== undefined) engine.setAutopilotInterval(autopilot.intervalSec)
+      // A pacing window wins; a bare interval is the legacy fixed-window form
+      // (`setAutopilotInterval` collapses the window to `[x, x]`).
+      if (autopilot.windowMinSec !== undefined && autopilot.windowMaxSec !== undefined) {
+        engine.setAutopilotRange(autopilot.windowMinSec, autopilot.windowMaxSec)
+      } else if (autopilot.intervalSec !== undefined) {
+        engine.setAutopilotInterval(autopilot.intervalSec)
+      }
       engine.setAutopilot(autopilot.enabled)
     }
     // The scheduler's P2 vocabulary has no `opening` kind (B2-T4 owns it);
@@ -762,15 +792,24 @@ export class PlaySession {
   }
 
   /**
-   * Human autopilot change while playing: toggle and/or set the interval.
+   * Human autopilot change while playing: toggle and/or set the pacing window.
    *
-   * The engine clamps the interval into its configured bounds; the next
-   * snapshot carries the adopted values so the UI can re-render the slider.
+   * A window (`windowMinSec`/`windowMaxSec`) lets the engine pick each delay in
+   * the range (an AI suggestion may narrow it for one turn, otherwise random);
+   * a legacy `intervalSec` behaves as the fixed `[x, x]` window. The engine
+   * clamps both into its absolute bounds and the next snapshot carries the
+   * adopted values so the UI can re-render its controls.
    */
   setAutopilot(input: PlayAutopilotInput): PlaySnapshot {
     const engine = this.liveEngine()
-    if (input.intervalSec !== undefined) engine.setAutopilotInterval(input.intervalSec)
-    engine.setAutopilot(input.enabled)
+    const next = normalizeAutopilot(input)
+    if (next === undefined) throw new SessionError('INVALID_INPUT', 'autopilot input is required')
+    if (next.windowMinSec !== undefined && next.windowMaxSec !== undefined) {
+      engine.setAutopilotRange(next.windowMinSec, next.windowMaxSec)
+    } else if (next.intervalSec !== undefined) {
+      engine.setAutopilotInterval(next.intervalSec)
+    }
+    engine.setAutopilot(next.enabled)
     return this.requireSnapshot()
   }
 
@@ -1049,6 +1088,10 @@ export class PlaySession {
       // model references a waveform that does not exist (core's default-wave
       // fallback, `内容包规范.md` §4.5), instead of dropping to a plain pattern.
       pack.waveforms[0]?.id,
+      // Loop textures keep playing on their own until the next plan/stop
+      // replaces them (clamped by the channel's own `maxDurationSec`), so the
+      // thinking window does not need a continuity hold for them.
+      SUSTAIN_LOOP_SEC,
     )
     // Build the prompt (the opening brief, when present, is part of it), then
     // consume the brief: it belongs to the opening turn only, even if that
@@ -1125,9 +1168,13 @@ export class PlaySession {
     this.recordTurnFacts(result)
     this.advanceRoundRobinCursor(result)
     const choices = result.plan?.choices
+    // The director may suggest the next auto-turn delay inside the pacing
+    // window; the engine clamps it and falls back to its own random pick.
+    const nextTurnAfterSec = result.plan?.nextTurnAfterSec
     return {
       line,
       ...(choices === undefined ? {} : { choices }),
+      ...(nextTurnAfterSec === undefined ? {} : { nextTurnAfterSec }),
     }
   }
 
@@ -1508,6 +1555,10 @@ export class PlaySession {
     const facts = this.worldFacts(snapshot)
     const briefs = [brief, sensor].filter(part => part !== '')
     const autopilot = this.engine?.autopilotEnabled === true
+    // Auto mode's pacing window is live engine state (the human may move it
+    // while playing); naming the current range lets the director place
+    // `nextTurnAfterSec` inside it instead of guessing.
+    const pacing = autopilot ? this.autopilotPacingLine() : []
     // The pack's waveform ids are namespaced; the model otherwise invents short
     // names (`saw-spin`) and the executor rejects the plan with UNKNOWN_WAVEFORM.
     const waveformMenu = pack.waveforms.length === 0
@@ -1528,8 +1579,33 @@ export class PlaySession {
         ...waveformMenu,
         ...(opening ? OPENING_PROTOCOL : []),
         ...(autopilot ? AUTOPILOT_PROTOCOL : []),
+        ...pacing,
       ],
     })
+  }
+
+  /**
+   * One protocol line naming the engine's current autopilot pacing window.
+   *
+   * The window is `[windowMinSec, windowMaxSec]` after the user moved range
+   * sliders (falling back to the engine's absolute bounds); the director may
+   * suggest the next delay with `apply_plan.nextTurnAfterSec`. A fixed window
+   * (`min === max`, e.g. the legacy single interval) is not random, so the
+   * line must not promise a random pick.
+   */
+  private autopilotPacingLine(): readonly string[] {
+    const autopilot = this.engine?.snapshot().autopilot
+    if (autopilot === undefined) return []
+    const minSec = autopilot.windowMinSec ?? autopilot.minSec
+    const maxSec = autopilot.windowMaxSec ?? autopilot.maxSec
+    if (minSec === maxSec) {
+      return [
+        `自动运行等待：固定 ${minSec}s；可在 apply_plan.nextTurnAfterSec 给下一回合等待建议（引擎会夹到该固定值），不写则固定等待。`,
+      ]
+    }
+    return [
+      `自动运行节奏区间：${minSec}–${maxSec}s；可在 apply_plan.nextTurnAfterSec 给下一回合等待建议（引擎会夹进区间），不写则由引擎在区间内随机。`,
+    ]
   }
 
   /** Ids in the effective intent table (the only `apply_plan` values). */
@@ -2051,6 +2127,7 @@ function resolveContextOf(
   regionAliases: ReadonlyMap<string, readonly string[]>,
   roundRobinCursor: number,
   defaultWaveformId: string | undefined,
+  sustainLoopSec: number,
 ): ResolveContext {
   const intents = new Map<string, FeedbackIntent>()
   for (const intent of scenario.feedbackIntents) intents.set(intent.id, intent)
@@ -2068,6 +2145,8 @@ function resolveContextOf(
     // A pack with waveforms ships one default: an unknown model reference
     // degrades to it (with a warning) instead of silently losing the texture.
     ...(defaultWaveformId === undefined ? {} : { defaultWaveformId }),
+    // Loop assets sustain themselves instead of being restarted by the hold.
+    sustainLoopSec,
     ...(regionAliases.size === 0 ? {} : { regionAliases }),
   }
 }
@@ -2112,8 +2191,10 @@ export function openingBriefText(
  * Validate the human autopilot request.
  *
  * `enabled` must be a real boolean (a string "false" must not silently switch
- * the timer on); the interval is optional, positive and finite, and the engine
- * clamps it into its configured range. A malformed request is a caller error.
+ * the timer on). The legacy interval and the pacing window are optional,
+ * positive and finite and are clamped by the engine into its absolute bounds;
+ * the window's two bounds must be provided together and be ordered. A
+ * malformed request is a caller error.
  */
 function normalizeAutopilot(input: PlayAutopilotInput | undefined): PlayAutopilotInput | undefined {
   if (input === undefined) return undefined
@@ -2124,9 +2205,29 @@ function normalizeAutopilot(input: PlayAutopilotInput | undefined): PlayAutopilo
     && (!Number.isFinite(input.intervalSec) || input.intervalSec <= 0)) {
     throw new SessionError('INVALID_INPUT', 'autopilot.intervalSec must be a positive number')
   }
+  for (const [name, value] of [
+    ['windowMinSec', input.windowMinSec],
+    ['windowMaxSec', input.windowMaxSec],
+  ] as const) {
+    if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+      throw new SessionError('INVALID_INPUT', `autopilot.${name} must be a positive number`)
+    }
+  }
+  if ((input.windowMinSec === undefined) !== (input.windowMaxSec === undefined)) {
+    throw new SessionError(
+      'INVALID_INPUT',
+      'autopilot.windowMinSec and autopilot.windowMaxSec must be provided together',
+    )
+  }
+  if (input.windowMinSec !== undefined && input.windowMaxSec !== undefined
+    && input.windowMinSec > input.windowMaxSec) {
+    throw new SessionError('INVALID_INPUT', 'autopilot.windowMinSec must not exceed autopilot.windowMaxSec')
+  }
   return {
     enabled: input.enabled,
     ...(input.intervalSec === undefined ? {} : { intervalSec: input.intervalSec }),
+    ...(input.windowMinSec === undefined ? {} : { windowMinSec: input.windowMinSec }),
+    ...(input.windowMaxSec === undefined ? {} : { windowMaxSec: input.windowMaxSec }),
   }
 }
 

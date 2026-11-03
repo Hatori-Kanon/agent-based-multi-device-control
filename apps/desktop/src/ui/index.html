@@ -72,8 +72,15 @@
             </div>
             <div class="auto-run-row">
               <label class="auto-run-toggle"><input type="checkbox" id="autoLobbyEnabled"> 自动运行</label>
-              <input id="autoLobbyInterval" type="range" min="10" max="60" step="1" value="20" aria-label="自动运行间隔（秒）">
               <span class="auto-run-value" id="autoLobbyValue">20s</span>
+            </div>
+            <div class="auto-run-row auto-run-window">
+              <span class="auto-run-axis">最短
+                <input id="autoLobbyMin" type="range" min="10" max="60" step="1" value="20" aria-label="自动运行最短等待（秒）">
+              </span>
+              <span class="auto-run-axis">最长
+                <input id="autoLobbyMax" type="range" min="10" max="60" step="1" value="20" aria-label="自动运行最长等待（秒）">
+              </span>
             </div>
             <button class="btn btn-accent btn-lg btn-block" id="start" type="button">开局</button>
           </section>
@@ -126,8 +133,15 @@
             <h2 class="card-title">自动运行</h2>
             <div class="auto-run-row">
               <label class="auto-run-toggle"><input type="checkbox" id="autoRunEnabled"> 自动运行</label>
-              <input id="autoRunInterval" type="range" min="10" max="60" step="1" value="20" aria-label="自动运行间隔（秒）">
               <span class="auto-run-value" id="autoRunValue">20s</span>
+            </div>
+            <div class="auto-run-row auto-run-window">
+              <span class="auto-run-axis">最短
+                <input id="autoRunMin" type="range" min="10" max="60" step="1" value="20" aria-label="自动运行最短等待（秒）">
+              </span>
+              <span class="auto-run-axis">最长
+                <input id="autoRunMax" type="range" min="10" max="60" step="1" value="20" aria-label="自动运行最长等待（秒）">
+              </span>
             </div>
           </section>
 

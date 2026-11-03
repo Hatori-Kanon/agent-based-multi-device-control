@@ -1413,10 +1413,14 @@ describe('play page (B2-T12)', () => {
     expect(html).toContain('id="packFile"')
     expect(html).toContain('id="packImportStatus"')
     // Autopilot is a human pacing control in both the lobby and the session rail.
-    for (const id of ['autoLobbyEnabled', 'autoLobbyInterval', 'autoLobbyValue',
-      'autoRunEnabled', 'autoRunInterval', 'autoRunValue']) {
+    // v12: the wait is a window (shortest–longest), so each mount has two range
+    // ids instead of the old single `auto*Interval` slider.
+    for (const id of ['autoLobbyEnabled', 'autoLobbyMin', 'autoLobbyMax', 'autoLobbyValue',
+      'autoRunEnabled', 'autoRunMin', 'autoRunMax', 'autoRunValue']) {
       expect(html).toContain(`id="${id}"`)
     }
+    expect(html).not.toContain('autoLobbyInterval')
+    expect(html).not.toContain('autoRunInterval')
     // Confirmations are rendered in-page (native <dialog>), never a browser popup.
     for (const id of ['confirmDialog', 'confirmText', 'confirmCancel', 'confirmOk']) {
       expect(html).toContain(`id="${id}"`)
@@ -1461,6 +1465,12 @@ describe('play page (B2-T12)', () => {
     expect(js).toContain('已导入（覆盖）')
     // Autopilot is session-scoped; end uses the in-page confirmation helper.
     expect(js).toContain('/api/session/autopilot')
+    // v12: start 与 /api/session/autopilot 的载荷都是等待区间；旧单值 id 必须
+    // 没有悬空引用（页面/脚本都只剩新 id），旧宿主靠 intervalSec 中点兼容。
+    expect(js).toContain('windowMinSec')
+    expect(js).toContain('windowMaxSec')
+    expect(js).not.toContain('autoLobbyInterval')
+    expect(js).not.toContain('autoRunInterval')
     expect(js).toContain('embodiedConfirm')
     expect(js).toContain('is-latest')
     expect(js).toContain('line-effects')

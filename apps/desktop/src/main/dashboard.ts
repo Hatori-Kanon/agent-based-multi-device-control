@@ -371,6 +371,45 @@ async function readJsonBody(request: IncomingMessage): Promise<Record<string, un
   return parsed as Record<string, unknown>
 }
 
+/**
+ * Parse the human autopilot input shared by start and the live route.
+ *
+ * `enabled` is required; the legacy `intervalSec` and the new pacing window
+ * (`windowMinSec`/`windowMaxSec`, both-or-neither, min <= max) are optional
+ * positive numbers. Returns the validated input or a 400-ready message.
+ */
+function parseAutopilotBody(raw: Record<string, unknown>): PlayAutopilotInput | string {
+  if (typeof raw.enabled !== 'boolean') return 'autopilot.enabled must be a boolean'
+  const intervalSec = raw.intervalSec
+  if (intervalSec !== undefined
+    && (typeof intervalSec !== 'number' || !Number.isFinite(intervalSec) || intervalSec <= 0)) {
+    return 'autopilot.intervalSec must be a positive number'
+  }
+  const windowMinSec = raw.windowMinSec
+  const windowMaxSec = raw.windowMaxSec
+  for (const [name, value] of [
+    ['windowMinSec', windowMinSec],
+    ['windowMaxSec', windowMaxSec],
+  ] as const) {
+    if (value !== undefined && (typeof value !== 'number' || !Number.isFinite(value) || value <= 0)) {
+      return `autopilot.${name} must be a positive number`
+    }
+  }
+  if ((windowMinSec === undefined) !== (windowMaxSec === undefined)) {
+    return 'autopilot.windowMinSec and autopilot.windowMaxSec must be provided together'
+  }
+  if (typeof windowMinSec === 'number' && typeof windowMaxSec === 'number'
+    && windowMinSec > windowMaxSec) {
+    return 'autopilot.windowMinSec must not exceed autopilot.windowMaxSec'
+  }
+  return {
+    enabled: raw.enabled,
+    ...(typeof intervalSec === 'number' ? { intervalSec } : {}),
+    ...(typeof windowMinSec === 'number' ? { windowMinSec } : {}),
+    ...(typeof windowMaxSec === 'number' ? { windowMaxSec } : {}),
+  }
+}
+
 function asString(value: unknown, fallback: string): string {
   return typeof value === 'string' ? value : fallback
 }
@@ -959,21 +998,12 @@ export class DashboardServer {
           sendError(response, 400, 'autopilot must be an object')
           return
         }
-        const record = raw as Record<string, unknown>
-        if (typeof record.enabled !== 'boolean') {
-          sendError(response, 400, 'autopilot.enabled must be a boolean')
+        const parsed = parseAutopilotBody(raw as Record<string, unknown>)
+        if (typeof parsed === 'string') {
+          sendError(response, 400, parsed)
           return
         }
-        const intervalSec = record.intervalSec
-        if (intervalSec !== undefined
-          && (typeof intervalSec !== 'number' || !Number.isFinite(intervalSec) || intervalSec <= 0)) {
-          sendError(response, 400, 'autopilot.intervalSec must be a positive number')
-          return
-        }
-        autopilot = {
-          enabled: record.enabled,
-          ...(typeof intervalSec === 'number' ? { intervalSec } : {}),
-        }
+        autopilot = parsed
       }
       const input: PlayHostStartRequest = {
         packId,
@@ -1163,22 +1193,13 @@ export class DashboardServer {
         sendError(response, 400, `invalid JSON body: ${error instanceof Error ? error.message : 'unreadable'}`)
         return
       }
-      const enabled = body.enabled
-      if (typeof enabled !== 'boolean') {
-        sendError(response, 400, 'enabled must be a boolean')
-        return
-      }
-      const intervalSec = body.intervalSec
-      if (intervalSec !== undefined
-        && (typeof intervalSec !== 'number' || !Number.isFinite(intervalSec) || intervalSec <= 0)) {
-        sendError(response, 400, 'intervalSec must be a positive number')
+      const parsed = parseAutopilotBody(body)
+      if (typeof parsed === 'string') {
+        sendError(response, 400, parsed)
         return
       }
       try {
-        sendJson(response, 200, await setAutopilot({
-          enabled,
-          ...(typeof intervalSec === 'number' ? { intervalSec } : {}),
-        }))
+        sendJson(response, 200, await setAutopilot(parsed))
       } catch (error) {
         sendSessionFailure(response, error)
       }

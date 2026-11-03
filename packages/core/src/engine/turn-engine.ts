@@ -77,8 +77,9 @@ export interface TurnRunnerResult {
   readonly choices?: readonly PlayerChoice[]
   /**
    * The plan's `BeatPlan.nextTurnAfterSec` suggestion (B2-T5). The engine
-   * clamps it into `[autopilot.minSec, autopilot.maxSec]` and adopts it for
-   * the next autopilot tick; `undefined` keeps the current interval.
+   * clamps it into the current autopilot window and uses it for the next
+   * autopilot tick; `undefined` falls back to the window (a random sample when
+   * the window is not fixed).
    */
   readonly nextTurnAfterSec?: number
   /** Defaults to `completed`. A runner may report `fallback` for a degraded turn. */
@@ -107,6 +108,14 @@ export interface EngineConfig {
   /** P1 preemption grace while a beat is being dispatched. */
   readonly preemptGraceMs: number
   readonly autopilot: { readonly minSec: number; readonly maxSec: number; readonly defaultSec: number }
+  /**
+   * Injectable randomness for a variable autopilot window (tests, hosts).
+   *
+   * Only consulted when the human window is not fixed (`windowMinSec <
+   * windowMaxSec`); defaults to `Math.random`. Keeping it injected makes the
+   * pacing deterministic in tests.
+   */
+  readonly random?: () => number
   readonly choices: {
     readonly enabled: boolean
     readonly max: number
@@ -160,12 +169,17 @@ export interface EngineSnapshot {
   readonly checkpoint: number | undefined
   /** True from the 90% checkpoint on: the next turn must produce a closing plan. */
   readonly mustResolve: boolean
-  /** Human-facing autopilot state: enabled flag, adopted interval and its bounds. */
+  /** Human-facing autopilot state: enabled flag, adopted delay, window and bounds. */
   readonly autopilot: {
     readonly enabled: boolean
+    /** Delay chosen for the pending tick (already inside the window). */
     readonly intervalSec: number
+    /** Absolute configured bounds (`config.autopilot`). */
     readonly minSec: number
     readonly maxSec: number
+    /** Human window the engine samples suggestions/random values from. */
+    readonly windowMinSec: number
+    readonly windowMaxSec: number
   }
 }
 
@@ -284,7 +298,14 @@ export class TurnEngine {
   // B2-T5: autopilot pacing and the session time budget.
   private autopilotOn = false
   private autopilotTimer: Timer | undefined
+  /** Delay chosen for the pending tick (shown to the human, used for choices). */
   private intervalSec: number
+  /** Human window (seconds), always inside `config.autopilot`'s absolute bounds. */
+  private windowMinSec: number
+  private windowMaxSec: number
+  /** Clamped `nextTurnAfterSec` waiting for the next timer arm; consumed once. */
+  private pendingPacedSec: number | undefined
+  private readonly random: () => number
   private sessionStarted = false
   private checkpointTimers: Timer[] = []
   private deadlineTimer: Timer | undefined
@@ -308,7 +329,12 @@ export class TurnEngine {
     this.config = mergeConfig(options.config)
     this.hooks = options
     this.startedAt = this.clock.now()
-    this.intervalSec = this.clampAutopilotSec(this.config.autopilot.defaultSec)
+    this.intervalSec = Math.round(this.clampAutopilotSec(this.config.autopilot.defaultSec))
+    // A fresh engine behaves like the old fixed-interval engine until a human
+    // narrows/widens the window: [defaultSec, defaultSec].
+    this.windowMinSec = this.intervalSec
+    this.windowMaxSec = this.intervalSec
+    this.random = this.config.random ?? Math.random
   }
 
   get state(): TurnState {
@@ -330,31 +356,59 @@ export class TurnEngine {
     return this.autopilotOn
   }
 
-  /** Adopted gap between autopilot turns, already clamped to `[minSec,maxSec]`. */
+  /** The delay chosen for the pending autopilot tick, inside the human window. */
   get autopilotIntervalSec(): number {
     return this.intervalSec
   }
 
   /**
-   * Change the adopted autopilot interval (human setting, seconds).
+   * Set the human-facing autopilot window (seconds).
    *
-   * Clamped into `[autopilot.minSec, autopilot.maxSec]`; an armed timer is
-   * re-armed so the new gap applies from now, not after the old tick. The
-   * engine still adopts a plan's `nextTurnAfterSec` afterwards (that is the
-   * model's pacing suggestion), so a host slider is a starting point rather
-   * than a lock. Returns the clamped value.
+   * Both bounds are clamped into `[config.autopilot.minSec,
+   * config.autopilot.maxSec]`; non-finite values or `minSec > maxSec` throw.
+   * The next delay is then chosen from this window: a plan's
+   * `nextTurnAfterSec` first (clamped), otherwise a uniform integer when the
+   * window is not fixed, otherwise the fixed value. An armed timer is re-armed
+   * so the new window applies from now, and the adopted pacing is published.
+   * Bounds are stored as whole seconds because the UI exposes an integer
+   * slider; `windowMinSec`/`windowMaxSec`/`intervalSec` never carry fractions
+   * (ui-v12-review §P2-5).
    */
-  setAutopilotInterval(seconds: number): number {
-    const next = this.clampAutopilotSec(seconds)
-    if (next === this.intervalSec) return next
-    this.intervalSec = next
+  setAutopilotRange(minSec: number, maxSec: number): void {
+    if (!Number.isFinite(minSec) || !Number.isFinite(maxSec)) {
+      throw new RangeError('autopilot range bounds must be finite numbers')
+    }
+    if (minSec > maxSec) {
+      throw new RangeError('autopilot range minSec must not exceed maxSec')
+    }
+    this.windowMinSec = Math.round(this.clampAutopilotSec(minSec))
+    this.windowMaxSec = Math.round(this.clampAutopilotSec(maxSec))
+    // Re-clamp a suggestion made against the old window; it will be consumed
+    // by the next arming and must never escape the new bounds.
+    if (this.pendingPacedSec !== undefined) {
+      this.pendingPacedSec = this.clampToWindow(this.pendingPacedSec)
+    }
+    this.intervalSec = this.clampToWindow(this.intervalSec)
     if (this.autopilotOn) {
       this.scheduleAutopilotTick()
       // The auto choice timeout follows the autopilot interval: a player who
       // does not pick should not stall auto mode for a separate 60s budget.
       this.maybeArmChoiceTimeout()
+    } else {
+      this.publishPacing()
     }
-    this.publishPacing()
+  }
+
+  /**
+   * Legacy fixed-interval setting (human slider, seconds).
+   *
+   * Exactly equivalent to `setAutopilotRange(seconds, seconds)`: the window
+   * collapses to one point, so no random sampling happens. Clamped into the
+   * absolute bounds and returns the clamped value.
+   */
+  setAutopilotInterval(seconds: number): number {
+    const next = Math.round(this.clampAutopilotSec(seconds))
+    this.setAutopilotRange(next, next)
     return next
   }
 
@@ -373,12 +427,20 @@ export class TurnEngine {
    *
    * Idempotent. A tick only *offers* a turn: it is dropped while another turn
    * runs or while a choice menu waits for the player, and never starts in
-   * `paused` / `locked` / `ending` / `ended`. The adopted interval starts as
-   * `autopilot.defaultSec` and changes only through a clamped
-   * `BeatPlan.nextTurnAfterSec`.
+   * `paused` / `locked` / `ending` / `ended`. The delay starts as
+   * `autopilot.defaultSec` and is then chosen per tick from the human window:
+   * a plan's `nextTurnAfterSec` first, otherwise a random integer inside the
+   * window (or the fixed value when `windowMinSec === windowMaxSec`).
    */
   setAutopilot(enabled: boolean): void {
-    if (this.disposed || this.autopilotOn === enabled) return
+    if (this.disposed) return
+    if (!enabled) {
+      // A suggestion produced while auto was running belongs to that run; a
+      // later `setAutopilot(true)` must not resurrect a stale plan's pacing
+      // (ui-v12-review §P2-3).
+      this.pendingPacedSec = undefined
+    }
+    if (this.autopilotOn === enabled) return
     this.autopilotOn = enabled
     if (enabled) {
       this.scheduleAutopilotTick()
@@ -453,6 +515,8 @@ export class TurnEngine {
         intervalSec: this.intervalSec,
         minSec: this.config.autopilot.minSec,
         maxSec: this.config.autopilot.maxSec,
+        windowMinSec: this.windowMinSec,
+        windowMaxSec: this.windowMaxSec,
       },
     }
   }
@@ -894,7 +958,7 @@ export class TurnEngine {
     })
 
     let outcome: TurnOutcome = 'completed'
-    /** Clamped `BeatPlan.nextTurnAfterSec`; adopted only after a clean turn. */
+    /** `nextTurnAfterSec` clamped to the window; consumed by the next arming. */
     let pacedSec: number | undefined
     try {
       const result = await this.runner.run({
@@ -918,8 +982,8 @@ export class TurnEngine {
           this.lastLine = result.line
           this.emit('line', { turnId, text: result.line })
         }
-        if (result.nextTurnAfterSec !== undefined) {
-          pacedSec = this.clampAutopilotSec(result.nextTurnAfterSec)
+        if (result.nextTurnAfterSec !== undefined && Number.isFinite(result.nextTurnAfterSec)) {
+          pacedSec = this.clampToWindow(result.nextTurnAfterSec)
         }
         if (result.choices !== undefined) {
           await this.offerChoices(turnId, result.choices)
@@ -1001,10 +1065,11 @@ export class TurnEngine {
     }
     this.setState('idle')
     this.emit('turn', { turnId, outcome })
-    // B2-T5: adopt the plan's clamped pacing before rescheduling the timer.
+    // B2-T5: a plan's pacing is a suggestion for the *next* tick, not a new
+    // permanent interval. Store it (window-clamped) and let the re-arm below
+    // consume it exactly once, so a variable window can resume sampling after.
     if (pacedSec !== undefined) {
-      this.intervalSec = pacedSec
-      this.publishPacing()
+      this.pendingPacedSec = pacedSec
     }
     this.drainQueue()
     this.scheduleAutopilotTick()
@@ -1033,11 +1098,46 @@ export class TurnEngine {
     return Math.min(high, Math.max(low, candidate))
   }
 
-  /** Arm (or re-arm) the single pending autopilot tick. */
+  /** Clamp a value into the human window (which is itself inside the bounds). */
+  private clampToWindow(seconds: number): number {
+    // Whole seconds only: the UI slider is step=1 and the snapshot exposes this
+    // value directly (ui-v12-review §P2-5).
+    return Math.round(Math.min(this.windowMaxSec, Math.max(this.windowMinSec, seconds)))
+  }
+
+  /**
+   * Pick the delay for the next autopilot tick.
+   *
+   * A plan's `nextTurnAfterSec` wins (already window-clamped when recorded) and
+   * is consumed once. Otherwise a variable window takes a uniform integer
+   * sample through the injected `random`; a fixed window returns its value.
+   * Every re-arm samples again — the human set a pace band, not a metronome
+   * (用户想法 3).
+   */
+  private selectAutopilotInterval(): number {
+    const suggestion = this.pendingPacedSec
+    this.pendingPacedSec = undefined
+    if (suggestion !== undefined) return this.clampToWindow(suggestion)
+    const low = this.windowMinSec
+    const high = this.windowMaxSec
+    if (high <= low) return low
+    const sample = this.random()
+    const bounded = Number.isFinite(sample) ? Math.min(Math.max(sample, 0), 0.999_999) : 0
+    return Math.min(high, Math.max(low, Math.round(low + (high - low) * bounded)))
+  }
+
+  /** Arm (or re-arm) the single pending autopilot tick with a fresh delay. */
   private scheduleAutopilotTick(): void {
     this.cancelAutopilotTick()
-    if (this.disposed || !this.autopilotOn) return
-    const delayMs = Math.max(1, Math.trunc(this.intervalSec * 1000))
+    // Paused means a full stop: arming while paused left a tick that fired
+    // behind the pause and had to be dropped (ui-v12-review §P2-4). Resume and
+    // `setAutopilot(true)` re-arm once the state allows it.
+    if (this.disposed || !this.autopilotOn || this.turnState === 'paused') return
+    const selected = this.selectAutopilotInterval()
+    const changed = selected !== this.intervalSec
+    this.intervalSec = selected
+    if (changed) this.publishPacing()
+    const delayMs = Math.max(1, Math.trunc(selected * 1000))
     this.autopilotTimer = this.clock.timeout(delayMs, () => {
       this.autopilotTimer = undefined
       this.onAutopilotTick()
@@ -1052,6 +1152,9 @@ export class TurnEngine {
   /** One P3 tick: offer a turn when idle, otherwise drop it and reschedule. */
   private onAutopilotTick(): void {
     if (this.disposed || !this.autopilotOn) return
+    // Defensive: a timer armed before the pause must not spin behind it.
+    // Resume re-arms the cadence (§P2-4).
+    if (this.turnState === 'paused') return
     if (this.canAutopilotStart()) {
       this.submit({ priority: 'autopilot', kind: 'autopilot', at: this.clock.now() })
     } else {

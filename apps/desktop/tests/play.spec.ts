@@ -48,6 +48,19 @@ function planCall(id = 'call_1'): ToolCall {
   }
 }
 
+/** The same plan plus the director's suggested wait before the next auto turn. */
+function pacedPlanCall(nextTurnAfterSec: number, id = 'call_paced'): ToolCall {
+  return {
+    id,
+    name: 'apply_plan',
+    arguments: {
+      pacing: 'probe',
+      nextTurnAfterSec,
+      beats: [{ id: 'b1', intentId: 'probe-touch', regions: ['whole-body'], strength: 'low' }],
+    },
+  }
+}
+
 /** The same plan, plus one offered player option (B2-T6/T11). */
 function choicePlanCall(id = 'call_1'): ToolCall {
   return {
@@ -367,6 +380,13 @@ function tentaclePack(): Promise<LoadedPack> {
       sensation: '细密先拍',
       frames: ['0A0A0A0A50505050', '1010101064646464'],
     }),
+    // A non-loop asset: its short authored duration must stay short (the
+    // sustain rule only raises `loop: true` textures).
+    'waveforms/stinger.json': JSON.stringify({
+      name: '短刺',
+      loop: false,
+      frames: ['1E1E1E1E64646464'],
+    }),
   }))
   return cachedTentaclePack
 }
@@ -547,10 +567,92 @@ describe('play session', () => {
       plannedMinutes: 30,
       autopilot: { enabled: true, intervalSec: 15 },
     })
-    expect(started.autopilot).toEqual({ enabled: true, intervalSec: 15, minSec: 10, maxSec: 60 })
+    // A legacy interval is the fixed `[15, 15]` window.
+    expect(started.autopilot).toMatchObject({
+      enabled: true,
+      intervalSec: 15,
+      minSec: 10,
+      maxSec: 60,
+      windowMinSec: 15,
+      windowMaxSec: 15,
+    })
 
     const changed = await h.host.setAutopilot({ enabled: false, intervalSec: 45 })
-    expect(changed.autopilot).toEqual({ enabled: false, intervalSec: 45, minSec: 10, maxSec: 60 })
+    expect(changed.autopilot).toMatchObject({
+      enabled: false,
+      intervalSec: 45,
+      windowMinSec: 45,
+      windowMaxSec: 45,
+    })
+    await h.host.end('completed')
+  })
+
+  it('applies an autopilot pacing window at start and live', async () => {
+    const h = await createHarness([
+      scriptedTurn('第一句。', [planCall()]),
+      scriptedTurn('第二句。', [planCall('call_2')]),
+    ])
+
+    const started = await h.host.start({
+      packId: 'demo',
+      plannedMinutes: 30,
+      autopilot: { enabled: true, windowMinSec: 10, windowMaxSec: 30 },
+    })
+    expect(started.autopilot).toMatchObject({
+      enabled: true,
+      minSec: 10,
+      maxSec: 60,
+      windowMinSec: 10,
+      windowMaxSec: 30,
+    })
+    // The pending delay is sampled inside the human window.
+    expect(started.autopilot.intervalSec).toBeGreaterThanOrEqual(10)
+    expect(started.autopilot.intervalSec).toBeLessThanOrEqual(30)
+
+    // A variable window is randomised by the engine, and the prompt says so.
+    const variablePrompt = h.runner.requests[0]?.messages
+      .find(message => message.role === 'system')?.content ?? ''
+    expect(variablePrompt).toContain('自动运行节奏区间：10–30s')
+    expect(variablePrompt).toContain('不写则由引擎在区间内随机')
+    expect(variablePrompt).not.toContain('自动运行等待：固定')
+
+    const changed = await h.host.setAutopilot({
+      enabled: true,
+      windowMinSec: 20,
+      windowMaxSec: 40,
+    })
+    expect(changed.autopilot).toMatchObject({ windowMinSec: 20, windowMaxSec: 40 })
+    expect(changed.autopilot.intervalSec).toBeGreaterThanOrEqual(20)
+    expect(changed.autopilot.intervalSec).toBeLessThanOrEqual(40)
+
+    // Engine bounds clamp a window wider than the absolute 10–60 s band.
+    const clamped = await h.host.setAutopilot({ enabled: true, windowMinSec: 5, windowMaxSec: 120 })
+    expect(clamped.autopilot).toMatchObject({ windowMinSec: 10, windowMaxSec: 60 })
+
+    // Malformed windows are caller errors, not 500s.
+    for (const bad of [
+      { enabled: true, windowMinSec: 10 },
+      { enabled: true, windowMinSec: 30, windowMaxSec: 10 },
+      { enabled: true, windowMinSec: -1, windowMaxSec: 20 },
+    ] as const) {
+      await expect(h.host.setAutopilot(bad)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    }
+    await h.host.end('completed')
+  })
+
+  it('adopts the plan nextTurnAfterSec as the next autopilot delay', async () => {
+    const h = await createHarness([
+      scriptedTurn('第一句。', [pacedPlanCall(25)]),
+      scriptedTurn('第二句。', [planCall('call_2')]),
+    ])
+    await h.host.start({
+      packId: 'demo',
+      plannedMinutes: 30,
+      autopilot: { enabled: true, windowMinSec: 10, windowMaxSec: 30 },
+    })
+    // The opening plan suggested 25 s; the engine consumes it once for the
+    // pending tick, so the live snapshot shows the adopted delay.
+    expect(h.host.snapshot()?.autopilot.intervalSec).toBe(25)
     await h.host.end('completed')
   })
 
@@ -729,6 +831,27 @@ describe('session HTTP routes', () => {
       .toMatchObject({ enabled: true, intervalSec: 15 })
     expect((await post('/api/session/autopilot', { enabled: 'yes' })).status).toBe(400)
 
+    // A pacing window is accepted and reflected by the live snapshot.
+    const windowed = await post('/api/session/autopilot', {
+      enabled: true,
+      windowMinSec: 10,
+      windowMaxSec: 30,
+    })
+    expect(windowed.status).toBe(200)
+    expect((await windowed.json() as { autopilot: Record<string, unknown> }).autopilot)
+      .toMatchObject({ windowMinSec: 10, windowMaxSec: 30 })
+    expect(await (await get('/api/session')).json()).toMatchObject({
+      autopilot: { windowMinSec: 10, windowMaxSec: 30 },
+    })
+    // A half/window-inverted request is a caller error.
+    expect((await post('/api/session/autopilot', { enabled: true, windowMinSec: 10 })).status).toBe(400)
+    expect((await post('/api/session/autopilot', {
+      enabled: true,
+      windowMinSec: 30,
+      windowMaxSec: 10,
+    })).status).toBe(400)
+    expect((await post('/api/session/autopilot', { enabled: true, windowMinSec: 'x' })).status).toBe(400)
+
     // The play rail's live chart asks for one waveform's per-slot preview.
     const library = await get('/api/waveforms')
     expect(library.status).toBe(200)
@@ -777,6 +900,17 @@ describe('session HTTP routes', () => {
     expect(await ended.json()).toMatchObject({ state: 'ended' })
     expect((await get('/api/session')).status).toBe(200)
     expect((await post('/api/session/message', { text: '还在吗' })).status).toBe(400)
+
+    // A fresh start accepts a pacing window in its autopilot payload too.
+    const restarted = await post('/api/session/start', {
+      packId: 'demo',
+      plannedMinutes: 30,
+      autopilot: { enabled: true, windowMinSec: 10, windowMaxSec: 30 },
+    })
+    expect(restarted.status).toBe(200)
+    expect(await restarted.json()).toMatchObject({
+      autopilot: { enabled: true, windowMinSec: 10, windowMaxSec: 30 },
+    })
   })
 
   it('refuses unknown packs and bad session input with 400', async () => {
@@ -1238,7 +1372,31 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
     expect(system).toContain('自动运行')
     expect(system).toContain('choices')
     expect(system).not.toContain('不要生成 choices')
+    // Auto mode names its live pacing window and carries the only
+    // `nextTurnAfterSec` mention (it has no effect in manual mode); the
+    // one-beat-per-channel rule is part of the global turn protocol too.
+    // This session uses a *fixed* 10 s window: no random wording.
+    expect(system).toContain('自动运行等待：固定 10s')
+    expect(system).toContain('可在 apply_plan.nextTurnAfterSec 给下一回合等待建议')
+    expect(system).not.toContain('随机')
+    expect(system).not.toContain('自动运行节奏区间')
+    expect(system).toContain('同一通道一回合最多一个 beat')
+    expect(system).toContain('superseded')
     await h.host.end('completed')
+
+    // The engine default (no interval/window given) is the fixed 20–20 s
+    // window, so the prompt must say 固定 rather than promising a random pick.
+    const defaults = await createHarness([scriptedTurn('默认。', [planCall()])])
+    await defaults.host.start({
+      packId: 'demo',
+      plannedMinutes: 30,
+      autopilot: { enabled: true },
+    })
+    const defaultPrompt = defaults.runner.requests[0]?.messages
+      .find(message => message.role === 'system')?.content ?? ''
+    expect(defaultPrompt).toContain('自动运行等待：固定 20s')
+    expect(defaultPrompt).not.toContain('随机')
+    await defaults.host.end('completed')
   })
 
   it('does not wait forever on a choice in autopilot mode', async () => {
@@ -1302,7 +1460,22 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
     // the wildcard), and a prose-only turn is called out as producing nothing.
     expect(opening).toContain('已就位部位')
     expect(opening).toContain('不要使用没有出现在「已就位部位」里的内容包 id')
+    // Device/channel ids are not visible to the model: targets are forbidden and
+    // a wrong device id falls back to region matching (resolver fallback).
+    expect(opening).toContain('设备/通道 id 对模型不可见')
+    expect(opening).toContain('不要使用 beats[].targets')
+    expect(opening).toContain('写错设备 id 的 beat 会回退到 regions')
     expect(opening).toContain('只写正文')
+    // The one-beat-per-channel rule is a *global* director constraint (manual
+    // mode hits duplicate merges too), so it lives in the mandatory turn
+    // protocol — not in the autopilot-only block.
+    expect(opening).toContain('同一通道一回合最多一个 beat')
+    expect(opening).toContain('superseded')
+    // `nextTurnAfterSec` only matters in auto mode: the pacing-window line
+    // (absent here) carries it, the one-beat rule must not advertise it.
+    expect(opening).not.toContain('nextTurnAfterSec')
+    // The pacing window is auto-mode state and must not leak into manual turns.
+    expect(opening).not.toContain('自动运行节奏区间')
     const applyPlan = h.runner.requests[0]?.tools.find(tool => tool.name === 'apply_plan')
     const properties = (applyPlan?.parameters as { properties: Record<string, unknown> }).properties
     expect(properties).toHaveProperty('narration')
@@ -1312,6 +1485,10 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
     await h.host.message('继续。')
     const second = h.runner.requests[1]?.messages.find(message => message.role === 'system')?.content ?? ''
     expect(second).toContain('narration')
+    expect(second).toContain('同一通道一回合最多一个 beat')
+    expect(second).toContain('设备/通道 id 对模型不可见')
+    expect(second).not.toContain('nextTurnAfterSec')
+    expect(second).not.toContain('自动运行节奏区间')
     expect(second).not.toContain('开场回合')
     await h.host.end('stop')
   })
@@ -1796,7 +1973,9 @@ describe('continuity hold while the model thinks', () => {
       { channels: waveformChannels },
     )
     await h.host.start({ packId: 'tentacle', plannedMinutes: 30 })
-    h.clock.advance(6_000)
+    // `saw-spin` is `loop: true`, so the resolver sustains it to 60 s; the
+    // hold only bridges the gap once that window has nearly run out.
+    h.clock.advance(61_000)
     await h.host.message('继续。')
 
     // The held texture must be re-issued as a steady pattern carrying the
@@ -1816,6 +1995,29 @@ describe('continuity hold while the model thinks', () => {
         },
       })
     }
+  })
+
+  it('sustains loop textures and keeps non-loop durations short', async () => {
+    const h = await createHarness(
+      [
+        // Both turns request a 5 s waveform change.
+        scriptedTurn('（循环纹理。）', [waveformPlanCall('saw-spin')]),
+        scriptedTurn('（短刺。）', [waveformPlanCall('stinger')]),
+      ],
+      await tentaclePack(),
+      { channels: waveformChannels },
+    )
+    await h.host.start({ packId: 'tentacle', plannedMinutes: 30 })
+    await h.host.message('继续。')
+
+    const modelDurations = h.records()
+      .filter(record => record.action === 'run_pattern' && record.actor === 'model')
+      .map(record => (record.detail as { readonly durationSec?: number }).durationSec)
+    // `saw-spin` is `loop: true`: the 5 s request is raised to
+    // min(SUSTAIN_LOOP_SEC, channel maxDurationSec) = 60 on both channels.
+    expect(modelDurations.slice(0, 2)).toEqual([60, 60])
+    // `stinger` is `loop: false`: the authored short action keeps its 5 s.
+    expect(modelDurations.slice(2)).toEqual([5, 5])
   })
 
   it('never blocks the turn when a hold command fails', async () => {

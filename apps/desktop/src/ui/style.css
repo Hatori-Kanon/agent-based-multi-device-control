@@ -2397,11 +2397,34 @@ input.region-input:focus {
 
 .auto-run-value {
   flex: none;
+  /* 读数贴右缘：勾选行只剩「开关 + 区间读数」，靠左看起来像开关的一部分。 */
+  margin-left: auto;
   min-width: 32px;
   font-size: 11.5px;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
   text-align: right;
+}
+
+/* 自动运行等待区间：最短/最长两条滑杆并排，读数在上一行（`10–30s`）。 */
+.auto-run-window {
+  gap: 14px;
+}
+
+.auto-run-axis {
+  display: inline-flex;
+  flex: 1 1 0;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.auto-run-axis input[type="range"] {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 /* 应用内确认弹窗：替代 window.confirm，沿用卡片 token 与顶部图层。 */
@@ -2439,6 +2462,15 @@ input.region-input:focus {
   }
 
   .auto-run-row input[type="range"] {
+    flex: 1 1 100%;
+  }
+
+  /* 两条区间滑杆也各占一行：并排时每根只剩几十像素，拖不动也看不清。 */
+  .auto-run-window {
+    flex-wrap: wrap;
+  }
+
+  .auto-run-axis {
     flex: 1 1 100%;
   }
 }

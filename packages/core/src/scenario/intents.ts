@@ -106,6 +106,18 @@ export interface ResolveContext {
    * pattern behaviour.
    */
   readonly defaultWaveformId?: string
+  /**
+   * Session-wide hold for looping waveforms, in seconds (用户想法 2).
+   *
+   * A content pack marks textures it wants to keep playing as `loop: true`.
+   * Without this, a short beat's pattern stops at its own duration and the
+   * channel falls silent while the model "thinks" before the next turn. When
+   * set (host passes e.g. 60), a looping waveform's pattern is raised to this
+   * hold — still capped by the channel's `maxDurationSec` — so it sustains
+   * until the next plan replaces or stops it. Non-loop textures, levels and
+   * stops are unaffected. Absent/<=0 keeps the short duration.
+   */
+  readonly sustainLoopSec?: number
   /** Used only to answer "does this waveform id exist". */
   readonly waveforms: WaveformLookup
   /**
@@ -169,6 +181,17 @@ interface BodyResult {
   readonly degraded: ResolvedCommand['degraded']
 }
 
+/** A beat's resolved channel matches plus how they were found. */
+interface CollectedMatches {
+  readonly matches: ChannelMatch[]
+  /**
+   * True only when the matches came from `beats[].targets`; false for region
+   * expansion (including the target→region fallback), which must honour the
+   * intent's distribution policy (ui-v12-review §P2-2).
+   */
+  readonly fromTargets: boolean
+}
+
 /**
  * Turn one plan into dispatchable commands.
  *
@@ -190,12 +213,19 @@ export function resolvePlan(plan: BeatPlan, ctx: ResolveContext): ResolvedPlan {
   }
 
   const merged = mergeChannelCommands(commands, warnings)
-  merged.sort(compareCommands)
+  // Sustain applies to the *surviving* command only: doing it before the merge
+  // let a sustained loop's hold leak into a later non-loop/level body through
+  // the merge's duration=max (ui-v12-review §P2-1).
+  const sustained = merged.map((command): ResolvedCommand => {
+    const channel = channelSnapshotOf(ctx, command.deviceId, command.channelId)
+    return channel === undefined ? command : sustainLoopCommand(command, channel, ctx)
+  })
+  sustained.sort(compareCommands)
 
   return {
     turnId: plan.turnId,
     planId: makePlanId(plan),
-    commands: merged,
+    commands: sustained,
     narrativeOnlyBeats: [...narrativeOnly].sort(compareStrings),
     warnings,
   }
@@ -293,14 +323,14 @@ function resolveBeat(
     }
   }
 
-  const matches = collectMatches(beat, ctx, warnings)
-  if (matches.length === 0) {
+  const collected = collectMatches(beat, ctx, warnings)
+  if (collected.matches.length === 0) {
     warnings.push(`beat ${beat.id}: no channel matched; the beat stays narrative-only`)
     narrativeOnly.add(beat.id)
     return
   }
 
-  const selected = selectMatches(matches, beat, intent, ctx)
+  const selected = selectMatches(collected.matches, collected.fromTargets, intent, ctx)
   let dispatched = 0
   for (const match of selected) {
     const command = buildCommand(beat, intent, match, ctx, warnings)
@@ -311,11 +341,50 @@ function resolveBeat(
   if (dispatched === 0) narrativeOnly.add(beat.id)
 }
 
+/**
+ * Keep a looping texture playing across the thinking gap (用户想法 2).
+ *
+ * Runs **after** the per-channel merge, on the surviving command only: the
+ * final body decides whether to sustain, so a long loop hold can never leak
+ * into a later level/non-loop body through the merge's duration=max
+ * (ui-v12-review §P2-1). A pack marks assets it wants sustained as
+ * `loop: true`; when the host sets `sustainLoopSec`, that pattern's hold is
+ * raised to the value — never past the channel's own `maxDurationSec` — so
+ * the texture keeps playing until the next plan replaces or stops it.
+ */
+function sustainLoopCommand(
+  command: ResolvedCommand,
+  channel: ResolveChannelSnapshot,
+  ctx: ResolveContext,
+): ResolvedCommand {
+  const body = command.body
+  if (body.kind !== 'pattern' || body.waveformId === undefined) return command
+  const sustainSec = ctx.sustainLoopSec
+  if (sustainSec === undefined || !Number.isFinite(sustainSec) || sustainSec <= 0) return command
+  if (ctx.waveforms.get(body.waveformId)?.loop !== true) return command
+  const channelCap = Number.isFinite(channel.maxDurationSec) && channel.maxDurationSec >= MIN_DURATION_SEC
+    ? channel.maxDurationSec
+    : MIN_DURATION_SEC
+  const targetSec = Math.min(sustainSec, channelCap)
+  if (body.durationSec >= targetSec) return command
+  return { ...command, body: { ...body, durationSec: targetSec } }
+}
+
+/** The live channel snapshot a surviving command points at, if still present. */
+function channelSnapshotOf(
+  ctx: ResolveContext,
+  deviceId: string,
+  channelId: string,
+): ResolveChannelSnapshot | undefined {
+  const device = ctx.snapshot.devices.find(candidate => candidate.id === deviceId)
+  return device?.channels.find(candidate => candidate.id === channelId)
+}
+
 /* ------------------------------------------------------------------------- */
 /* Target expansion: explicit targets first, then regions                     */
 /* ------------------------------------------------------------------------- */
 
-function collectMatches(beat: Beat, ctx: ResolveContext, warnings: string[]): ChannelMatch[] {
+function collectMatches(beat: Beat, ctx: ResolveContext, warnings: string[]): CollectedMatches {
   if (beat.targets !== undefined) {
     const matches: ChannelMatch[] = []
     for (const target of beat.targets) {
@@ -333,7 +402,18 @@ function collectMatches(beat: Beat, ctx: ResolveContext, warnings: string[]): Ch
       }
       matches.push({ device, channel, target, fromFallback: false })
     }
-    return sortMatches(matches)
+    if (matches.length > 0) return { matches: sortMatches(matches), fromTargets: true }
+    // The prompt deliberately exposes regions, not device/channel ids, so a
+    // model can only guess `targets` and usually guesses wrong (smoke
+    // turn 1/3: deviceId "tentacle-shadow"/"tentacle" for a coyote). With no
+    // match at all, falling back to the beat's regions is the only way this
+    // beat can reach hardware; treat it as a region route, not as explicit
+    // targets (distribution still applies). A target that *did* match a
+    // device (even an offline one) never falls back: that would drive a part
+    // the plan did not ask for.
+    if (beat.regions.length === 0) return { matches: [], fromTargets: true }
+    warnings.push(`beat ${beat.id}: no explicit target matched; falling back to region matching`)
+    // Fall through to the region expansion below.
   }
 
   const matches: ChannelMatch[] = []
@@ -350,7 +430,7 @@ function collectMatches(beat: Beat, ctx: ResolveContext, warnings: string[]): Ch
       }
     }
   }
-  if (matches.length > 0) return sortMatches(matches, true)
+  if (matches.length > 0) return { matches: sortMatches(matches, true), fromTargets: false }
 
   // §4.4 step 2 / `内容包规范.md` §8 S15 ③: nothing maps to the requested
   // region, so fall back to every online level channel and mark the command.
@@ -365,7 +445,7 @@ function collectMatches(beat: Beat, ctx: ResolveContext, warnings: string[]): Ch
       fallback.push({ device, channel, target: undefined, fromFallback: true })
     }
   }
-  return sortMatches(fallback)
+  return { matches: sortMatches(fallback), fromTargets: false }
 }
 
 /**
@@ -392,17 +472,20 @@ function channelMatchesRegion(
 /**
  * Apply the intent's distribution policy to region-expanded matches.
  *
- * Explicit `beats[].targets` bypass the policy: a script that names devices
- * means it. Round-robin is only reachable when a pack declares it (§4.4
- * step 5 / §8.1 #5).
+ * Only matches that *actually came from* `beats[].targets` bypass the policy:
+ * a script that names devices means it. The target→region fallback is a
+ * region route and must honour distribution; keying off
+ * `beat.targets !== undefined` let `primary`/`round-robin` silently dispatch
+ * every channel (ui-v12-review §P2-2). Round-robin is only reachable when a
+ * pack declares it (§4.4 step 5 / §8.1 #5).
  */
 function selectMatches(
   matches: readonly ChannelMatch[],
-  beat: Beat,
+  fromTargets: boolean,
   intent: FeedbackIntent,
   ctx: ResolveContext,
 ): readonly ChannelMatch[] {
-  if (beat.targets !== undefined) return matches
+  if (fromTargets) return matches
   const distribution: IntentDistribution = intent.distribution ?? 'synced'
   if (distribution === 'primary') {
     const first = matches[0]

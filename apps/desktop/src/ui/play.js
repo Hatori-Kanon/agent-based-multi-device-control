@@ -15,9 +15,12 @@
 // 单位元数据由宿主快照给出，缺强度元数据时按百分比降级，读不到 Hz 则该行
 // 显示「—」并禁用。
 //
-// 自动运行（P3 pacing）：大厅的 checkbox/slider 只改本地设置，随开局请求一起
-// 提交；会话内控件跟随快照的 autopilot（启停/间隔/边界），修改走
-// POST /api/session/autopilot。结束用 shell.js 的应用内确认（window.embodiedConfirm）；
+// 自动运行（P3 pacing）：大厅的 checkbox + 区间滑杆只改本地设置，随开局请求
+// 一起提交；会话内控件跟随快照的 autopilot（启停/等待区间/绝对边界），修改走
+// POST /api/session/autopilot。等待间隔是**区间**（windowMinSec/windowMaxSec）：
+// 玩家给一个最短–最长的窗口，由 AI 在窗口内决定这一拍等多久；刷新频率越高越
+// 像「随机」。旧宿主只认 intervalSec 时回退成单值（两个滑杆相等）。
+// 结束用 shell.js 的应用内确认（window.embodiedConfirm）；
 // 一局结束后回到大厅（同一进程可以再开一局），并将最后采用的自动运行设置写回
 // 大厅控件。旧局迟到的 ended 快照按 sessionId 丢弃，不把新一局打回大厅。
 //
@@ -51,10 +54,12 @@
     resume: document.getElementById('resume'),
     end: document.getElementById('end'),
     autoLobbyEnabled: document.getElementById('autoLobbyEnabled'),
-    autoLobbyInterval: document.getElementById('autoLobbyInterval'),
+    autoLobbyMin: document.getElementById('autoLobbyMin'),
+    autoLobbyMax: document.getElementById('autoLobbyMax'),
     autoLobbyValue: document.getElementById('autoLobbyValue'),
     autoRunEnabled: document.getElementById('autoRunEnabled'),
-    autoRunInterval: document.getElementById('autoRunInterval'),
+    autoRunMin: document.getElementById('autoRunMin'),
+    autoRunMax: document.getElementById('autoRunMax'),
     autoRunValue: document.getElementById('autoRunValue'),
     lobby: document.getElementById('lobby'),
     sessionView: document.getElementById('sessionView'),
@@ -111,7 +116,9 @@
   let busy = false
   /** 大厅的自动运行设置；跨局保留（上一局结束后写回这里）。 */
   let lobbyAutoEnabled = false
-  let lobbyAutoSeconds = AUTO_DEFAULT_SEC
+  /** 大厅的等待区间（秒）；默认 20–20，与旧单值默认一致。 */
+  let lobbyAutoMinSec = AUTO_DEFAULT_SEC
+  let lobbyAutoMaxSec = AUTO_DEFAULT_SEC
   /** 已经播到大厅控件的那一局 id：宿主会继续返回 ended 快照，别每次轮询都覆盖玩家刚改的设置。 */
   let lobbyAutoSeeded = ''
   /** 会话内有一笔自动运行修改在请求中。 */
@@ -415,10 +422,12 @@
 
     // 自动运行：大厅在开局前设置（跨局保留），会话内跟着快照走。
     el.autoLobbyEnabled.disabled = busy || running
-    el.autoLobbyInterval.disabled = busy || running
+    el.autoLobbyMin.disabled = busy || running
+    el.autoLobbyMax.disabled = busy || running
     const autoDisabled = !running || locked || state === 'ended' || state === 'ending'
     el.autoRunEnabled.disabled = autoDisabled
-    el.autoRunInterval.disabled = autoDisabled
+    el.autoRunMin.disabled = autoDisabled
+    el.autoRunMax.disabled = autoDisabled
   }
 
   // ── 自动运行（P3 pacing） ────────────────────────────────────────────────
@@ -435,34 +444,119 @@
     return Math.min(high, Math.max(low, sec))
   }
 
-  /** 大厅自动运行控件：默认值或上一局留下的设置。 */
-  function renderLobbyAuto() {
-    el.autoLobbyEnabled.checked = lobbyAutoEnabled
-    el.autoLobbyInterval.min = String(AUTO_MIN_SEC)
-    el.autoLobbyInterval.max = String(AUTO_MAX_SEC)
-    el.autoLobbyInterval.value = String(lobbyAutoSeconds)
-    el.autoLobbyValue.textContent = `${lobbyAutoSeconds}s`
+  /** 把区间两端夹进绝对边界（low/high 来自快照的 minSec/maxSec）。 */
+  function clampAutoWindow(minValue, maxValue, low = AUTO_MIN_SEC, high = AUTO_MAX_SEC) {
+    return {
+      minSec: clampAutoSeconds(minValue, low, high),
+      maxSec: clampAutoSeconds(maxValue, low, high),
+    }
+  }
+
+  /** 区间读数：两端相等写 `20s`，否则写 `10–30s`。 */
+  function autoWindowText(minSec, maxSec) {
+    return minSec === maxSec ? `${minSec}s` : `${minSec}–${maxSec}s`
   }
 
   /**
-   * 用当前 session.autopilot 重写会话内控件（不检查焦点）。
+   * 把一对区间滑杆的范围/值/读数一起刷新。
    *
-   * 引擎会在采用计划后的下一拍夹取/采纳 intervalSec，轮询回来的快照就是实际
-   * 生效值，所以这里始终以快照为准。
+   * 两端各自保留自己的滑杆位置；`paintRange` 是软上限滑杆在用的同一套金色
+   * 进度样式（`--fill`），这里直接复用，不新增视觉语言。
+   */
+  function paintAutoWindow(minInput, maxInput, readout, minSec, maxSec, low, high) {
+    const lowBound = Math.min(low, high)
+    const highBound = Math.max(low, high)
+    for (const input of [minInput, maxInput]) {
+      input.min = String(lowBound)
+      input.max = String(highBound)
+    }
+    if (Number(minInput.value) !== minSec) minInput.value = String(minSec)
+    if (Number(maxInput.value) !== maxSec) maxInput.value = String(maxSec)
+    paintRange(minInput)
+    paintRange(maxInput)
+    readout.textContent = autoWindowText(minSec, maxSec)
+  }
+
+  /**
+   * 拖动区间滑杆：两端夹进绝对边界并保证 min<=max。
+   *
+   * 拖过界时把另一端推着走（而不是弹回原位），玩家不会遇到「拖不动」的
+   * 滑杆；`changed` 是正在拖的那一端。
+   */
+  function updateAutoWindow(changed, minInput, maxInput) {
+    const low = Number(minInput.min)
+    const high = Number(minInput.max)
+    let minSec = clampAutoSeconds(Number(minInput.value), low, high)
+    let maxSec = clampAutoSeconds(Number(maxInput.value), low, high)
+    if (minSec > maxSec) {
+      if (changed === 'min') maxSec = minSec
+      else minSec = maxSec
+    }
+    return { minSec, maxSec }
+  }
+
+  /**
+   * 快照 autopilot → 用户区间。
+   *
+   * 新宿主给 `windowMinSec/windowMaxSec`（玩家希望 AI 在窗口内决定每拍等多久）；
+   * 旧宿主没有这两个字段，回退到 `intervalSec` 单值 —— 两个滑杆都等于它。
+   */
+  function autoWindowOf(autopilot, low, high) {
+    const fallback = clampAutoSeconds(autopilot.intervalSec, low, high)
+    const hasWindow = (typeof autopilot.windowMinSec === 'number' && Number.isFinite(autopilot.windowMinSec))
+      || (typeof autopilot.windowMaxSec === 'number' && Number.isFinite(autopilot.windowMaxSec))
+    const rawMin = hasWindow ? autoBound(autopilot.windowMinSec, fallback) : fallback
+    const rawMax = hasWindow ? autoBound(autopilot.windowMaxSec, fallback) : fallback
+    const clamped = clampAutoWindow(rawMin, rawMax, low, high)
+    // 快照理论上保证 min<=max；万一宿主给了反的，按区间语义取两端。
+    return {
+      minSec: Math.min(clamped.minSec, clamped.maxSec),
+      maxSec: Math.max(clamped.minSec, clamped.maxSec),
+    }
+  }
+
+  /** 大厅自动运行控件：默认区间或上一局留下的区间。 */
+  function renderLobbyAuto() {
+    el.autoLobbyEnabled.checked = lobbyAutoEnabled
+    const clamped = clampAutoWindow(lobbyAutoMinSec, lobbyAutoMaxSec, AUTO_MIN_SEC, AUTO_MAX_SEC)
+    // 双保险：状态永远落在 10–60 且 min<=max。否则浏览器会把滑杆值夹到范围
+    // 内、读数却按越界值写，两者会对不上。
+    lobbyAutoMinSec = Math.min(clamped.minSec, clamped.maxSec)
+    lobbyAutoMaxSec = Math.max(clamped.minSec, clamped.maxSec)
+    paintAutoWindow(el.autoLobbyMin, el.autoLobbyMax, el.autoLobbyValue,
+      lobbyAutoMinSec, lobbyAutoMaxSec, AUTO_MIN_SEC, AUTO_MAX_SEC)
+  }
+
+  /** 大厅区间 → 开局载荷；旧宿主只认 intervalSec 时补一个中点。 */
+  function lobbyAutoPayload() {
+    const minSec = Math.min(lobbyAutoMinSec, lobbyAutoMaxSec)
+    const maxSec = Math.max(lobbyAutoMinSec, lobbyAutoMaxSec)
+    return {
+      enabled: el.autoLobbyEnabled.checked === true,
+      windowMinSec: minSec,
+      windowMaxSec: maxSec,
+      intervalSec: minSec === maxSec ? minSec : Math.round((minSec + maxSec) / 2),
+    }
+  }
+
+  /**
+   * 用当前 session.autopilot 重写会话内区间控件（不检查焦点）。
+   *
+   * 引擎会在采用计划后的下一拍夹取/采纳 `intervalSec`，轮询回来的快照就是
+   * 实际生效值；但玩家持有的是区间两端，读数跟着 `windowMinSec/windowMaxSec`
+   * 走，`intervalSec` 不再当成唯一真值。
    */
   function syncAutoFromSession() {
     const current = session
     if (current === null) return
     const autopilot = current.autopilot
     if (autopilot === null || typeof autopilot !== 'object') return
-    const minSec = autoBound(autopilot.minSec, AUTO_MIN_SEC)
-    const maxSec = autoBound(autopilot.maxSec, AUTO_MAX_SEC)
-    const intervalSec = clampAutoSeconds(autopilot.intervalSec, minSec, maxSec)
-    el.autoRunInterval.min = String(minSec)
-    el.autoRunInterval.max = String(maxSec)
-    el.autoRunInterval.value = String(intervalSec)
+    const low = autoBound(autopilot.minSec, AUTO_MIN_SEC)
+    const high = autoBound(autopilot.maxSec, AUTO_MAX_SEC)
+    const window = autoWindowOf(autopilot, low, high)
+    paintAutoWindow(el.autoRunMin, el.autoRunMax, el.autoRunValue,
+      window.minSec, window.maxSec, low, high)
     el.autoRunEnabled.checked = autopilot.enabled === true
-    el.autoRunValue.textContent = `${intervalSec}s`
   }
 
   /**
@@ -477,15 +571,32 @@
     const autopilot = current.autopilot
     if (autopilot === null || typeof autopilot !== 'object') return
     const active = document.activeElement
-    if (active !== null && (active === el.autoRunEnabled || active === el.autoRunInterval)) return
+    if (active !== null
+      && (active === el.autoRunEnabled || active === el.autoRunMin || active === el.autoRunMax)) return
     syncAutoFromSession()
   }
 
-  /** 一局收尾时把最后采用的自动运行设置留给大厅（下一局沿用）。 */
+  /** 会话内区间控件当前值 → POST 载荷（旧宿主用 intervalSec 中点兼容）。 */
+  function sessionAutoPayload() {
+    const minSec = Math.min(Number(el.autoRunMin.value), Number(el.autoRunMax.value))
+    const maxSec = Math.max(Number(el.autoRunMin.value), Number(el.autoRunMax.value))
+    return {
+      enabled: el.autoRunEnabled.checked === true,
+      windowMinSec: minSec,
+      windowMaxSec: maxSec,
+      intervalSec: minSec === maxSec ? minSec : Math.round((minSec + maxSec) / 2),
+    }
+  }
+
+  /** 一局收尾时把最后采用的自动运行区间留给大厅（下一局沿用）。 */
   function rememberLobbyAuto(autopilot) {
     if (autopilot === null || typeof autopilot !== 'object') return
     lobbyAutoEnabled = autopilot.enabled === true
-    lobbyAutoSeconds = clampAutoSeconds(autopilot.intervalSec, AUTO_MIN_SEC, AUTO_MAX_SEC)
+    const low = autoBound(autopilot.minSec, AUTO_MIN_SEC)
+    const high = autoBound(autopilot.maxSec, AUTO_MAX_SEC)
+    const window = autoWindowOf(autopilot, low, high)
+    lobbyAutoMinSec = window.minSec
+    lobbyAutoMaxSec = window.maxSec
     renderLobbyAuto()
   }
 
@@ -1578,10 +1689,8 @@
         body: JSON.stringify({
           packId,
           plannedMinutes,
-          autopilot: {
-            enabled: el.autoLobbyEnabled.checked === true,
-            intervalSec: Number(el.autoLobbyInterval.value),
-          },
+          // 等待区间是玩家意图；旧宿主只认 intervalSec，载荷里同时带上中点。
+          autopilot: lobbyAutoPayload(),
         }),
         timeoutMs: 90000, // 开局要跑一整回合，别用轮询的 8s 预算
       })
@@ -1771,31 +1880,43 @@
   el.resume.addEventListener('click', () => { void control('/api/session/resume', '继续') })
   el.end.addEventListener('click', () => { void endSession() })
 
-  // 大厅：只改本地设置，开局时才随 /api/session/start 一起提交。
+  // 大厅：只改本地设置，开局时才随 /api/session/start 一起提交。等待区间
+  // 的最短/最长两条滑杆拖过界时互相推着走（min<=max 始终成立）。
   el.autoLobbyEnabled.addEventListener('change', () => {
     lobbyAutoEnabled = el.autoLobbyEnabled.checked === true
   })
-  el.autoLobbyInterval.addEventListener('input', () => {
-    lobbyAutoSeconds = clampAutoSeconds(Number(el.autoLobbyInterval.value))
-    el.autoLobbyInterval.value = String(lobbyAutoSeconds)
-    el.autoLobbyValue.textContent = `${lobbyAutoSeconds}s`
+  el.autoLobbyMin.addEventListener('input', () => {
+    const window = updateAutoWindow('min', el.autoLobbyMin, el.autoLobbyMax)
+    lobbyAutoMinSec = window.minSec
+    lobbyAutoMaxSec = window.maxSec
+    renderLobbyAuto()
+  })
+  el.autoLobbyMax.addEventListener('input', () => {
+    const window = updateAutoWindow('max', el.autoLobbyMin, el.autoLobbyMax)
+    lobbyAutoMinSec = window.minSec
+    lobbyAutoMaxSec = window.maxSec
+    renderLobbyAuto()
   })
 
-  // 会话内：勾选/松手才提交，拖动过程只更新读数。
+  // 会话内：勾选/松手才提交，拖动过程只更新读数；两端同样互相约束。
   el.autoRunEnabled.addEventListener('change', () => {
-    void postAutopilot({
-      enabled: el.autoRunEnabled.checked === true,
-      intervalSec: Number(el.autoRunInterval.value),
-    })
+    void postAutopilot(sessionAutoPayload())
   })
-  el.autoRunInterval.addEventListener('input', () => {
-    el.autoRunValue.textContent = `${Number(el.autoRunInterval.value)}s`
+  el.autoRunMin.addEventListener('input', () => {
+    const window = updateAutoWindow('min', el.autoRunMin, el.autoRunMax)
+    paintAutoWindow(el.autoRunMin, el.autoRunMax, el.autoRunValue,
+      window.minSec, window.maxSec, Number(el.autoRunMin.min), Number(el.autoRunMin.max))
   })
-  el.autoRunInterval.addEventListener('change', () => {
-    void postAutopilot({
-      enabled: el.autoRunEnabled.checked === true,
-      intervalSec: Number(el.autoRunInterval.value),
-    })
+  el.autoRunMin.addEventListener('change', () => {
+    void postAutopilot(sessionAutoPayload())
+  })
+  el.autoRunMax.addEventListener('input', () => {
+    const window = updateAutoWindow('max', el.autoRunMin, el.autoRunMax)
+    paintAutoWindow(el.autoRunMin, el.autoRunMax, el.autoRunValue,
+      window.minSec, window.maxSec, Number(el.autoRunMin.min), Number(el.autoRunMin.max))
+  })
+  el.autoRunMax.addEventListener('change', () => {
+    void postAutopilot(sessionAutoPayload())
   })
 
   el.composer.addEventListener('submit', event => {

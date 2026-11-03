@@ -62,6 +62,17 @@ function packLookup(): { readonly lookup: WaveformLookup; readonly library: Wave
   return { lookup, library }
 }
 
+/**
+ * A lookup with one looping texture and one one-shot texture, for the
+ * `sustainLoopSec` behaviour (`loop: true` keeps playing across the gap).
+ */
+function sustainLookup(): { readonly lookup: WaveformLookup; readonly library: WaveformLibrary } {
+  const library = new WaveformLibrary()
+  library.addSessionWaveform({ ...packWaveform(), id: 'loop-sustain', name: '循环', loop: true })
+  library.addSessionWaveform({ ...packWaveform(), id: 'stinger-burst', name: '短刺', loop: false })
+  return { lookup: { get: id => library.get(id) }, library }
+}
+
 const AMBIENT: FeedbackIntent = {
   id: 'ambient-field',
   meaning: '持续环境',
@@ -511,6 +522,97 @@ describe('region routing and distribution', () => {
   })
 })
 
+describe('unknown explicit targets fall back to the beat regions', () => {
+  it('routes by region when every guessed target names an unknown device', () => {
+    const registry = snapshot(device('toy', [channel('a', 'chest'), channel('b', 'chest')]))
+    const fixture = plan([
+      levelBeat('b1', {
+        intentId: 'plain',
+        regions: ['chest'],
+        // The prompt never exposes device ids, so the model guesses pack ids
+        // ("tentacle-shadow"/"tentacle" for a coyote in the smoke run).
+        targets: [{ deviceId: 'tentacle-shadow', channelId: 'a' }],
+      }),
+    ])
+
+    const resolved = resolvePlan(fixture, context(registry, PLAIN_INTENT_MAP))
+
+    expect(resolved.commands.map(command => command.channelId)).toEqual(['a', 'b'])
+    expect(resolved.narrativeOnlyBeats).toEqual([])
+    expect(resolved.warnings).toContain(
+      'beat b1: no explicit target matched; falling back to region matching',
+    )
+  })
+
+  it('applies the intent distribution to the region fallback', () => {
+    const registry = snapshot(device('toy', [channel('a', 'chest'), channel('b', 'chest')]))
+    const fixture = plan([
+      levelBeat('b1', {
+        intentId: 'probe-touch', // distribution: 'primary'
+        regions: ['chest'],
+        targets: [{ deviceId: 'tentacle-shadow', channelId: 'a' }],
+      }),
+    ])
+
+    const resolved = resolvePlan(fixture, context(registry))
+
+    // The fallback is region routing, so primary must pick one channel instead
+    // of dispatching every match (ui-v12-review §P2-2).
+    expect(resolved.commands).toHaveLength(1)
+    expect(resolved.commands[0]?.channelId).toBe('a')
+    expect(resolved.warnings).toContain(
+      'beat b1: no explicit target matched; falling back to region matching',
+    )
+  })
+
+  it('stays narrative-only when the guessed target has no region to fall back to', () => {
+    const registry = snapshot(device('toy', [channel('a', 'chest')]))
+    const fixture = plan([
+      levelBeat('b1', {
+        intentId: 'plain',
+        regions: [],
+        targets: [{ deviceId: 'tentacle', channelId: 'a' }],
+      }),
+    ])
+
+    const resolved = resolvePlan(fixture, context(registry, PLAIN_INTENT_MAP))
+
+    expect(resolved.commands).toEqual([])
+    expect(resolved.narrativeOnlyBeats).toEqual(['b1'])
+    expect(resolved.warnings).toContain(
+      'beat b1: target device "tentacle" is not connected; target dropped',
+    )
+    expect(
+      resolved.warnings.some(warning => warning.includes('falling back to region matching')),
+    ).toBe(false)
+  })
+
+  it('does not fall back when a valid target merely points at an offline device', () => {
+    const registry = snapshot(
+      device('toy', [channel('a', 'chest')]),
+      device('dead', [channel('a', 'chest')], 'disconnected'),
+    )
+    const fixture = plan([
+      levelBeat('b1', {
+        intentId: 'plain',
+        regions: ['chest'],
+        targets: [{ deviceId: 'dead', channelId: 'a' }],
+      }),
+    ])
+
+    const resolved = resolvePlan(fixture, context(registry, PLAIN_INTENT_MAP))
+
+    // The target matched a real device, so the region fallback must not route
+    // the beat to the unrelated ready toy.
+    expect(resolved.commands).toEqual([])
+    expect(resolved.narrativeOnlyBeats).toEqual(['b1'])
+    expect(
+      resolved.warnings.some(warning => warning.includes('falling back to region matching')),
+    ).toBe(false)
+    expect(resolved.warnings.some(warning => warning.includes('disconnected'))).toBe(true)
+  })
+})
+
 describe('offline devices and degraded commands', () => {
   it('degrades an offline device to narrative instead of throwing', () => {
     const registry = snapshot(device('toy', [channel('a', 'chest')], 'disconnected'))
@@ -754,6 +856,172 @@ describe('pattern bodies', () => {
       { kind: 'level', percent: 0, durationSec: 0 },
     ])
     expect(resolved.commands.every(command => !command.clamped)).toBe(true)
+  })
+})
+
+describe('looping waveforms sustain across the thinking gap', () => {
+  function channelWithCap(maxDurationSec = 60): ResolveChannelSnapshot {
+    return channel('a', 'chest', { supportsWaveform: true, maxDurationSec })
+  }
+
+  function waveformBeat(waveformId: string, durationSec: number): Beat {
+    return levelBeat('b1', {
+      intentId: 'plain',
+      regions: ['chest'],
+      change: { kind: 'waveform', waveformId, durationSec },
+    })
+  }
+
+  function durationOf(command: ResolvedCommand): number | undefined {
+    return command.body.kind === 'waveform' ? undefined : command.body.durationSec
+  }
+
+  it('raises a looping pattern to the session sustain hold', () => {
+    const { lookup } = sustainLookup()
+    const registry = snapshot(device('toy', [channelWithCap()]))
+    const command = firstCommand(resolvePlan(
+      plan([waveformBeat('loop-sustain', 4)]),
+      { ...context(registry, PLAIN_INTENT_MAP), waveforms: lookup, sustainLoopSec: 60 },
+    ).commands)
+
+    expect(command.body.kind).toBe('pattern')
+    if (command.body.kind === 'pattern') expect(command.body.waveformId).toBe('loop-sustain')
+    expect(durationOf(command)).toBe(60)
+  })
+
+  it('leaves a non-loop texture short', () => {
+    const { lookup } = sustainLookup()
+    const registry = snapshot(device('toy', [channelWithCap()]))
+    const command = firstCommand(resolvePlan(
+      plan([waveformBeat('stinger-burst', 4)]),
+      { ...context(registry, PLAIN_INTENT_MAP), waveforms: lookup, sustainLoopSec: 60 },
+    ).commands)
+
+    expect(durationOf(command)).toBe(4)
+  })
+
+  it('keeps the requested duration when no sustain hold is configured', () => {
+    const { lookup } = sustainLookup()
+    const registry = snapshot(device('toy', [channelWithCap()]))
+    const command = firstCommand(resolvePlan(
+      plan([waveformBeat('loop-sustain', 4)]),
+      { ...context(registry, PLAIN_INTENT_MAP), waveforms: lookup },
+    ).commands)
+
+    expect(durationOf(command)).toBe(4)
+  })
+
+  it('never exceeds the channel maximum', () => {
+    const { lookup } = sustainLookup()
+    const registry = snapshot(device('toy', [channelWithCap(30)]))
+    const command = firstCommand(resolvePlan(
+      plan([waveformBeat('loop-sustain', 4)]),
+      { ...context(registry, PLAIN_INTENT_MAP), waveforms: lookup, sustainLoopSec: 60 },
+    ).commands)
+
+    expect(durationOf(command)).toBe(30)
+  })
+
+  it('does not extend level or stop commands', () => {
+    const { lookup } = sustainLookup()
+    const registry = snapshot(device('toy', [channel('a', 'chest', { supportsWaveform: true })]))
+    const ctx: ResolveContext = {
+      ...context(registry, PLAIN_INTENT_MAP),
+      waveforms: lookup,
+      sustainLoopSec: 60,
+    }
+
+    const level = firstCommand(resolvePlan(
+      plan([levelBeat('b1', { intentId: 'plain', regions: ['chest'], change: { kind: 'level', durationSec: 4 } })]),
+      ctx,
+    ).commands)
+    expect(level.body).toEqual({ kind: 'level', percent: 14, durationSec: 4 })
+
+    const stop = firstCommand(resolvePlan(
+      plan([levelBeat('b2', { intentId: 'stop', regions: ['chest'] })]),
+      { ...context(registry), waveforms: lookup, sustainLoopSec: 60 },
+    ).commands)
+    expect(stop.body).toEqual({ kind: 'level', percent: 0, durationSec: 0 })
+  })
+
+  it('does not leak a sustained loop hold into a later level body', () => {
+    const { lookup } = sustainLookup()
+    const registry = snapshot(device('toy', [channelWithCap()]))
+    const resolved = resolvePlan(
+      plan([
+        levelBeat('b1', {
+          intentId: 'plain',
+          regions: ['chest'],
+          change: { kind: 'waveform', waveformId: 'loop-sustain', durationSec: 4 },
+        }),
+        levelBeat('b2', {
+          intentId: 'plain',
+          regions: ['chest'],
+          change: { kind: 'level', durationSec: 5 },
+        }),
+      ]),
+      { ...context(registry, PLAIN_INTENT_MAP), waveforms: lookup, sustainLoopSec: 60 },
+    )
+
+    expect(resolved.commands).toHaveLength(1)
+    const command = firstCommand(resolved.commands)
+    expect(command.beatId).toBe('b2')
+    // The surviving body is a level; the superseded loop's 60 s sustain must
+    // not extend it through the merge (ui-v12-review §P2-1).
+    expect(command.body).toMatchObject({ kind: 'level', durationSec: 5 })
+  })
+
+  it('sustains a loop that survives the merge', () => {
+    const { lookup } = sustainLookup()
+    const registry = snapshot(device('toy', [channelWithCap()]))
+    const resolved = resolvePlan(
+      plan([
+        levelBeat('b1', {
+          intentId: 'plain',
+          regions: ['chest'],
+          change: { kind: 'waveform', waveformId: 'loop-sustain', durationSec: 4 },
+        }),
+        levelBeat('b2', {
+          intentId: 'plain',
+          regions: ['chest'],
+          change: { kind: 'waveform', waveformId: 'loop-sustain', durationSec: 6 },
+        }),
+      ]),
+      { ...context(registry, PLAIN_INTENT_MAP), waveforms: lookup, sustainLoopSec: 60 },
+    )
+
+    expect(resolved.commands).toHaveLength(1)
+    const command = firstCommand(resolved.commands)
+    expect(command.beatId).toBe('b2')
+    if (command.body.kind === 'pattern') expect(command.body.waveformId).toBe('loop-sustain')
+    expect(durationOf(command)).toBe(60)
+  })
+
+  it('leaves a non-loop final body at the merged hold', () => {
+    const { lookup } = sustainLookup()
+    const registry = snapshot(device('toy', [channelWithCap()]))
+    const resolved = resolvePlan(
+      plan([
+        levelBeat('b1', {
+          intentId: 'plain',
+          regions: ['chest'],
+          change: { kind: 'waveform', waveformId: 'loop-sustain', durationSec: 4 },
+        }),
+        levelBeat('b2', {
+          intentId: 'plain',
+          regions: ['chest'],
+          change: { kind: 'waveform', waveformId: 'stinger-burst', durationSec: 6 },
+        }),
+      ]),
+      { ...context(registry, PLAIN_INTENT_MAP), waveforms: lookup, sustainLoopSec: 60 },
+    )
+
+    expect(resolved.commands).toHaveLength(1)
+    const command = firstCommand(resolved.commands)
+    expect(command.beatId).toBe('b2')
+    if (command.body.kind === 'pattern') expect(command.body.waveformId).toBe('stinger-burst')
+    // Non-loop stays short even though the superseded beat was a loop.
+    expect(durationOf(command)).toBe(6)
   })
 })
 
