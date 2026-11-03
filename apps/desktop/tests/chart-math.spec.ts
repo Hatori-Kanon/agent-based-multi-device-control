@@ -1,14 +1,18 @@
 // 波形柱状图纯函数的真行为测试。
 //
-// 图表几何的计算规则（1px 细柱、柱高只跟波形 intensity 走、绝对频率决定
+// 图表几何的计算规则（1px 细柱、柱高只跟波形 intensity 走、物理频率决定
 // 疏密、显示用升采样、phase 滚动循环）全部在 `src/ui/chart-math.js` 里。
 // 这里不用 grep 源码冒充行为测试：用 node:vm 在一个只有 `window` 的干净
 // 上下文里执行整份 classic script（没有 DOM、没有时钟），再对 computeBars /
 // upsampleLinear 的输出做几何断言。
+//
+// 频率口径（v17）：柱距按**物理脉冲周期**映射，协议码先按厂商分段表还原成
+// 周期（码 10 = 100Hz、码 100 = 10Hz、码 240 = 1Hz），再用周期/10px 算柱距。
 
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import * as vm from 'node:vm'
+import { codeToHz, createBuiltinWaveforms } from '@embodied/core'
 import { describe, expect, it } from 'vitest'
 
 interface Bar {
@@ -87,6 +91,21 @@ function mean(values: readonly number[]): number {
   return values.reduce((sum, value) => sum + value, 0) / values.length
 }
 
+/** 内置波形编译后的逐 slot freq/intensity（真实资产，不是手写合成数组）。 */
+function builtinSlots(id: string): { freq: number[]; intensity: number[] } {
+  const waveform = createBuiltinWaveforms().find(candidate => candidate.id === id)
+  if (waveform === undefined) throw new Error(`missing builtin waveform "${id}"`)
+  const freq: number[] = []
+  const intensity: number[] = []
+  for (const frame of waveform.frames) {
+    for (let slot = 0; slot < 4; slot += 1) {
+      freq.push(frame.freq[slot] ?? 0)
+      intensity.push(frame.intensity[slot] ?? 0)
+    }
+  }
+  return { freq, intensity }
+}
+
 describe('chart-math', () => {
   it('is a pure classic script: one frozen window API, no DOM/clock', () => {
     const source = readFileSync(fileURLToPath(SOURCE_URL), 'utf8')
@@ -104,18 +123,18 @@ describe('chart-math', () => {
   })
 
   it('draws thin 1px bars and never widens them to fill the spacing', () => {
-    const sparse = uniform(10, 10, 60)
-    const dense = uniform(10, 240, 60)
-    expect(sparse.length).toBeGreaterThan(0)
-    expect(dense.length).toBeGreaterThan(0)
-    for (const bar of [...sparse, ...dense]) {
+    const sparsest = uniform(10, 240, 60)
+    const densest = uniform(10, 10, 60)
+    expect(sparsest.length).toBeGreaterThan(0)
+    expect(densest.length).toBeGreaterThan(0)
+    for (const bar of [...sparsest, ...densest]) {
       expect(bar.width).toBe(1)
     }
-    // 最疏/最密两种柱距下柱宽都一样：宽度不随 spacing 变。
-    expect(new Set(sparse.map(bar => bar.width))).toEqual(new Set([1]))
-    expect(new Set(dense.map(bar => bar.width))).toEqual(new Set([1]))
+    // 20px 最疏 / 1px 最密两种柱距下柱宽都一样：宽度不随 spacing 变。
+    expect(new Set(sparsest.map(bar => bar.width))).toEqual(new Set([1]))
+    expect(new Set(densest.map(bar => bar.width))).toEqual(new Set([1]))
     // 输出只有可 fillRect 的三个字段（没有 y、没有可传通道强度的字段）。
-    expect(Object.keys(sparse[0] ?? {}).sort()).toEqual(['height', 'width', 'x'])
+    expect(Object.keys(sparsest[0] ?? {}).sort()).toEqual(['height', 'width', 'x'])
   })
 
   it('ties bar height to the waveform intensity only, not the channel strength', () => {
@@ -152,21 +171,38 @@ describe('chart-math', () => {
     expect(base.map(bar => bar.height).slice(0, 4)).toEqual([16, 31, 16, 1])
   })
 
-  it('maps absolute frequency to 1/f spacing: high frequency visibly denser', () => {
-    // 绝对协议频率（不按本帧 min/max 归一化）：spacing = clamp(1,20,200/freq)。
-    expect(new Set(gaps(uniform(10, 10, 60)))).toEqual(new Set([20]))
-    expect(new Set(gaps(uniform(10, 50, 60)))).toEqual(new Set([4]))
-    expect(new Set(gaps(uniform(10, 240, 60)))).toEqual(new Set([1]))
-    // 80 → 200/80 = 2.5px；整数 x 取整后相邻差在 2–3 之间、均值≈2.5。
-    const gaps80 = gaps(uniform(10, 80, 60))
-    expect(new Set(gaps80)).toEqual(new Set([2, 3]))
-    expect(Math.abs(mean(gaps80) - 2.5)).toBeLessThan(0.5)
-    // 高频明显比低频密（v15 的归一化会把两者都拉满到 3–22，已撤销）。
-    expect(mean(gaps(uniform(10, 10, 60))) - mean(gaps(uniform(10, 240, 60)))).toBeGreaterThan(10)
+  it('maps the physical pulse period to spacing: high Hz dense, low Hz sparse', () => {
+    // 协议码不是频率，是压缩后的脉冲周期：码 10 = 100Hz、码 50 = 20Hz、
+    // 码 100 = 10Hz、码 240 = 1Hz；柱距 = 周期/10px，夹在 1–20px。
+    expect(new Set(gaps(uniform(10, 10, 60)))).toEqual(new Set([1]))
+    expect(new Set(gaps(uniform(10, 20, 60)))).toEqual(new Set([2]))
+    expect(new Set(gaps(uniform(10, 40, 60)))).toEqual(new Set([4]))
+    expect(new Set(gaps(uniform(10, 50, 60)))).toEqual(new Set([5]))
+    expect(new Set(gaps(uniform(10, 80, 60)))).toEqual(new Set([8]))
+    expect(new Set(gaps(uniform(10, 100, 60)))).toEqual(new Set([10]))
+    // 压缩段：110 → 150ms → 15px；120 → 200ms → 20px；240 → 1000ms → clamp 20px。
+    expect(new Set(gaps(uniform(10, 110, 60)))).toEqual(new Set([15]))
+    expect(new Set(gaps(uniform(10, 120, 60)))).toEqual(new Set([20]))
+    expect(new Set(gaps(uniform(10, 240, 60)))).toEqual(new Set([20]))
 
-    // 0/非有限频率 fallback 到最疏 20px，不产生 NaN。
+    // 半像素：25 → 2.5px，整数 x 取整后相邻差 2–3、均值≈2.5。
+    const gaps25 = gaps(uniform(10, 25, 60))
+    expect(new Set(gaps25)).toEqual(new Set([2, 3]))
+    expect(Math.abs(mean(gaps25) - 2.5)).toBeLessThan(0.5)
+
+    // 方向与体感一致：100Hz（码 10）比 10Hz（码 100）密。
+    expect(mean(gaps(uniform(10, 10, 60)))).toBeLessThan(mean(gaps(uniform(10, 100, 60))))
+
+    // 码越大 → 物理频率越低 → 柱距单调不减（v16 的 200/码 是反的）。
+    const monotonic = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 150, 200, 240]
+      .map(code => mean(gaps(uniform(10, code, 60))))
+    for (let index = 1; index < monotonic.length; index += 1) {
+      expect(monotonic[index]).toBeGreaterThanOrEqual(monotonic[index - 1]!)
+    }
+
+    // 0/非有限/非法码（<10）fallback 到最疏 20px，不产生 NaN。
     const fallback = bars({
-      freq: [0, Number.NaN, 0],
+      freq: [0, Number.NaN, 5],
       intensity: [60, 60, 60],
       width: WIDTH,
       height: HEIGHT,
@@ -178,7 +214,7 @@ describe('chart-math', () => {
       expect(bar.width).toBe(1)
     }
 
-    // 窄域 [20,20,80,80]：绝对映射下柱距约 10px 与 2–3px，不再被归一化拉满。
+    // 窄域 [20,20,80,80]：50Hz→2px、12.5Hz→8px，不再被归一化拉满。
     const narrow = gaps(bars({
       freq: [20, 20, 80, 80],
       intensity: [60, 60, 60, 60],
@@ -186,11 +222,10 @@ describe('chart-math', () => {
       height: HEIGHT,
       phase: 0,
     }))
-    expect(Math.max(...narrow)).toBe(10)
-    expect(Math.min(...narrow)).toBeLessThanOrEqual(3)
-    expect(Math.max(...narrow) - Math.min(...narrow)).toBeGreaterThan(6)
+    expect(Math.max(...narrow)).toBe(8)
+    expect(Math.min(...narrow)).toBe(2)
 
-    // 宽域 [10,240] 覆盖两个极值（整数 x 下正好是 20px / 1px）。
+    // 宽域 [10,240] 覆盖两个极值（100Hz 1px / 1Hz clamp 20px）。
     const wide = gaps(bars({
       freq: [10, 10, 240, 240],
       intensity: [60, 60, 60, 60],
@@ -201,41 +236,81 @@ describe('chart-math', () => {
     expect(new Set(wide)).toEqual(new Set([1, 20]))
   })
 
-  it('gives real pack frequency ranges their physical density (cilia/tide/climb)', () => {
-    // 绝对域下真实波形不再“全等且疏”：cilia 50–80 ≈2–4px、tide 25–70 ≈3–8px、
-    // climb 18–90 ≈2–11px（整数 x 取整后相邻差会 ±1）。
+  it('matches the Coyote backend code->Hz table (one physical source of truth)', () => {
+    // 与 packages/core 的 frequency.ts 对表：柱距 = clamp(1,20, 周期/10)，
+    // 周期 = 1000/codeToHz(code)。9 根柱 → 8 个间隔，半像素码的均值精确。
+    for (const code of [10, 11, 25, 50, 80, 90, 100, 110, 150, 200, 201, 240]) {
+      const expected = Math.min(20, Math.max(1, Math.round((1000 / codeToHz(code) / 10) * 2) / 2))
+      const observed = gaps(uniform(9, code, 60))
+      const integers = Number.isInteger(expected) ? [expected] : [Math.floor(expected), Math.ceil(expected)]
+      expect(new Set(observed)).toEqual(new Set(integers))
+      expect(Math.abs(mean(observed) - expected)).toBeLessThan(0.01)
+    }
+    // 101 → 10.5px：相邻差 10/11 交替、均值精确 10.5。
+    const halfPixel = gaps(uniform(9, 101, 60))
+    expect(new Set(halfPixel)).toEqual(new Set([10, 11]))
+    expect(Math.abs(mean(halfPixel) - 10.5)).toBeLessThan(0.01)
+    // 121–240 在 20px 上限下不可区分；第三段（201–240）的斜率由与 core 的
+    // codeToHz 对表（codeToHz 已含 610/1000ms）与独立探针保证，不是本测试能观测的量。
+    for (const code of [121, 150, 200, 201, 240]) {
+      expect(new Set(gaps(uniform(9, code, 60)))).toEqual(new Set([20]))
+    }
+  })
+
+  it('gives real assets their physical density (pack slices + compiled builtins)', () => {
+    // pack 0.4.0 编译后真实 slot 序列（前 17 个）：纤毛 50–80、微须 70–98。
     const cilia = gaps(bars({
-      freq: [50, 56, 62, 68, 74, 80],
-      intensity: [60, 60, 60, 60, 60, 60],
+      freq: [50, 52, 54, 56, 58, 59, 61, 63, 65, 67, 69, 71, 73, 74, 76, 78, 80],
+      intensity: [15, 17, 19, 21, 23, 24, 26, 28, 30, 28, 26, 24, 22, 20, 18, 16, 15],
       width: WIDTH,
       height: HEIGHT,
       phase: 0,
     }))
-    expect(Math.min(...cilia)).toBeGreaterThanOrEqual(2)
-    expect(Math.max(...cilia)).toBeLessThanOrEqual(5)
+    expect(Math.min(...cilia)).toBeGreaterThanOrEqual(5)
+    expect(Math.max(...cilia)).toBeLessThanOrEqual(8)
 
-    const tide = gaps(bars({
-      freq: [25, 34, 43, 52, 61, 70],
-      intensity: [60, 60, 60, 60, 60, 60],
+    const flutter = gaps(bars({
+      freq: [70, 70, 71, 72, 73, 74, 76, 79, 81, 84, 87, 91, 98],
+      intensity: [20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 80, 90],
       width: WIDTH,
       height: HEIGHT,
       phase: 0,
     }))
-    expect(Math.min(...tide)).toBeGreaterThanOrEqual(2)
-    expect(Math.max(...tide)).toBeGreaterThanOrEqual(7)
-    expect(Math.max(...tide) - Math.min(...tide)).toBeGreaterThan(3)
+    expect(Math.min(...flutter)).toBeGreaterThanOrEqual(7)
+    expect(Math.max(...flutter)).toBeLessThanOrEqual(10)
 
-    const climb = gaps(bars({
-      freq: [18, 34, 50, 66, 82, 90],
-      intensity: [60, 60, 60, 60, 60, 60],
-      width: WIDTH,
-      height: HEIGHT,
-      phase: 0,
-    }))
-    expect(Math.min(...climb)).toBeLessThanOrEqual(3)
-    expect(Math.max(...climb)).toBeGreaterThanOrEqual(9)
-    // 高频端（90）比低频端（18）密得多：绝对体感而不是等距。
-    expect(Math.max(...climb) - Math.min(...climb)).toBeGreaterThan(6)
+    // 内置波形直接从 core 的编译结果取 slot（不是手写合成数组）：
+    // breathing 恒 100Hz、tide 23.8–100Hz、climb 11.1–55.6Hz。
+    const meanGapOf = (id: string): number => {
+      const { freq, intensity } = builtinSlots(id)
+      return mean(gaps(bars({ freq, intensity, width: WIDTH, height: HEIGHT, phase: 0 })))
+    }
+    const breathing = meanGapOf('breathing')
+    const tide = meanGapOf('tide')
+    const climb = meanGapOf('climb')
+    expect(breathing).toBeLessThanOrEqual(1.01) // 100Hz → 1px
+    expect(tide).toBeGreaterThanOrEqual(1)
+    expect(tide).toBeLessThanOrEqual(5) // 23.8–100Hz → 1–4.2px
+    expect(climb).toBeGreaterThanOrEqual(2) // 11.1–55.6Hz → 2–9px
+    expect(climb).toBeLessThanOrEqual(10)
+    // 平均物理频率越低 → 平均柱距越大（呼吸 100Hz < 潮汐 < 攀升 11–56Hz）。
+    expect(breathing).toBeLessThan(tide)
+    expect(tide).toBeLessThan(climb)
+    // 跨资产方向：低频的微须（10–14Hz）比纤毛（12.5–20Hz）疏。
+    expect(mean(flutter)).toBeGreaterThan(mean(cilia))
+
+    // UI 实际路径先 2x 升采样再算柱距：升采样不改变物理映射的上下界。
+    const upsampledGaps = (id: string): number[] => {
+      const { freq, intensity } = builtinSlots(id)
+      const smooth = chartMath.upsampleLinear(freq, intensity, 2)
+      return gaps(bars({ freq: smooth.freq, intensity: smooth.intensity, width: WIDTH, height: HEIGHT, phase: 0 }))
+    }
+    const tide2x = upsampledGaps('tide')
+    expect(Math.min(...tide2x)).toBeGreaterThanOrEqual(1)
+    expect(Math.max(...tide2x)).toBeLessThanOrEqual(5)
+    const climb2x = upsampledGaps('climb')
+    expect(Math.min(...climb2x)).toBeGreaterThanOrEqual(2)
+    expect(Math.max(...climb2x)).toBeLessThanOrEqual(10)
   })
 
   it('linearly upsamples the preview for smoother display (2x/4x)', () => {
@@ -261,12 +336,12 @@ describe('chart-math', () => {
   })
 
   it('scrolls with phase and wraps around the frame cycle', () => {
-    // 恒定频率 40 → 绝对 5px 柱距：一帧总柱距 = 10 * 5 = 50px，是滚动周期。
+    // 恒定码 40 = 40ms 周期 → 4px 柱距：一帧总柱距 = 10 * 4 = 40px，是滚动周期。
     const base = uniform(10, 40, 60, 0)
-    const cycle = 50
+    const cycle = 40
     // 最右一根柱贴住画布右缘（1px 柱 → x = width - 1）。
     expect(base[0]?.x).toBe(WIDTH - 1)
-    // phase 增加 → 所有柱整体左移 2px（仍在画布内的那些；2 不是 5px 柱距的整数倍）。
+    // phase 增加 → 所有柱整体左移 2px（仍在画布内的那些；2 不是 4px 柱距的整数倍）。
     const shifted = uniform(10, 40, 60, 2)
     const shiftedXs = new Set(shifted.map(bar => bar.x))
     for (const bar of base) {
@@ -279,6 +354,13 @@ describe('chart-math', () => {
     expect(uniform(10, 40, 60, -cycle)).toEqual(base)
     // 确定性：同一输入重复调用结果不变。
     expect(uniform(10, 40, 60, 2)).toEqual(shifted)
+
+    // variable spacing 的整帧总柱距也要取模：混合 freq [10,50,10,50] 的
+    // 总柱距 = 1+5+1+5 = 12px，相位 ±12 与 0 等价。
+    const mixed = { freq: [10, 50, 10, 50], intensity: [60, 60, 60, 60], width: WIDTH, height: HEIGHT }
+    const mixedBase = bars({ ...mixed, phase: 0 })
+    expect(bars({ ...mixed, phase: 12 })).toEqual(mixedBase)
+    expect(bars({ ...mixed, phase: -12 })).toEqual(mixedBase)
   })
 
   it('never lets a bar exceed the canvas height', () => {
