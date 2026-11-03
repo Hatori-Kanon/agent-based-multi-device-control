@@ -136,6 +136,42 @@ describe('content-pack loader', () => {
     expect(pack.warnings).toEqual([])
   })
 
+  it('reads a long sensation label as writer prose, not as an over-long author tag', async () => {
+    const files = scenarioFiles()
+    const sensation = '密集软刺履带单向无限循环滚动刮抚，如粗糙猫舌连绵不绝的密集体表电麻'
+    files['waveforms/prose-sensation.json'] = JSON.stringify({
+      id: 'prose-sensation',
+      name: '长感觉',
+      sensation,
+      tags: ['mechanical'],
+      loop: true,
+      segments: [
+        { ms: 400, freq: 60, intensity: { from: 0, to: 50 }, curve: 'easeInOut' },
+        { ms: 400, freq: 60, intensity: { from: 50, to: 0 }, curve: 'easeInOut' },
+      ],
+    })
+    const pack = await loadPack(new MemoryContentSource(files))
+    const prose = pack.waveforms.find(waveform => waveform.id === 'tentacle-pure:prose-sensation')
+    expect(prose).toBeDefined()
+    // The prose is kept verbatim and appended beyond the 24-char author-tag cap.
+    expect(prose!.tags).toContain(sensation)
+    expect(prose!.tags).toContain('mechanical')
+    expect(pack.warnings).toEqual([])
+  })
+
+  it('still rejects an over-long author keyword tag', async () => {
+    const files = scenarioFiles()
+    files['waveforms/bad-tag.json'] = JSON.stringify({
+      id: 'bad-tag',
+      name: 'bad',
+      tags: ['x'.repeat(25)],
+      loop: true,
+      segments: [{ ms: 400, freq: 60, intensity: 40 }],
+    })
+    const malformed = await failure(loadPack(new MemoryContentSource(files)))
+    expect(malformed.message).toContain('1-24')
+  })
+
   it('reports a pack error with the offending file path', async () => {
     const broken = scenarioFiles()
     broken['scenario.json'] = '{ "phases": ['

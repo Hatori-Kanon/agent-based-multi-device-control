@@ -25,7 +25,7 @@ import {
 } from './types.ts'
 
 /** How a segment interpolates between its start and end values. */
-export type WaveformCurve = 'linear' | 'easeIn' | 'easeOut' | 'step'
+export type WaveformCurve = 'linear' | 'easeIn' | 'easeOut' | 'easeInOut' | 'step'
 
 /** A constant, or a value that travels from one bound to another. */
 export type RampedValue = number | { readonly from: number; readonly to: number }
@@ -97,6 +97,11 @@ function easing(curve: WaveformCurve, progress: number): number {
       return progress * progress
     case 'easeOut':
       return 1 - (1 - progress) * (1 - progress)
+    case 'easeInOut':
+      // Symmetric quadratic: slow start, fastest through the middle, slow end.
+      return progress < 0.5
+        ? 2 * progress * progress
+        : 1 - 2 * (1 - progress) * (1 - progress)
     case 'step':
       // Progress never reaches 1 inside a segment, so `from` holds throughout
       // and the change lands on the segment boundary.
@@ -128,7 +133,7 @@ function validate(script: WaveformScript): Span[] {
       fail(`segment ${index}: ms must be a whole number from ${SLOT_MS} to ${MAX_SEGMENT_MS}`)
     }
     const curve = segment.curve ?? 'linear'
-    if (!['linear', 'easeIn', 'easeOut', 'step'].includes(curve)) {
+    if (!['linear', 'easeIn', 'easeOut', 'easeInOut', 'step'].includes(curve)) {
       fail(`segment ${index}: unknown curve "${String(curve)}"`)
     }
     const freq = bounds(segment.freq, 'freq', index, MIN_FREQ, MAX_FREQ)

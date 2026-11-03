@@ -313,6 +313,32 @@ describe('content-pack registry', () => {
     expect((await registry.list())[0]!.versions).toHaveLength(2)
   })
 
+  it('imports a pack whose waveform has long sensation prose and easeInOut curves', async () => {
+    const store = new MemoryPackStore()
+    const registry = new PackRegistry({ store })
+    const sensation = '密集软刺履带单向无限循环滚动刮抚，如粗糙猫舌连绵不绝的密集体表电麻'
+    const bytes = freeformZipWith('tentacle', '0.1.0', '触手', {
+      'waveforms/mech.json': JSON.stringify({
+        id: 'mech',
+        name: '机械爬行',
+        sensation,
+        tags: ['mechanical'],
+        loop: true,
+        segments: [
+          { ms: 400, freq: 60, intensity: { from: 0, to: 50 }, curve: 'easeInOut' },
+          { ms: 400, freq: 60, intensity: { from: 50, to: 0 }, curve: 'easeInOut' },
+        ],
+      }),
+    })
+    const result = await registry.install(bytes, { activate: true })
+    expect(result.id).toBe('tentacle')
+    const loaded = await registry.load('tentacle')
+    expect(loaded.waveforms).toHaveLength(1)
+    // The prose is preserved, beyond the 24-char author-tag cap.
+    expect(loaded.waveforms[0]!.tags).toContain(sensation)
+    expect(loaded.waveforms[0]!.tags).toContain('mechanical')
+  })
+
   it('never touches session state when a pack is uninstalled', async () => {
     const store = new MemoryPackStore()
     const registry = new PackRegistry({ store })

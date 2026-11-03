@@ -136,6 +136,27 @@ describe('waveform script compiler', () => {
     expect(eased.frames[2]?.intensity[0]).toBeLessThan(linear.frames[2]?.intensity[0] ?? 0)
   })
 
+  it('supports a symmetric easeInOut curve (slow start, fast middle, slow end)', () => {
+    const compiled = compileWaveformScript({
+      name: 'eased-in-out',
+      segments: [{ ms: 400, freq: 20, intensity: { from: 0, to: 100 }, curve: 'easeInOut' }],
+    })
+    expect(compiled.frames).toHaveLength(4)
+    // t=0 is the start; the midpoint t=0.5 lands exactly at the halfway value.
+    expect(compiled.frames[0]?.intensity[0]).toBe(0)
+    expect(compiled.frames[2]?.intensity[0]).toBe(50)
+    // t=0.1875 → f=0.0703 → 7; its mirror t=0.8125 → 92.97 → 93 (symmetric ±1).
+    const quarter = compiled.frames[0]?.intensity[3] ?? 0
+    const threeQuarters = compiled.frames[3]?.intensity[1] ?? 0
+    expect(quarter).toBeLessThan(10)
+    expect(threeQuarters).toBeGreaterThan(90)
+    expect(Math.abs(100 - quarter - threeQuarters)).toBeLessThanOrEqual(1)
+    // Symmetric shape: f(t) + f(1-t) = 1 at mirrored slots (slot k ↔ 15-k).
+    expect(Math.abs((compiled.frames[1]?.intensity[0] ?? 0) + (compiled.frames[3]?.intensity[0] ?? 0) - 100)).toBeLessThanOrEqual(1)
+    expect(Math.abs((compiled.frames[0]?.intensity[1] ?? 0) + (compiled.frames[3]?.intensity[3] ?? 0) - 100)).toBeLessThanOrEqual(1)
+    expect(Math.abs((compiled.frames[0]?.intensity[3] ?? 0) + (compiled.frames[3]?.intensity[1] ?? 0) - 100)).toBeLessThanOrEqual(1)
+  })
+
   it('requires the total to be a whole number of frames and says how to fix it', async () => {
     const error = await safetyError(() => compileWaveformScript({
       name: 'ragged',

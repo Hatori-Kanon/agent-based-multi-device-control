@@ -285,11 +285,19 @@ function parseWaveformAsset(file: string, raw: unknown, issues: ValidationIssue[
       if (typeof tag === 'string' && tag.trim().length > 0 && !tags.includes(tag.trim())) tags.push(tag.trim())
     }
   }
-  // `sensation` is the writer-facing feeling label ("细密/潮汐/凌厉"); the core
-  // `Waveform` has no separate field for it, so it travels as a tag.
-  if (typeof raw['sensation'] === 'string' && raw['sensation'].trim().length > 0) {
-    const sensation = raw['sensation'].trim()
-    if (!tags.includes(sensation)) tags.push(sensation)
+  // `sensation` is the writer-facing feeling label ("细密/潮汐/凌厉", or a full
+  // sentence in the packs end users actually import); the core `Waveform` has no
+  // separate field for it, so it travels as a tag. It is appended **after** the
+  // waveform compiler's tag validation, because the 1–24 character cap is for
+  // author keywords: feeding a long sensation through that check made a perfectly
+  // valid pack fail import with the misleading error
+  // `each tag must be 1-24 characters` on `segments` (real packs:
+  // mech-restraint / succubus-abyss, 2026-11-04). There is no length cap here —
+  // the author's prose is what the writer is meant to read.
+  const sensation = typeof raw['sensation'] === 'string' ? raw['sensation'].trim() : ''
+  const withSensation = (base: readonly string[]): string[] => {
+    if (sensation.length === 0) return [...base]
+    return base.includes(sensation) ? [...base] : [...base, sensation]
   }
 
   const framesField = raw['frames']
@@ -309,7 +317,7 @@ function parseWaveformAsset(file: string, raw: unknown, issues: ValidationIssue[
         issues.push(toIssue(file, 'frames', 'waveform.output', 'error', 'this waveform never produces output; at least one intensity slot must be above 0'))
         return undefined
       }
-      return { localId, waveform: { id: localId, name, frames, loop, source: 'imported', tags } }
+      return { localId, waveform: { id: localId, name, frames, loop, source: 'imported', tags: withSensation(tags) } }
     } catch (error) {
       // The parser names the offending frame and slot; keep that text.
       issues.push(toIssue(file, 'frames', 'waveform.bounds', 'error', describe(error)))
@@ -321,7 +329,7 @@ function parseWaveformAsset(file: string, raw: unknown, issues: ValidationIssue[
   if (Array.isArray(segmentsField)) {
     try {
       const compiled = compileWaveformScript({ name, loop, tags, segments: segmentsField as readonly WaveformSegment[] })
-      return { localId, waveform: { id: localId, name: compiled.name, frames: compiled.frames, loop: compiled.loop, source: 'imported', tags: compiled.tags } }
+      return { localId, waveform: { id: localId, name: compiled.name, frames: compiled.frames, loop: compiled.loop, source: 'imported', tags: withSensation(compiled.tags) } }
     } catch (error) {
       issues.push(toIssue(file, 'segments', 'waveform.bounds', 'error', describe(error)))
       return undefined

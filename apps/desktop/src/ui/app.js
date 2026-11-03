@@ -879,6 +879,9 @@
         const chip = document.createElement('span')
         chip.className = 'tag'
         chip.textContent = tag
+        // `sensation` is author prose and can be a long sentence; keep the chip
+        // from stretching the card and reveal the full text on hover.
+        chip.title = tag
         tags.append(chip)
       }
       card.append(row1, meta, tags)

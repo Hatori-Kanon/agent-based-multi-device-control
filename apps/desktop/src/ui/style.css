@@ -1006,6 +1006,16 @@ input[type="range"]:disabled {
   margin-top: 7px;
 }
 
+/* A pack's `sensation` prose travels as a tag; ellipsize it instead of
+   stretching the card, with `title` on the chip for the full sentence. */
+.wf-card .tags .tag {
+  display: inline-block;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
+
 .import-row {
   display: flex;
   flex-wrap: wrap;
