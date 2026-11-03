@@ -136,41 +136,74 @@ describe('chart-math', () => {
     })
     expect(withStrength).toEqual(base)
 
-    // 自右向左：最后一根（最右）用最后一个采样点的 intensity，依次向左。
-    expect(base.map(bar => bar.height)).toEqual([16, 31, 16, 1])
+    // 自右向左：最右一根用最后一个采样点的 intensity，依次向左。
+    expect(base.map(bar => bar.height).slice(0, 4)).toEqual([16, 31, 16, 1])
   })
 
-  it('spaces bars by each sample point frequency: low sparse, high dense', () => {
-    const sparse = uniform(10, 10, 60)
-    const dense = uniform(10, 240, 60)
-    const sparseGaps = gaps(sparse)
-    const denseGaps = gaps(dense)
-    expect(sparseGaps.length).toBeGreaterThan(3)
-    expect(denseGaps.length).toBeGreaterThan(3)
-    // 协议频率 10 → 28px；240 → 4px（公式是确定的，同时验证「明显大于」）。
-    expect(new Set(sparseGaps)).toEqual(new Set([28]))
-    expect(new Set(denseGaps)).toEqual(new Set([4]))
-    const sparseAvg = sparseGaps.reduce((sum, gap) => sum + gap, 0) / sparseGaps.length
-    const denseAvg = denseGaps.reduce((sum, gap) => sum + gap, 0) / denseGaps.length
-    expect(sparseAvg - denseAvg).toBeGreaterThan(20)
-
-    // 一帧里频率混合时，每根柱用自己采样点的频率决定间距，而不是平均值。
-    const mixed = bars({
-      freq: [10, 240],
-      intensity: [60, 60],
+  it('normalizes spacing to the preview frequency range so density is visible', () => {
+    // 真实波形的频率常只覆盖协议域一小段（例如 20–80）。按「本帧 min/max」
+    // 归一化后：最低频 ≈ MAX_SPACING(22px)、最高频 ≈ MIN_SPACING(3px)。
+    const narrow = bars({
+      freq: [20, 20, 80, 80],
+      intensity: [60, 60, 60, 60],
       width: WIDTH,
       height: HEIGHT,
       phase: 0,
     })
-    const mixedGaps = gaps(mixed)
-    expect(mixedGaps).toContain(28)
-    expect(mixedGaps).toContain(4)
+    const narrowGaps = gaps(narrow)
+    expect(narrowGaps.length).toBeGreaterThan(6)
+    expect(Math.max(...narrowGaps)).toBe(22)
+    expect(Math.min(...narrowGaps)).toBe(3)
+    expect(new Set(narrowGaps)).toEqual(new Set([3, 22]))
+    // 不再是「全等且疏」：最疏与最密差 > 15px。
+    expect(Math.max(...narrowGaps) - Math.min(...narrowGaps)).toBeGreaterThan(15)
+
+    // 恒定频率（min==max）：固定中间柱距，等距、无 NaN、不除零。
+    const constantGaps = gaps(uniform(10, 40, 60))
+    expect(constantGaps.length).toBeGreaterThan(3)
+    expect(new Set(constantGaps)).toEqual(new Set([13]))
+    expect(constantGaps.every(gap => Number.isFinite(gap))).toBe(true)
+
+    // 宽域 10–240 仍覆盖到两个极值。
+    const wide = bars({
+      freq: [10, 10, 240, 240],
+      intensity: [60, 60, 60, 60],
+      width: WIDTH,
+      height: HEIGHT,
+      phase: 0,
+    })
+    expect(new Set(gaps(wide))).toEqual(new Set([3, 22]))
+  })
+
+  it('shows visible density for real pack frequency ranges (cilia/tide/climb)', () => {
+    // 真实内容包/内置波形的频率大多只覆盖协议域的一小段：cilia 50–80、
+    // tide 25–70、climb 90–170。归一化后每段都要有明显疏→密对比。
+    const cases = [
+      { name: 'cilia 50–80', values: [50, 56, 62, 68, 74, 80] },
+      { name: 'tide 25–70', values: [25, 34, 43, 52, 61, 70] },
+      { name: 'climb 90–170', values: [90, 106, 122, 138, 154, 170] },
+    ]
+    for (const { values } of cases) {
+      const caseGaps = gaps(bars({
+        freq: values,
+        intensity: values.map(() => 60),
+        width: WIDTH,
+        height: HEIGHT,
+        phase: 0,
+      }))
+      expect(caseGaps.length).toBeGreaterThan(8)
+      const dense = Math.min(...caseGaps)
+      const sparse = Math.max(...caseGaps)
+      expect(dense).toBeLessThanOrEqual(4)
+      expect(sparse).toBeGreaterThanOrEqual(21)
+      expect(sparse - dense).toBeGreaterThan(15)
+    }
   })
 
   it('scrolls with phase and wraps around the frame cycle', () => {
     const base = uniform(10, 125, 60, 0)
-    // 一帧总柱距 = 10 * 16 = 160px，是滚动的循环周期。
-    const cycle = 160
+    // 恒定频率用固定 13px 柱距：一帧总柱距 = 10 * 13 = 130px，是滚动周期。
+    const cycle = 130
     // 最右一根柱贴住画布右缘（2px 柱 → x = width - 2）。
     expect(base[0]?.x).toBe(WIDTH - 2)
     // phase 增加 → 所有柱整体左移 5px（仍在画布内的那些）。
