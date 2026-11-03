@@ -96,6 +96,16 @@ export interface ResolveContext {
    * builds the map per turn; the resolver only reads it, so it stays pure.
    */
   readonly regionAliases?: ReadonlyMap<string, readonly string[]>
+  /**
+   * Optional session default waveform (`内容包规范.md` §4.5).
+   *
+   * When a plan references an unknown waveform id, the resolver falls back to
+   * this id instead of a plain pattern: the channel keeps its texture and the
+   * command is still marked `unknown-waveform` for the audit. The host wires
+   * it to the pack's default/fallback asset; absent keeps the old plain
+   * pattern behaviour.
+   */
+  readonly defaultWaveformId?: string
   /** Used only to answer "does this waveform id exist". */
   readonly waveforms: WaveformLookup
   /**
@@ -162,8 +172,11 @@ interface BodyResult {
 /**
  * Turn one plan into dispatchable commands.
  *
- * The command list is sorted by `(beatId, deviceId, channelId)`; the beat list
- * keeps `narrativeOnlyBeats` sorted; warnings are emitted in plan order. All
+ * Commands are generated in plan order, then collapsed per `(device, channel)`
+ * so one turn drives each channel at most once (see
+ * {@link mergeChannelCommands}). The command list is sorted by
+ * `(beatId, deviceId, channelId)`; the beat list keeps `narrativeOnlyBeats`
+ * sorted; warnings are emitted in plan order and then in command order. All
  * three are stable for the same input, which is what makes the audit replay
  * and the snapshot tests meaningful.
  */
@@ -176,15 +189,88 @@ export function resolvePlan(plan: BeatPlan, ctx: ResolveContext): ResolvedPlan {
     resolveBeat(beat, ctx, commands, narrativeOnly, warnings)
   }
 
-  commands.sort(compareCommands)
+  const merged = mergeChannelCommands(commands, warnings)
+  merged.sort(compareCommands)
 
   return {
     turnId: plan.turnId,
     planId: makePlanId(plan),
-    commands,
+    commands: merged,
     narrativeOnlyBeats: [...narrativeOnly].sort(compareStrings),
     warnings,
   }
+}
+
+interface ChannelMerge {
+  /** Last command generated for this channel: its body is the final state. */
+  last: ResolvedCommand
+  /** Longest non-stop hold requested for this channel anywhere in the turn. */
+  maxDurationSec: number
+}
+
+/**
+ * Collapse a turn's commands so each channel is driven at most once.
+ *
+ * Beats are independent narrative units but they land on one hardware state:
+ * a later beat on the same `(device, channel)` replaces the earlier one.
+ * Dispatching both in plan order let the later command truncate the earlier
+ * (audit turn 13: a 40 s level was cut to 4 s by a pattern on the same part)
+ * and made the player feel the same part move twice. The final body is the
+ * last command's body (percent/envelope/waveform); the hold time is the
+ * longest **non-stop** duration requested anywhere in the turn, so a long hold
+ * survives a later short texture change. A final stop stays a stop: `percent:
+ * 0` clears the channel and has no meaningful duration to merge.
+ *
+ * The merge keeps the surviving command in the slot where it was generated and
+ * records one warning per superseded command, so the audit explains why a
+ * beat's command is absent from `commands`.
+ */
+function mergeChannelCommands(commands: readonly ResolvedCommand[], warnings: string[]): ResolvedCommand[] {
+  const groups = new Map<string, ChannelMerge>()
+  for (const command of commands) {
+    const key = matchKey(command.deviceId, command.channelId)
+    const durationSec = nonStopDurationSec(command)
+    const existing = groups.get(key)
+    if (existing === undefined) {
+      groups.set(key, { last: command, maxDurationSec: durationSec })
+    } else {
+      existing.last = command
+      existing.maxDurationSec = Math.max(existing.maxDurationSec, durationSec)
+    }
+  }
+
+  const merged: ResolvedCommand[] = []
+  for (const command of commands) {
+    const group = groups.get(matchKey(command.deviceId, command.channelId))
+    if (group === undefined) continue // unreachable: every command has a group
+    if (group.last !== command) {
+      warnings.push(
+        `beat ${command.beatId}: command on ${command.deviceId}/${command.channelId}`
+        + ` superseded by beat ${group.last.beatId} in the same turn`,
+      )
+      continue
+    }
+    merged.push(withMergedDuration(command, group.maxDurationSec))
+  }
+  return merged
+}
+
+/** Requested hold, or 0 for a stop (which clears the channel instead). */
+function nonStopDurationSec(command: ResolvedCommand): number {
+  const body = command.body
+  if (body.kind === 'waveform') return 0
+  if (body.kind === 'level' && body.percent === 0) return 0
+  return Number.isFinite(body.durationSec) && body.durationSec > 0 ? body.durationSec : 0
+}
+
+/** Apply the turn-wide hold time to the surviving body (stops keep their own). */
+function withMergedDuration(command: ResolvedCommand, durationSec: number): ResolvedCommand {
+  const body = command.body
+  if (body.kind === 'waveform') return command
+  // `setLevel(percent: 0)` is a stop; it ignores duration and must stay one.
+  if (body.kind === 'level' && body.percent === 0) return command
+  if (body.durationSec === durationSec) return command
+  return { ...command, body: { ...body, durationSec } }
 }
 
 function resolveBeat(
@@ -619,8 +705,10 @@ function envelopeDefaults(preset: EnvelopePreset): EnvelopeDefaults | undefined 
 }
 
 /**
- * §4.4 step 7: a missing waveform degrades to a plain pattern; a channel that
- * cannot play one does too. Never throws.
+ * §4.4 step 7 / §4.5: a missing waveform degrades instead of throwing. When the
+ * session exposes a default waveform and the channel can play one, the request
+ * falls back to that asset; otherwise it becomes a plain pattern. A channel
+ * that cannot play any waveform always becomes a plain pattern.
  *
  * The returned id is the **resolved waveform's canonical id**, not the request
  * reference. The lookup accepts pack-relative references (`tentacle-crawl`),
@@ -640,6 +728,13 @@ function resolveWaveform(
   if (reference === undefined) return { degraded: undefined }
   const waveform = ctx.waveforms.get(reference)
   if (waveform === undefined) {
+    const fallback = defaultWaveformOf(ctx, channel)
+    if (fallback !== undefined) {
+      warnings.push(
+        `beat ${beatId}: waveform "${reference}" was not found; using the session default waveform "${fallback.id}"`,
+      )
+      return { waveformId: fallback.id, degraded: 'unknown-waveform' }
+    }
     warnings.push(`beat ${beatId}: waveform "${reference}" was not found; falling back to a plain pattern`)
     return { degraded: 'unknown-waveform' }
   }
@@ -650,6 +745,19 @@ function resolveWaveform(
     return { degraded: 'unsupported-waveform' }
   }
   return { waveformId: waveform.id, degraded: undefined }
+}
+
+/**
+ * The session default waveform an unknown reference may fall back to.
+ *
+ * Only a waveform-capable channel can use it; when no default is configured or
+ * the lookup cannot resolve it, the caller keeps the plain-pattern degradation.
+ */
+function defaultWaveformOf(ctx: ResolveContext, channel: ResolveChannelSnapshot): Waveform | undefined {
+  if (channel.supportsWaveform !== true) return undefined
+  const id = ctx.defaultWaveformId
+  if (id === undefined) return undefined
+  return ctx.waveforms.get(id)
 }
 
 /* ------------------------------------------------------------------------- */

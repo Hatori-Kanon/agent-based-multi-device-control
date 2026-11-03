@@ -195,7 +195,8 @@ describe('resolvePlan is a pure, byte-stable function', () => {
 
     const keys = first.commands.map(command => `${command.beatId}/${command.deviceId}/${command.channelId}`)
     expect(keys).toEqual([...keys].sort())
-    expect(first.commands.map(command => command.channelId)).toEqual(['a', 'b', 'a'])
+    // b1/a is superseded by b2/a; the surviving commands are one per channel.
+    expect(first.commands.map(command => `${command.beatId}/${command.channelId}`)).toEqual(['b1/b', 'b2/a'])
   })
 
   it('has no line field in its context and ignores an injected one', () => {
@@ -214,6 +215,93 @@ describe('resolvePlan is a pure, byte-stable function', () => {
     const two = resolvePlan(plan([levelBeat('b1', { regions: ['chest'], strength: 'high' })]), ctx)
 
     expect(one.planId).not.toBe(two.planId)
+  })
+})
+
+describe('one turn drives each channel once', () => {
+  it('merges same-channel commands: last body wins and the longest hold is kept', () => {
+    const registry = snapshot(device('toy', [channel('a', 'chest', { supportsWaveform: true })]))
+    const fixture = plan([
+      // Audit turn 13: a long level followed by a short pattern on the same
+      // channel used to truncate the hold; the final state must be the pattern
+      // with the 40 s hold preserved.
+      levelBeat('b1', {
+        intentId: 'plain',
+        regions: ['chest'],
+        change: { kind: 'level', targetPercent: 100, durationSec: 40 },
+      }),
+      levelBeat('b2', {
+        intentId: 'plain',
+        regions: ['chest'],
+        change: { kind: 'waveform', waveformId: 'climb', durationSec: 4 },
+      }),
+    ])
+
+    const resolved = resolvePlan(fixture, context(registry, PLAIN_INTENT_MAP))
+
+    expect(resolved.commands).toHaveLength(1)
+    const command = firstCommand(resolved.commands)
+    expect(command.beatId).toBe('b2')
+    expect(command.body).toEqual({
+      kind: 'pattern',
+      envelope: { preset: 'steady', minPercent: 14, maxPercent: 14, periodMs: 1_000, jitter: 0 },
+      durationSec: 40,
+      waveformId: 'climb',
+    })
+    expect(resolved.warnings).toContain(
+      'beat b1: command on toy/a superseded by beat b2 in the same turn',
+    )
+  })
+
+  it('keeps a final stop as a stop instead of merging the earlier hold time', () => {
+    const registry = snapshot(device('toy', [channel('a', 'chest')]))
+    const fixture = plan([
+      levelBeat('b1', {
+        regions: ['chest'],
+        change: { kind: 'level', targetPercent: 100, durationSec: 40 },
+      }),
+      levelBeat('b2', { intentId: 'stop', regions: ['chest'] }),
+    ])
+
+    const resolved = resolvePlan(fixture, context(registry))
+
+    expect(resolved.commands).toHaveLength(1)
+    const command = firstCommand(resolved.commands)
+    expect(command.beatId).toBe('b2')
+    expect(command.body).toEqual({ kind: 'level', percent: 0, durationSec: 0 })
+    expect(resolved.warnings).toContain(
+      'beat b1: command on toy/a superseded by beat b2 in the same turn',
+    )
+  })
+
+  it('leaves other channels untouched when only one channel collides', () => {
+    const registry = snapshot(device('toy', [channel('a', 'chest'), channel('b', 'chest')]))
+    const fixture = plan([
+      levelBeat('b1', {
+        intentId: 'plain',
+        regions: ['chest'],
+        change: { kind: 'level', targetPercent: 100, durationSec: 10 },
+      }),
+      levelBeat('b2', {
+        intentId: 'plain',
+        regions: ['chest'],
+        targets: [{ deviceId: 'toy', channelId: 'a' }],
+        change: { kind: 'level', targetPercent: 30, durationSec: 4 },
+      }),
+    ])
+
+    const resolved = resolvePlan(fixture, context(registry, PLAIN_INTENT_MAP))
+
+    expect(resolved.commands.map(command => `${command.beatId}/${command.channelId}`)).toEqual([
+      'b1/b',
+      'b2/a',
+    ])
+    const byChannel = new Map(resolved.commands.map(command => [command.channelId, command]))
+    expect(byChannel.get('a')?.body).toEqual({ kind: 'level', percent: 6, durationSec: 10 })
+    expect(byChannel.get('b')?.body).toEqual({ kind: 'level', percent: 20, durationSec: 10 })
+    expect(resolved.warnings.filter(warning => warning.includes('superseded'))).toEqual([
+      'beat b1: command on toy/a superseded by beat b2 in the same turn',
+    ])
   })
 })
 
@@ -527,6 +615,66 @@ describe('offline devices and degraded commands', () => {
 
     expect(resolved.commands).toEqual([])
     expect(resolved.narrativeOnlyBeats).toEqual(['b1'])
+  })
+})
+
+describe('unknown waveform references fall back to the session default', () => {
+  const vanished = (): FeedbackIntent => ({
+    ...AMBIENT,
+    suggest: { preset: 'wave', waveform: 'no-such-waveform', durationSec: 30, strength: 'med' },
+  })
+
+  it('uses the configured default waveform on a waveform-capable channel', () => {
+    const registry = snapshot(device('toy', [channel('a', 'chest', { supportsWaveform: true })]))
+    const resolved = resolvePlan(
+      plan([levelBeat('b1', { regions: ['chest'] })]),
+      {
+        ...context(registry, new Map([['ambient-field', vanished()]])),
+        defaultWaveformId: 'tide',
+      },
+    )
+    const command = firstCommand(resolved.commands)
+
+    expect(command.body.kind).toBe('pattern')
+    if (command.body.kind === 'pattern') {
+      expect(command.body.waveformId).toBe('tide')
+      // The intent's envelope is kept: only the texture fallback changed.
+      expect(command.body.envelope.preset).toBe('wave')
+    }
+    // Still reported as a degradation: the requested texture was not played.
+    expect(command.degraded).toBe('unknown-waveform')
+    expect(resolved.warnings.some(
+      warning => warning.includes('using the session default waveform "tide"'),
+    )).toBe(true)
+  })
+
+  it('keeps the plain pattern when the channel cannot play a waveform', () => {
+    const registry = snapshot(device('toy', [channel('a', 'chest')]))
+    const resolved = resolvePlan(
+      plan([levelBeat('b1', { regions: ['chest'] })]),
+      {
+        ...context(registry, new Map([['ambient-field', vanished()]])),
+        defaultWaveformId: 'tide',
+      },
+    )
+    const command = firstCommand(resolved.commands)
+
+    expect(command.body.kind).toBe('pattern')
+    if (command.body.kind === 'pattern') expect(command.body.waveformId).toBeUndefined()
+    expect(command.degraded).toBe('unknown-waveform')
+    expect(resolved.warnings.some(warning => warning.includes('falling back to a plain pattern'))).toBe(true)
+  })
+
+  it('keeps the plain pattern when no default is configured', () => {
+    const registry = snapshot(device('toy', [channel('a', 'chest', { supportsWaveform: true })]))
+    const command = firstCommand(resolvePlan(
+      plan([levelBeat('b1', { regions: ['chest'] })]),
+      context(registry, new Map([['ambient-field', vanished()]])),
+    ).commands)
+
+    expect(command.body.kind).toBe('pattern')
+    if (command.body.kind === 'pattern') expect(command.body.waveformId).toBeUndefined()
+    expect(command.degraded).toBe('unknown-waveform')
   })
 })
 

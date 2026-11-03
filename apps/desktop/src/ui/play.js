@@ -767,7 +767,8 @@
       canvas = document.createElement('canvas')
       canvas.className = 'live-wave'
       canvas.width = 300
-      canvas.height = 32
+      // 和 .live-wave 的 CSS 高度一致：细柱（2px）才不会被纵向拉伸糊掉。
+      canvas.height = 34
       canvas.setAttribute('aria-label', `${channel.label ?? channel.id ?? '通道'} 实时波形`)
       row.append(canvas)
     }
@@ -838,10 +839,13 @@
   }
 
   /**
-   * 波形柱状图：从右往左滚；频率越低柱距越大，强度越高柱子越高。
+   * 波形柱状图：从右往左滚；频率越低柱距越大（疏），越高越密。
    *
-   * 这里画的是宿主给出的一帧采样（每 25ms 一个 slot）；当前通道强度作为
-   * 整体振幅，波形自身的 intensity 作为纹理，最后再按当前百分比缩放。
+   * 几何计算全在 `/chart-math.js` 的纯函数里：柱宽固定 2px；柱高只跟波形
+   * 自身 intensity 走；柱距跟每个采样点的协议频率走。当前通道强度只影响
+   * 设备输出，不再缩放这张图（旧版把柱高乘上通道百分比，整片柱子会随
+   * 强度缩水，用户看到的「高度跟强度走」就是它）。这里只负责取 preview、
+   * 无 preview 时画基线、以及把算好的矩形 fillRect 出来。
    */
   function drawLiveWave(view) {
     const canvas = view.canvas
@@ -852,7 +856,7 @@
     const height = canvas.height
     context.clearRect(0, 0, width, height)
     const preview = view.waveformId === '' ? undefined : waveformPreviews.get(view.waveformId)
-    if (preview === undefined) {
+    if (preview === undefined || window.EmbodiedChartMath === undefined) {
       context.strokeStyle = 'rgba(247, 217, 122, 0.18)'
       context.lineWidth = 1
       context.beginPath()
@@ -861,23 +865,17 @@
       context.stroke()
       return
     }
-    const { freq, intensity } = preview
-    const count = Math.min(freq.length, intensity.length)
-    if (count === 0) return
-    let sum = 0
-    for (const value of freq) sum += value
-    const avgFreq = sum / freq.length
-    // 协议频率 10-240：低频柱距宽、高频柱距窄。
-    const spacing = Math.max(4, Math.min(22, 4 + (240 - avgFreq) / 12))
-    const phase = (performance.now() / 1000) * 28 % (spacing * 8)
+    const bars = window.EmbodiedChartMath.computeBars({
+      freq: preview.freq,
+      intensity: preview.intensity,
+      width,
+      height,
+      // 28px/s 的滚动速度；相位取模交给纯函数，滚动是无缝循环的。
+      phase: (performance.now() / 1000) * 28,
+    })
     context.fillStyle = 'rgba(247, 217, 122, 0.72)'
-    for (let x = -phase; x < width + spacing; x += spacing) {
-      const index = Math.floor((x + phase) / spacing * 8) % count
-      const sample = Math.abs(index)
-      const texture = Math.max(0, Math.min(100, intensity[sample] ?? 0)) / 100
-      const barHeight = Math.max(1, Math.round(texture * (view.level / 100) * (height - 3)))
-      const barX = Math.round(x)
-      context.fillRect(barX, height - barHeight - 1, Math.max(2, spacing - 2), barHeight)
+    for (const bar of bars) {
+      context.fillRect(bar.x, height - 1 - bar.height, bar.width, bar.height)
     }
   }
 
@@ -1171,11 +1169,21 @@
       if (Number(hi.value) < Number(hi.min)) hi.value = hi.min
       paintRange(lo)
       paintRange(hi)
-      readout.textContent = intensity
-        ? (caps.intensityUnit === 'strength'
-            ? `${lo.value}–${hi.value}`
-            : `${lo.value}%–${hi.value}%`)
-        : `${lo.value}–${hi.value} Hz`
+      if (!intensity) {
+        readout.textContent = `${lo.value}–${hi.value} Hz`
+        readout.title = `频率范围 ${lo.value}–${hi.value} Hz`
+      } else if (caps.intensityUnit === 'strength') {
+        // 原生强度读数带满量程参照：只写「0–22」会让人以为强度很小，
+        // 写成「0–22 / 200」才看得出它是绝对量程里的一段；百分比更直观，
+        // 但读数保持原生单位，百分比放进 title。
+        readout.textContent = `${lo.value}–${hi.value} / ${caps.intensityMax}`
+        readout.title = `强度范围 ${lo.value}–${hi.value} / ${caps.intensityMax}`
+          + `（${toPercent(Number(lo.value))}%–${toPercent(Number(hi.value))}%）`
+      } else {
+        // 百分比后端没有原生单位，保持「0%–40%」的既有写法。
+        readout.textContent = `${lo.value}%–${hi.value}%`
+        readout.title = `强度范围 ${lo.value}%–${hi.value}%（满量程 100%）`
+      }
     }
     lo.addEventListener('input', sync)
     hi.addEventListener('input', sync)

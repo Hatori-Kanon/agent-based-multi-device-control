@@ -288,6 +288,10 @@ function replayTimeline(records: readonly AuditRecord[]): TimelineTurn[] {
   let pending: AuditRecord[] = []
   for (const record of records) {
     if (record.action === 'set_level' || record.action === 'run_pattern') {
+      // The host's continuity hold is a `system`-actor bridge between turns,
+      // not a command resolved from a beat: pairing it with the next plan's
+      // actions would corrupt the beat → command timeline.
+      if (record.actor === 'system') continue
       pending.push(record)
       continue
     }
@@ -685,7 +689,9 @@ describe('M2 end-to-end acceptance (B2-T13)', () => {
     expect(runtime.policy.effective('mock-pulse', 'a').maxPercent).toBe(10)
 
     const dispatchedPercents = afterMessage
-      .filter(record => record.action === 'set_level')
+      // The `system` rows are the host's continuity hold between turns, not
+      // plan commands; this list asserts what the model's plans dispatched.
+      .filter(record => record.action === 'set_level' && record.actor !== 'system')
       .map(record => (record.detail as { readonly percent?: number } | undefined)?.percent)
     expect(dispatchedPercents).toEqual([20, 10])
 

@@ -1317,10 +1317,12 @@ body.in-session .main-play {
 .live-wave {
   display: block;
   width: 100%;
-  height: 32px;
+  height: 34px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: rgba(12, 15, 21, 0.6);
+  /* 画布按容器宽度缩放：柱宽只有 2px，线性插值会糊成一片，像素化才看得清。 */
+  image-rendering: pixelated;
 }
 
 .line--player {

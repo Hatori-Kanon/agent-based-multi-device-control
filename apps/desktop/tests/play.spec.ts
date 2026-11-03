@@ -144,6 +144,67 @@ function doubleRotationPlanCall(id = 'call_double_rotation'): ToolCall {
   }
 }
 
+/**
+ * A level plan that drives every ready channel (synced intent, no waveform).
+ *
+ * `durationSec` defaults to a short 3 s hold so a following turn is past the
+ * effect and the continuity hold is allowed to bridge the gap.
+ */
+function holdPlanCall(targetPercent: number, durationSec = 3, id = 'call_level'): ToolCall {
+  return {
+    id,
+    name: 'apply_plan',
+    arguments: {
+      pacing: 'probe',
+      beats: [{
+        id: 'b1',
+        intentId: 'ambient-field',
+        regions: ['whole-body'],
+        strength: 'low',
+        change: { kind: 'level', targetPercent, durationSec },
+      }],
+    },
+  }
+}
+
+/** One turn that raises every channel and then stops them again. */
+function levelThenStopPlanCall(id = 'call_level_stop'): ToolCall {
+  return {
+    id,
+    name: 'apply_plan',
+    arguments: {
+      pacing: 'probe',
+      beats: [
+        {
+          id: 'b1',
+          intentId: 'ambient-field',
+          regions: ['whole-body'],
+          strength: 'low',
+          change: { kind: 'level', targetPercent: 100, durationSec: 10 },
+        },
+        { id: 'b2', intentId: 'stop', regions: ['whole-body'], strength: 'low' },
+      ],
+    },
+  }
+}
+
+/** Registry commands issued by the continuity hold (host, `system` actor). */
+function holdRecords(records: readonly AuditRecord[]): readonly AuditRecord[] {
+  return records.filter(record => record.actor === 'system'
+    && (record.action === 'set_level' || record.action === 'run_pattern'))
+}
+
+/** Records after the previous `plan_resolved` up to and including the last one. */
+function recordsOfLastTurn(records: readonly AuditRecord[]): readonly AuditRecord[] {
+  const resolved = records
+    .map((record, index) => ({ record, index }))
+    .filter(entry => entry.record.action === 'plan_resolved')
+  if (resolved.length < 2) return []
+  const previous = resolved[resolved.length - 2]!
+  const last = resolved[resolved.length - 1]!
+  return records.slice(previous.index + 1, last.index + 1)
+}
+
 /** Every dispatch action recorded by the executor's `plan_resolved` audit lines. */
 function planActions(records: readonly AuditRecord[]): readonly DispatchStatus[] {
   return records
@@ -1467,9 +1528,11 @@ describe('packed waveforms, player parts and true effect rows (audit fixes)', ()
     expect(effects.map(effect => effect.channelId)).toEqual(['a', 'b'])
     expect(effects.map(effect => effect.regionLabel)).toEqual(['小穴', '后穴'])
     expect(effects.every(effect => effect.status === 'degraded')).toBe(true)
-    // Two beats drove the same two channels with the same effect: four
-    // dispatched actions, two effect rows.
-    expect(planActions(h.records())).toHaveLength(4)
+    // Two beats requested the same region; the resolver merges same-channel
+    // commands (keep the last body), so each channel dispatched exactly one
+    // command. Both channels still get a row in the effect box — the old v9
+    // filter hid them entirely.
+    expect(planActions(h.records())).toHaveLength(2)
   })
 
   it('rotates round-robin intents across turns', async () => {
@@ -1507,13 +1570,14 @@ describe('packed waveforms, player parts and true effect rows (audit fixes)', ()
       await tentaclePack(),
     )
     await h.host.start({ packId: 'tentacle', plannedMinutes: 30 })
-    // Both beats of one plan share the turn's cursor: turn 1 = a+a, not a+b.
-    expect(planActions(h.records()).map(action => action.channelId)).toEqual(['a', 'a'])
+    // Both beats of one plan share the turn's cursor, so both would pick `a`;
+    // the resolver then merges their same-channel commands into one dispatch.
+    expect(planActions(h.records()).map(action => action.channelId)).toEqual(['a'])
 
     await h.host.message('继续。')
     // The turn advances the cursor by exactly one (not by the beat count):
-    // turn 2 = b+b. With +2 per turn an even pool would stay on `a` forever.
-    expect(planActions(h.records()).slice(2).map(action => action.channelId)).toEqual(['b', 'b'])
+    // turn 2 = b. With +2 per turn an even pool would stay on `a` forever.
+    expect(planActions(h.records()).slice(1).map(action => action.channelId)).toEqual(['b'])
   })
 
   it('does not jump channels when a no-plan turn is interleaved', async () => {
@@ -1591,6 +1655,214 @@ describe('packed waveforms, player parts and true effect rows (audit fixes)', ()
     // not invent a `plan_fallback` audit line for a turn that really executed.
     expect(h.host.snapshot()?.lastLine).toBe('（短暂停顿）')
     expect(h.records().some(record => record.action === 'plan_fallback')).toBe(false)
+  })
+})
+
+// ── Continuity hold + default waveform (user feedback 4/5/6) ───────────────
+
+describe('continuity hold while the model thinks', () => {
+  /** Two pulse channels that can actually play a waveform (Coyote-like). */
+  const waveformChannels: readonly Channel[] = [
+    { id: 'a', kind: 'level', label: 'A 通道', supportsWaveform: true },
+    { id: 'b', kind: 'level', label: 'B 通道', supportsWaveform: true },
+  ]
+
+  it('holds the last output before the next turn and lets the plan override it', async () => {
+    const h = await createHarness([
+      scriptedTurn('（第一回合。）', [holdPlanCall(100)]),
+      scriptedTurn('（第二回合。）', [planCall('call_2')]),
+    ])
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    // 100 % relative maps through each channel's 0–20 % handler interval; the
+    // synced ambient intent drove both ready channels.
+    expect(h.host.transcript()[0]!.effects.map(effect => effect.percent)).toEqual([20, 20])
+
+    // Let the plan's own 3 s hold expire: only then is there a gap for the
+    // continuity hold to bridge.
+    h.clock.advance(4_000)
+    await h.host.message('继续。')
+
+    const records = h.records()
+    const holds = holdRecords(records)
+    // One hold per channel, bounded by min(30, channel.maxDurationSec).
+    expect(holds.length).toBeGreaterThanOrEqual(2)
+    for (const hold of holds.slice(0, 2)) {
+      expect(hold.action).toBe('set_level')
+      expect(hold.detail).toMatchObject({ percent: 20 })
+      const durationSec = (hold.detail as { durationSec?: number }).durationSec
+      expect(durationSec).toBeGreaterThan(0)
+      expect(durationSec).toBeLessThanOrEqual(30)
+    }
+    // The hold belongs to the *second* turn and precedes its plan commands, so
+    // the model's thinking time is bridged before any new effect starts.
+    const turn = recordsOfLastTurn(records)
+    const firstHold = turn.findIndex(record => holds.includes(record))
+    const firstPlanCommand = turn.findIndex(record => record.actor === 'model')
+    expect(firstHold).toBeGreaterThanOrEqual(0)
+    expect(firstPlanCommand).toBeGreaterThan(firstHold)
+
+    // The new plan overrides the held channel: `probe-touch` is `primary`, so
+    // it drives channel a only, at the low strength mapped through the interval.
+    const second = h.host.transcript()[1]!
+    expect(second.effects).toHaveLength(1)
+    expect(second.effects[0]).toMatchObject({ channelId: 'a', percent: 8 })
+  })
+
+  it('does not hold a channel that the previous turn stopped', async () => {
+    const h = await createHarness([
+      scriptedTurn('（起又停。）', [levelThenStopPlanCall()]),
+      scriptedTurn('（下一回合。）', [planCall('call_2')]),
+    ])
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    const opening = h.host.transcript()[0]!
+    // Both channels were raised and then stopped in the same turn (two level
+    // rows plus two stop rows, the stop ones at percent 0).
+    expect(opening.effects.filter(effect => effect.percent === 0)).toHaveLength(2)
+
+    await h.host.message('继续。')
+    // A stop clears the remembered output: the next turn must not revive it.
+    expect(holdRecords(h.records())).toHaveLength(0)
+    expect(h.host.transcript()).toHaveLength(2)
+  })
+
+  it('does not restart an effect that still covers the think time', async () => {
+    const long = await createHarness([
+      scriptedTurn('（长效果。）', [holdPlanCall(100, 60)]),
+      scriptedTurn('（下一回合。）', [planCall('call_2')]),
+    ])
+    await long.host.start({ packId: 'demo', plannedMinutes: 30 })
+    await long.host.message('继续。')
+    // A 60 s command accepted a moment ago still covers the generation window:
+    // there is no gap to bridge, so restarting it would only duplicate/lengthen.
+    expect(holdRecords(long.records())).toHaveLength(0)
+
+    const short = await createHarness([
+      scriptedTurn('（短效果。）', [holdPlanCall(100, 3)]),
+      scriptedTurn('（下一回合。）', [planCall('call_2')]),
+    ])
+    await short.host.start({ packId: 'demo', plannedMinutes: 30 })
+    // The 3 s effect has already expired when the next turn starts: bridge it.
+    short.clock.advance(4_000)
+    await short.host.message('继续。')
+    expect(holdRecords(short.records()).length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('does not revive a plan output older than the TTL', async () => {
+    const h = await createHarness([
+      scriptedTurn('（很旧的一拍。）', [holdPlanCall(100, 3)]),
+      scriptedTurn('（很久以后。）', [planCall('call_2')]),
+    ])
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    // The turn that produced the output settled long ago; the narration may
+    // already describe 放开/退出, so the effect must not come back.
+    h.clock.advance(91_000)
+    await h.host.message('继续。')
+    expect(holdRecords(h.records())).toHaveLength(0)
+  })
+
+  it('does not replay human direct control', async () => {
+    const h = await createHarness([
+      // Opening turn settles with prose only: no plan, no dispatch.
+      scriptedTurn('（只有正文。）'),
+      scriptedTurn('（仍然没有计划。）'),
+      scriptedTurn('（下一回合。）', [planCall('call_2')]),
+    ])
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+
+    // The human drives a channel from the device page while no plan is running.
+    await h.registry.setLevel('human', {
+      deviceId: 'mock-pulse',
+      channelId: 'a',
+      percent: 15,
+      durationSec: 5,
+    })
+    expect(h.records().some(record =>
+      record.action === 'set_level' && record.actor === 'human')).toBe(true)
+
+    await h.host.message('继续。')
+    // Human output is not a plan command: the next turn must not hold it.
+    expect(holdRecords(h.records())).toHaveLength(0)
+    expect(h.host.transcript()).toHaveLength(2)
+  })
+
+  it('holds a waveform channel with a steady pattern', async () => {
+    const h = await createHarness(
+      [
+        // `waveformPlanCall` requests 5 s of the packed waveform.
+        scriptedTurn('（带纹理的一拍。）', [waveformPlanCall('saw-spin')]),
+        scriptedTurn('（下一回合。）', [planCall('call_2')]),
+      ],
+      await tentaclePack(),
+      { channels: waveformChannels },
+    )
+    await h.host.start({ packId: 'tentacle', plannedMinutes: 30 })
+    h.clock.advance(6_000)
+    await h.host.message('继续。')
+
+    // The held texture must be re-issued as a steady pattern carrying the
+    // waveform, not as a plain level (which would drop the texture).
+    const patterns = holdRecords(h.records()).filter(record => record.action === 'run_pattern')
+    expect(patterns).toHaveLength(2)
+    for (const hold of patterns) {
+      expect(hold.detail).toMatchObject({
+        waveformId: 'tentacle:saw-spin',
+        durationSec: 30,
+        envelope: {
+          preset: 'steady',
+          minPercent: 8,
+          maxPercent: 8,
+          periodMs: 1_000,
+          jitter: 0,
+        },
+      })
+    }
+  })
+
+  it('never blocks the turn when a hold command fails', async () => {
+    const h = await createHarness([
+      scriptedTurn('（第一回合。）', [holdPlanCall(100)]),
+      scriptedTurn('（第二回合。）', [planCall('call_2')]),
+    ])
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    // The first held channel fails; the host must swallow it and still run the
+    // turn (the hold is best-effort, never a turn failure).
+    const rejected = vi.spyOn(h.registry, 'setLevel').mockRejectedValueOnce(new Error('hold failed'))
+    // Past the plan's 3 s hold so the continuity hold actually runs.
+    h.clock.advance(4_000)
+
+    await h.host.message('继续。')
+
+    expect(rejected).toHaveBeenCalled()
+    expect(h.host.transcript()).toHaveLength(2)
+    expect(h.host.transcript()[1]!.effects).toHaveLength(1)
+    expect(planActions(h.records())).toHaveLength(3)
+    expect(h.host.snapshot()?.state).toBe('idle')
+  })
+
+  it('wires the pack default waveform into the resolver fallback', async () => {
+    const h = await createHarness(
+      [scriptedTurn('（波形丢失的一拍。）', [waveformPlanCall('missing-wave')])],
+      await tentaclePack(),
+      { channels: waveformChannels },
+    )
+    await h.host.start({ packId: 'tentacle', plannedMinutes: 30 })
+
+    // The pack's only waveform is the session default; an unknown reference
+    // degrades to it instead of dropping the texture (the host must pass
+    // `defaultWaveformId` into the resolve context).
+    const opening = h.host.transcript()[0]!
+    expect(opening.effects).toHaveLength(2)
+    for (const effect of opening.effects) {
+      expect(effect).toMatchObject({
+        status: 'degraded',
+        waveformId: 'tentacle:saw-spin',
+        waveformName: '回旋锯齿',
+      })
+    }
+    const resolved = h.records().find(record => record.action === 'plan_resolved')
+    const warnings = (resolved?.detail as { readonly warnings?: readonly string[] } | undefined)?.warnings ?? []
+    expect(warnings.join('\n')).toContain('using the session default waveform "tentacle:saw-spin"')
+    expect(holdRecords(h.records())).toHaveLength(0)
   })
 })
 

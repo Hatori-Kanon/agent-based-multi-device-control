@@ -21,6 +21,7 @@ import { createHostRuntime } from './main/bootstrap.ts'
 // serve the same page and there is no separate play.html any more.
 import indexHtml from './ui/index.html?text'
 import appJs from './ui/app.js?text'
+import chartMathJs from './ui/chart-math.js?text'
 import playJs from './ui/play.js?text'
 import shellJs from './ui/shell.js?text'
 import settingsJs from './ui/settings.js?text'
@@ -55,6 +56,7 @@ const runtime = await createHostRuntime({
         dashboardStaticFiles: {
           'index.html': indexHtml,
           'app.js': appJs,
+          'chart-math.js': chartMathJs,
           'play.js': playJs,
           'shell.js': shellJs,
           'settings.js': settingsJs,

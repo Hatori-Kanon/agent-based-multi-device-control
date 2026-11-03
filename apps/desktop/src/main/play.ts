@@ -99,6 +99,7 @@ import {
   type TurnRunner,
   type TurnRunnerResult,
   type WaveformLibrary,
+  type DispatchEvent,
 } from '@embodied/core'
 import type { ContentSource } from '@embodied/core'
 import {
@@ -128,6 +129,20 @@ const OPENING_TRIGGER_KIND = 'resume' as const
 /** Recent assistant lines kept in the conversation (the writer's memory). */
 const RECENT_LINE_LIMIT = 8
 
+/**
+ * Continuity hold TTL: a model command accepted longer ago than this is not
+ * revived. The turn where it happened has long settled, so the narration may
+ * already describe 放开/退出; only a recent effect may be bridged.
+ */
+const HOLD_TTL_MS = 90_000
+
+/**
+ * If the previous model command's own duration still covers this much of the
+ * model's think time, the effect is still running and must not be restarted
+ * (a restart would also bump a finite effect back to a full hold window).
+ */
+const HOLD_REMAINING_THRESHOLD_MS = 6_000
+
 /** Pack ids follow `内容包规范.md` §3: lowercase slug. */
 const PACK_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/u
 
@@ -148,6 +163,8 @@ const TURN_PROTOCOL = [
   '本端点工具调用不携带正文 content：给玩家看的完整正文必须写进 apply_plan 的 narration 字段（非空，篇幅遵循人设），不能只写在 reasoning 里，也不能只调用工具。',
   'narration 是玩家会看到的正文，不是计划摘要；环境/动作/身体反应用（）包裹，台词不加括号，不出现设备硬件词。',
   'narration 必须写清本回合 beats 实际作用的玩家部位（用这些名字）和动作，不能写没有下发动作的部位，也不能写成与部位无关的泛泛台词。',
+  'strength 随节奏推进：试探/停顿 low，推进 med，高峰 high；不要整局只用 low（真正的上限由玩家通道软上限决定）。',
+  '非 stop 动作的 durationSec 建议 30–60s，避免设备在下一回合开始前停掉；短促/瞬间动作用 ramp/pulse 且 duration 设短。',
   '玩家选项会作为下一回合用户消息（含选项文字和 tag）回传；必须据此改变动作与叙事，不要无视选项或复读上一回合。',
 ] as const
 
@@ -424,6 +441,34 @@ export class PlaySession {
    * Process-local by design: a scheduling hint does not need persistence.
    */
   private roundRobinCursor = 0
+  /**
+   * Last accepted *model plan* output per `device:channel`: the source of the
+   * continuity hold that bridges the model's thinking time.
+   *
+   * Fed by registry dispatch events but only while `modelDispatchActive` is
+   * set: a human's direct output on the device page and the host's own holds
+   * must never be replayed by a later turn (review ui-v11 §P1-1). `stop`
+   * unconditionally removes the entry (including the `all` sentinel), so any
+   * stop — model, human, pause, panic — means the channel is never revived.
+   * `at`/`durationSec` are the command's own clock time and hold time: the hold
+   * uses them for the TTL and "the old effect is still running" gates.
+   */
+  private readonly lastDispatched = new Map<string, {
+    percent: number
+    waveformId?: string
+    at: number
+    durationSec?: number
+  }>()
+  /** Registry subscription feeding {@link lastDispatched}; session-scoped. */
+  private unsubscribeDispatch: (() => void) | undefined
+  /**
+   * True while a model plan's commands are being dispatched.
+   *
+   * Registry events carry no actor, so this is how `noteDispatch` tells a
+   * plan's output (a continuity candidate) from human direct control or the
+   * host's own hold (never candidates).
+   */
+  private modelDispatchActive = false
   /** `metaReactions` opening brief, consumed by the opening turn only. */
   private openingBrief: OpeningBrief | undefined
   /**
@@ -633,6 +678,9 @@ export class PlaySession {
       sensors: this.env.sensors,
       audit: this.env.audit,
     })
+    // The continuity hold observes accepted dispatch events for the lifetime of
+    // the session (subscribed before the opening turn, released in `dispose`).
+    this.subscribeDispatch()
 
     await this.env.audit.record({
       actor: 'human',
@@ -888,6 +936,10 @@ export class PlaySession {
    */
   dispose(): void {
     this.engine?.dispose()
+    // Stop observing dispatch events: the hold state belongs to this session.
+    this.unsubscribeDispatch?.()
+    this.unsubscribeDispatch = undefined
+    this.lastDispatched.clear()
     // Remove only the pack waveforms this session registered. The same scratch
     // map holds human imports/authors from the device page, and a session
     // boundary must not delete those (review P1-4R: this was the cleanup
@@ -958,9 +1010,23 @@ export class PlaySession {
     const executor: TurnExecutor = {
       dispatch: async (plan, ctx, diagnostics) => {
         if (this.engine?.state === 'planning') request.onStage?.('executing')
-        return await this.executor.dispatch(plan, ctx, diagnostics)
+        // Registry events carry no actor, so mark the window in which they are
+        // caused by *plan* commands. Only these become continuity candidates;
+        // human direct control and the host's own holds happen outside it.
+        this.modelDispatchActive = true
+        try {
+          return await this.executor.dispatch(plan, ctx, diagnostics)
+        } finally {
+          this.modelDispatchActive = false
+        }
       },
     }
+
+    // Bridge the model's thinking time before the snapshot/prompt is frozen:
+    // re-assert the last accepted output so a finished effect does not leave
+    // the hardware silent while the next plan is generated. The new plan (if
+    // any) overwrites it; a failure here never blocks the turn.
+    await this.holdContinuity()
 
     let wrote = false
     // Freeze the registry facts once per turn: the prompt's device/region
@@ -979,6 +1045,10 @@ export class PlaySession {
       // Per-turn rotation seed: same-plan round-robin beats share it, the next
       // turn gets the advanced value (see `advanceRoundRobinCursor`).
       this.roundRobinCursor,
+      // Content-pack default waveform: the resolver falls back to it when the
+      // model references a waveform that does not exist (core's default-wave
+      // fallback, `内容包规范.md` §4.5), instead of dropping to a plain pattern.
+      pack.waveforms[0]?.id,
     )
     // Build the prompt (the opening brief, when present, is part of it), then
     // consume the brief: it belongs to the opening turn only, even if that
@@ -1171,6 +1241,153 @@ export class PlaySession {
     const rotated = plan.beats.some(beat =>
       roundRobinIntents.has(beat.intentId) && dispatchedBeats.has(beat.id))
     if (rotated) this.roundRobinCursor += 1
+  }
+
+  /**
+   * Subscribe to accepted dispatch events for this session.
+   *
+   * The map is reset on subscribe and unsubscribed in `dispose`, so a new
+   * session can never inherit the previous one's held output.
+   */
+  private subscribeDispatch(): void {
+    this.unsubscribeDispatch?.()
+    this.lastDispatched.clear()
+    this.unsubscribeDispatch = this.env.registry.subscribe(event => this.noteDispatch(event))
+  }
+
+  /**
+   * Remember the last accepted *plan* output per channel (continuity source).
+   *
+   * Dispatch events are observations of *accepted* commands: a rejected action
+   * never reaches this map, so a hold can never re-assert an output the safety
+   * runtime refused. Two filters make "the plan is the only continuity source"
+   * true (review ui-v11 §P1-1):
+   *
+   * - only commands emitted while `modelDispatchActive` is set are candidates,
+   *   so a human's direct output or a previous hold is never replayed later;
+   * - `stop` — per-channel or the `all` sentinel — clears unconditionally, so
+   *   any stop (model, human, pause, panic) means the channel stays stopped.
+   *
+   * A level/pattern event updates the level, the command's clock time and its
+   * hold time (a command without an explicit waveform keeps the remembered
+   * texture); a `waveform` event only changes the texture and keeps the
+   * previous `at`/`durationSec`, because selecting a waveform does not restart
+   * the effect.
+   */
+  private noteDispatch(event: DispatchEvent): void {
+    if (event.kind === 'stop') {
+      if (event.deviceId === 'all' || event.channelId === 'all') this.lastDispatched.clear()
+      else this.lastDispatched.delete(dispatchKey(event.deviceId, event.channelId))
+      return
+    }
+    // Human direct control and the host's own hold must never become the state
+    // a later turn re-asserts.
+    if (!this.modelDispatchActive) return
+    if (event.deviceId === 'all' || event.channelId === 'all') return
+    const key = dispatchKey(event.deviceId, event.channelId)
+    const previous = this.lastDispatched.get(key)
+    if (event.kind === 'waveform') {
+      this.lastDispatched.set(key, {
+        percent: previous?.percent ?? 0,
+        ...(event.waveformId === undefined ? {} : { waveformId: event.waveformId }),
+        at: previous?.at ?? event.at,
+        ...(previous?.durationSec === undefined ? {} : { durationSec: previous.durationSec }),
+      })
+      return
+    }
+    // `level`/`pattern`: a command without an explicit waveform does not clear
+    // the channel's current selection, so the remembered id is kept.
+    const waveformId = event.waveformId ?? previous?.waveformId
+    this.lastDispatched.set(key, {
+      percent: event.percent ?? previous?.percent ?? 0,
+      ...(waveformId === undefined ? {} : { waveformId }),
+      at: event.at,
+      ...(event.durationSec === undefined ? {} : { durationSec: event.durationSec }),
+    })
+  }
+
+  /**
+   * Re-assert the last model output before a turn starts (continuity hold).
+   *
+   * The user-visible problem: a plan's effect ends after its `durationSec`
+   * while the model spends 4–6 s generating the next one, so the hardware
+   * visibly stops between turns. The host therefore re-issues each channel's
+   * last *plan* state as one fresh *bounded* command before the model call:
+   * waveform channels get a steady pattern that keeps the texture, others a
+   * steady level, both for `min(30, channel.maxDurationSec)` seconds.
+   *
+   * Two gates keep this a bridge and not a reanimator (review ui-v11 §P1-1):
+   *
+   * - **TTL** (`HOLD_TTL_MS`): a command accepted longer ago than 90 s is not
+   *   revived — the plan that produced it has settled and the narration may
+   *   already describe 放开/退出;
+   * - **still running** (`HOLD_REMAINING_THRESHOLD_MS`): if the previous
+   *   command's own `durationSec` still covers the think time, there is no gap
+   *   to bridge and restarting would both duplicate the effect and lengthen it.
+   *
+   * A new plan then naturally overwrites the hold; stop/end/pause still stop
+   * everything, and a failed turn leaves output running for at most one hold
+   * window (the registry's own duration cap is the final safety bound).
+   *
+   * This is host maintenance, not a plan command: it is not resolved from a
+   * beat, registers no probe, and its registry audit lines carry `actor:
+   * 'system'`. Every per-channel failure (locked, policy, device error) is
+   * swallowed — a hold must never block or fail the turn.
+   */
+  private async holdContinuity(): Promise<void> {
+    if (this.env.registry.isLocked || this.lastDispatched.size === 0) return
+    const now = this.env.clock.now()
+    const snapshot = this.env.registry.snapshot()
+    for (const device of snapshot.devices) {
+      if (device.lifecycle !== 'ready') continue
+      for (const channel of device.channels) {
+        if (channel.kind !== 'level') continue
+        const last = this.lastDispatched.get(dispatchKey(device.id, channel.id))
+        if (last === undefined || last.percent <= 0) continue
+        // Too old: the turn that planned it has long settled, so reviving it
+        // would contradict the narration the player just read.
+        if (now - last.at > HOLD_TTL_MS) continue
+        // The old effect still covers the thinking window: no gap to bridge,
+        // and restarting would duplicate/lengthen it.
+        const remainingMs = last.at + (last.durationSec ?? 0) * 1_000 - now
+        if (remainingMs > HOLD_REMAINING_THRESHOLD_MS) continue
+        // Bounded on purpose: a hold is a bridge to the next plan, not an
+        // indefinite effect, and never exceeds the channel's own duration cap.
+        const durationSec = Math.max(1, Math.min(30, channel.maxDurationSec ?? 30))
+        const waveformId = last.waveformId !== undefined
+          && channel.supportsWaveform
+          && this.env.waveforms.get(last.waveformId) !== undefined
+          ? last.waveformId
+          : undefined
+        try {
+          if (waveformId === undefined) {
+            await this.env.registry.setLevel('system', {
+              deviceId: device.id,
+              channelId: channel.id,
+              percent: last.percent,
+              durationSec,
+            })
+          } else {
+            await this.env.registry.runPattern('system', {
+              deviceId: device.id,
+              channelId: channel.id,
+              envelope: {
+                preset: 'steady',
+                minPercent: last.percent,
+                maxPercent: last.percent,
+                periodMs: 1_000,
+                jitter: 0,
+              },
+              durationSec,
+              waveformId,
+            })
+          }
+        } catch {
+          // Best-effort by design: the registry already audited the refusal
+          // (locked/policy/device); the turn itself must go on.
+        }
+      }
+    }
   }
 
   /**
@@ -1821,6 +2038,11 @@ function compareStrings(left: string, right: string): number {
   return 0
 }
 
+/** Map key for one channel; `\u0000` cannot occur in a device or channel id. */
+function dispatchKey(deviceId: string, channelId: string): string {
+  return `${deviceId}\u0000${channelId}`
+}
+
 /** What the model may read about the world this turn: registry facts only. */
 function resolveContextOf(
   snapshot: RegistrySnapshot,
@@ -1828,6 +2050,7 @@ function resolveContextOf(
   waveforms: WaveformLookup,
   regionAliases: ReadonlyMap<string, readonly string[]>,
   roundRobinCursor: number,
+  defaultWaveformId: string | undefined,
 ): ResolveContext {
   const intents = new Map<string, FeedbackIntent>()
   for (const intent of scenario.feedbackIntents) intents.set(intent.id, intent)
@@ -1842,6 +2065,9 @@ function resolveContextOf(
     // Per-turn rotation seed for round-robin intents (production never moved
     // it before; the resolver accepts it, so the host must supply it).
     roundRobinCursor,
+    // A pack with waveforms ships one default: an unknown model reference
+    // degrades to it (with a warning) instead of silently losing the texture.
+    ...(defaultWaveformId === undefined ? {} : { defaultWaveformId }),
     ...(regionAliases.size === 0 ? {} : { regionAliases }),
   }
 }

@@ -736,7 +736,7 @@ const STATIC_TYPES: Readonly<Record<string, string>> = {
  * same page, so `/` and `/play` both serve `index.html` and `shell.js` switches
  * views client-side.
  */
-const STATIC_FILES = new Set(['index.html', 'app.js', 'play.js', 'shell.js', 'settings.js', 'style.css', 'phone.html'])
+const STATIC_FILES = new Set(['index.html', 'app.js', 'chart-math.js', 'play.js', 'shell.js', 'settings.js', 'style.css', 'phone.html'])
 
 /**
  * Page aliases → static file name.

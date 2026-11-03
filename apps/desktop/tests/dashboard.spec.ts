@@ -1381,6 +1381,11 @@ describe('play page (B2-T12)', () => {
     expect(html).toContain('/shell.js')
     expect(html).toContain('/settings.js')
     expect(html).toContain('href="/style.css"')
+    // v11: 波形柱状图的几何计算是独立的 classic script，必须在 play.js 之前
+    // 加载 —— play.js 直接读 window.EmbodiedChartMath，顺序反了图表整块不画。
+    expect(html).toContain('/chart-math.js')
+    expect(html.indexOf('/chart-math.js')).toBeGreaterThan(-1)
+    expect(html.indexOf('/chart-math.js')).toBeLessThan(html.indexOf('/play.js'))
     expect(html).toMatch(/connect-src 'self'/)
     // Safety chrome is in the markup: a persistent stop button and the LOCKED
     // banner, plus the player-visible narrative surface.
@@ -1461,6 +1466,19 @@ describe('play page (B2-T12)', () => {
     expect(js).toContain('line-effects')
     expect(js).toContain('channel-live')
     expect(js).toContain('/api/waveforms/preview')
+    // v11: 右轨柱状图只调用纯几何函数；柱高只跟波形自身 intensity 走，
+    // 旧实现乘当前通道强度的 `view.level / 100` 必须消失（用户反馈「高度
+    // 不要根据强度」）。
+    expect(js).toContain('EmbodiedChartMath.computeBars')
+    expect(js).not.toContain('view.level / 100')
+    // 图表数学是独立的 classic script，走同一份静态白名单，否则 <script src>
+    // 404、图表整块不画。
+    const chartMath = await fetch(`${base(host)}/chart-math.js`)
+    expect(chartMath.status).toBe(200)
+    expect(chartMath.headers.get('content-type')).toContain('javascript')
+    const chartMathJs = await chartMath.text()
+    expect(chartMathJs).toContain('EmbodiedChartMath')
+    expect(chartMathJs).toContain('computeBars')
     expect(js).not.toContain('window.confirm')
     expect(js).toContain('region-input')
     expect(js).toContain('datalist')
@@ -1581,7 +1599,7 @@ describe('play page (B2-T12)', () => {
     // `start-dev.bat` runs `dev-server.ts`, which inlines the UI files into the
     // bundle and hands them over as `staticFiles`; this is that exact path.
     const { readFile } = await import('node:fs/promises')
-    const names = ['index.html', 'play.js', 'app.js', 'shell.js', 'settings.js'] as const
+    const names = ['index.html', 'chart-math.js', 'play.js', 'app.js', 'shell.js', 'settings.js'] as const
     const files = Object.fromEntries(await Promise.all(names.map(async name =>
       [name, await readFile(join(process.cwd(), 'src', 'ui', name), 'utf8')] as const,
     )))
@@ -1603,6 +1621,12 @@ describe('play page (B2-T12)', () => {
       expect(script.status).toBe(200)
       expect(script.headers.get('content-type')).toContain('javascript')
       expect(await script.text()).toContain('/api/session/transcript')
+
+      // 图表数学和 play.js 一起被内联进 bundle；缺了它柱状图只剩基线。
+      const chartMath = await fetch(`${url}/chart-math.js`)
+      expect(chartMath.status).toBe(200)
+      expect(chartMath.headers.get('content-type')).toContain('javascript')
+      expect(await chartMath.text()).toContain('computeBars')
 
       const shell = await fetch(`${url}/shell.js`)
       expect(shell.status).toBe(200)

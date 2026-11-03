@@ -7,6 +7,7 @@ import {
   MemoryAppendOnlyStore,
   MockBackend,
   PolicyStore,
+  SafetyError,
   WaveformLibrary,
   type AuditRecord,
   type Channel,
@@ -23,6 +24,12 @@ const WAVEFORMS = new WaveformLibrary()
 const CHANNELS: readonly Channel[] = [
   { id: 'a', kind: 'level', label: 'A 通道' },
   { id: 'b', kind: 'level', label: 'B 通道' },
+]
+
+/** Channels that accept waveform selection; only the waveform-degrade tests need them. */
+const WAVEFORM_CHANNELS: readonly Channel[] = [
+  { id: 'a', kind: 'level', label: 'A 通道', supportsWaveform: true },
+  { id: 'b', kind: 'level', label: 'B 通道', supportsWaveform: true },
 ]
 
 /** Explicit policy so the assertions describe behaviour, not the shipped default. */
@@ -54,6 +61,28 @@ class RecordingProbes implements ProbeRegistrar {
   }
 }
 
+/**
+ * Registry double whose `runPattern` fails on demand.
+ *
+ * `PlanExecutor` only accepts a real `DeviceRegistry` (instanceof check), so
+ * failure injection subclasses it instead of stubbing the interface.
+ */
+class ScriptedRunPatternRegistry extends DeviceRegistry {
+  runPatternCalls = 0
+
+  constructor(
+    options: ConstructorParameters<typeof DeviceRegistry>[0],
+    private readonly failure: (call: number) => Error,
+  ) {
+    super(options)
+  }
+
+  override async runPattern(): Promise<void> {
+    this.runPatternCalls += 1
+    throw this.failure(this.runPatternCalls)
+  }
+}
+
 interface Harness {
   readonly clock: FakeClock
   readonly store: MemoryAppendOnlyStore
@@ -66,7 +95,22 @@ interface Harness {
   readonly records: () => AuditRecord[]
 }
 
-function createHarness(): Harness {
+interface HarnessOptions {
+  readonly channels?: readonly Channel[]
+  /**
+   * Builds the registry after the harness clock/audit/policy exist, so a test
+   * can inject a `DeviceRegistry` subclass for failure-path coverage.
+   */
+  readonly registry?: (deps: {
+    readonly clock: FakeClock
+    readonly audit: AuditLog
+    readonly policy: PolicyStore
+    readonly onError: (error: unknown) => void
+  }) => DeviceRegistry
+}
+
+function createHarness(options: HarnessOptions = {}): Harness {
+  const channels = options.channels ?? CHANNELS
   const clock = new FakeClock()
   const store = new MemoryAppendOnlyStore()
   const errors: unknown[] = []
@@ -74,19 +118,15 @@ function createHarness(): Harness {
     errors.push(error)
   })
   const policy = new PolicyStore(TEST_POLICY)
-  const registry = new DeviceRegistry({
-    clock,
-    audit,
-    policy,
-    onError: error => {
-      errors.push(error)
-    },
-    tickMs: 50,
-    random: () => 0.5,
-  })
-  const toy = new MockBackend({ id: 'toy', name: 'Mock Toy', clock, channels: CHANNELS })
+  const onError = (error: unknown): void => {
+    errors.push(error)
+  }
+  const registry = options.registry === undefined
+    ? new DeviceRegistry({ clock, audit, policy, onError, tickMs: 50, random: () => 0.5 })
+    : options.registry({ clock, audit, policy, onError })
+  const toy = new MockBackend({ id: 'toy', name: 'Mock Toy', clock, channels })
   // Registered but never connected: exercises the offline path deterministically.
-  const dead = new MockBackend({ id: 'dead', name: 'Dead Toy', clock, channels: CHANNELS })
+  const dead = new MockBackend({ id: 'dead', name: 'Dead Toy', clock, channels })
   registry.register(toy)
   registry.register(dead)
   const probes = new RecordingProbes()
@@ -181,9 +221,12 @@ describe('dispatch', () => {
     expect(source).not.toMatch(/\bline\b/)
   })
 
-  it('records plan_resolved with per-beat status', async () => {
+  it('records plan_resolved with merged per-channel statuses', async () => {
     const harness = createHarness()
     await connect(harness)
+    // b1/b2/b3 all resolve onto toy/a and toy/b. The per-channel merge keeps
+    // only b3's body there (b1/b2 are reported as superseded warnings), while
+    // b4's offline target stays narrative-only.
     const fixture = makePlan([
       levelBeat('b1', { strength: 'med' }),
       levelBeat('b2', { strength: 'high', change: { kind: 'level', targetPercent: 100, durationSec: 600 } }),
@@ -203,15 +246,17 @@ describe('dispatch', () => {
       statuses.push(action.status)
       byBeat.set(action.beatId, statuses)
     }
-    expect(byBeat.get('b1')).toEqual(['dispatched', 'dispatched'])
-    expect(byBeat.get('b2')).toEqual(['clamped', 'clamped'])
+    expect(byBeat.get('b1')).toBeUndefined()
+    expect(byBeat.get('b2')).toBeUndefined()
     expect(byBeat.get('b3')).toEqual(['degraded', 'degraded'])
     expect(byBeat.has('b4')).toBe(false)
+    // The merged command keeps b3's fallback body (wave preset, low strength:
+    // 0.4 × the 0-40 test interval = 16%).
+    expect(result.actions.every(action => action.percent === 16)).toBe(true)
 
-    // Never above the human's cap, even for the clamped beat.
+    // Never above the human's cap.
     expect(harness.toy.writes.length).toBeGreaterThan(0)
     expect(harness.toy.writes.every(write => write.percent <= TEST_POLICY.maxPercent)).toBe(true)
-    expect(harness.toy.writes.some(write => write.percent === TEST_POLICY.maxPercent)).toBe(true)
     // The offline device was never touched.
     expect(harness.dead.writes).toEqual([])
 
@@ -231,31 +276,56 @@ describe('dispatch', () => {
     expect(detail['actions']).toEqual(result.actions)
     expect(detail['warnings']).toContain('parser note')
     expect(detail['warnings']).toEqual(expect.arrayContaining([expect.stringContaining('disconnected')]))
+    expect(detail['warnings']).toEqual(expect.arrayContaining([expect.stringContaining('superseded')]))
+  })
+
+  it('reports dispatched and clamped for single-channel commands', async () => {
+    const harness = createHarness()
+    await connect(harness)
+
+    const dispatched = await harness.executor.dispatch(makePlan([
+      levelBeat('b1', { targets: [{ deviceId: 'toy', channelId: 'a' }] }),
+    ]), context(harness))
+    expect(dispatched.actions.map(action => action.status)).toEqual(['dispatched'])
+
+    const clamped = await harness.executor.dispatch(makePlan([
+      levelBeat('b2', {
+        targets: [{ deviceId: 'toy', channelId: 'b' }],
+        strength: 'high',
+        change: { kind: 'level', targetPercent: 100, durationSec: 600 },
+      }),
+    ]), context(harness))
+    expect(clamped.actions.map(action => action.status)).toEqual(['clamped'])
+    expect(clamped.actions[0]?.percent).toBe(TEST_POLICY.maxPercent)
   })
 
   it('registers exactly one probe per dispatched beat', async () => {
     const harness = createHarness()
     await connect(harness)
-    const fixture = makePlan([
-      levelBeat('b1'),
-      levelBeat('b2', { intentId: 'pulse' }),
-      levelBeat('b3', { intentId: 'stop', strength: 'high' }),
-    ])
+    // Explicit distinct channels keep both beats in the turn: per-channel
+    // merging would otherwise keep only the last command on one channel.
+    const played = await harness.executor.dispatch(makePlan([
+      levelBeat('b1', { targets: [{ deviceId: 'toy', channelId: 'a' }] }),
+      levelBeat('b2', { intentId: 'pulse', targets: [{ deviceId: 'toy', channelId: 'b' }] }),
+    ]), context(harness))
 
-    const result = await harness.executor.dispatch(fixture, context(harness))
-
-    expect(result.actions).toHaveLength(6)
+    expect(played.actions).toHaveLength(2)
     expect(harness.probes.calls).toHaveLength(2)
     const byBeat = new Map(harness.probes.calls.map(call => [call.beatId, call]))
     expect([...byBeat.keys()]).toEqual(['b1', 'b2'])
     expect(byBeat.get('b1')?.intentId).toBe('plain')
     expect(byBeat.get('b1')?.turnId).toBe(42)
-    expect(byBeat.get('b1')?.targets).toEqual([
-      { deviceId: 'toy', channelId: 'a' },
-      { deviceId: 'toy', channelId: 'b' },
-    ])
-    // `stop` is a bypass in the probe contract (§4.2 / D3): one action, no probe.
-    expect(byBeat.has('b3')).toBe(false)
+    expect(byBeat.get('b1')?.targets).toEqual([{ deviceId: 'toy', channelId: 'a' }])
+    expect(byBeat.get('b2')?.targets).toEqual([{ deviceId: 'toy', channelId: 'b' }])
+
+    // `stop` is a bypass in the probe contract (§4.2 / D3): it dispatches, but
+    // registers no probe and leaves no beat-specific target.
+    const stopped = await harness.executor.dispatch(
+      makePlan([levelBeat('b3', { intentId: 'stop', strength: 'high' })]),
+      context(harness),
+    )
+    expect(stopped.actions).toHaveLength(2)
+    expect(harness.probes.calls).toHaveLength(2)
     expect(harness.toy.writes.at(-1)?.percent).toBe(0)
 
     // 50 ms effect ticks are not actions: time alone must never register a probe.
@@ -344,10 +414,185 @@ describe('dispatch', () => {
   })
 })
 
+describe('waveform-stage failures degrade instead of rejecting the beat', () => {
+  it('retries the same envelope without the waveform and reports degraded', async () => {
+    // The registry has no waveform library here, so selecting `tide` throws even
+    // though the executor's own lookup resolved it — exactly the "waveform
+    // asset failed at dispatch" shape this path exists for.
+    const harness = createHarness({ channels: WAVEFORM_CHANNELS })
+    await connect(harness)
+    const events: string[] = []
+    const unsubscribe = harness.registry.subscribe(event => events.push(event.kind))
+    try {
+      const result = await harness.executor.dispatch(
+        makePlan([
+          levelBeat('b1', {
+            targets: [{ deviceId: 'toy', channelId: 'a' }],
+            change: { kind: 'waveform', waveformId: 'tide', durationSec: 4 },
+          }),
+        ]),
+        context(harness),
+      )
+
+      expect(result.actions).toHaveLength(1)
+      expect(result.actions[0]).toMatchObject({
+        beatId: 'b1',
+        deviceId: 'toy',
+        channelId: 'a',
+        status: 'degraded',
+      })
+      expect(result.actions[0]?.reason).toContain('waveform "tide" failed')
+      expect(result.actions[0]?.reason).toContain('ran a plain pattern')
+      // The retry really reached the registry: exactly one accepted pattern.
+      expect(events.filter(kind => kind === 'pattern')).toHaveLength(1)
+
+      const detail = planResolvedRecords(harness)[0]?.detail as Record<string, unknown>
+      expect(detail['warnings']).toEqual(expect.arrayContaining([
+        expect.stringContaining('waveform "tide" failed'),
+      ]))
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  it('rejects only when the waveform-free retry also fails', async () => {
+    // A registry double that keeps failing at the waveform stage: the first
+    // attempt throws, the waveform-free retry throws as well, so the command
+    // must stay rejected after exactly two calls.
+    let registry: ScriptedRunPatternRegistry | undefined
+    const harness = createHarness({
+      channels: WAVEFORM_CHANNELS,
+      registry: deps => {
+        registry = new ScriptedRunPatternRegistry(
+          { ...deps },
+          () => new SafetyError('UNKNOWN_WAVEFORM', 'waveform asset write failed (fake)'),
+        )
+        return registry
+      },
+    })
+    await connect(harness)
+
+    const result = await harness.executor.dispatch(
+      makePlan([
+        levelBeat('b1', {
+          targets: [{ deviceId: 'toy', channelId: 'a' }],
+          change: { kind: 'waveform', waveformId: 'tide', durationSec: 4 },
+        }),
+      ]),
+      context(harness),
+    )
+
+    expect(registry?.runPatternCalls).toBe(2)
+    expect(result.actions).toHaveLength(1)
+    expect(result.actions[0]?.status).toBe('rejected')
+    expect(result.actions[0]?.reason).toContain('UNKNOWN_WAVEFORM')
+
+    const detail = planResolvedRecords(harness)[0]?.detail as Record<string, unknown>
+    expect(detail['warnings']).toEqual(expect.arrayContaining([
+      expect.stringContaining('waveform "tide" failed'),
+    ]))
+  })
+
+  it('does not retry a refusal that is not a waveform-stage failure', async () => {
+    const harness = createHarness({ channels: WAVEFORM_CHANNELS })
+    await connect(harness)
+    // Resolution thinks `dead` is ready; the registry refuses it with
+    // NOT_CONNECTED before any waveform handling. That is a channel refusal,
+    // not a waveform failure: reject as before, with exactly one attempt.
+    const staleSnapshot: ResolveRegistrySnapshot = {
+      ...harness.registry.snapshot(),
+      devices: harness.registry.snapshot().devices.map(device =>
+        device.id === 'dead' ? { ...device, lifecycle: 'ready' as const } : device,
+      ),
+    }
+
+    const result = await harness.executor.dispatch(
+      makePlan([
+        levelBeat('b1', {
+          targets: [{ deviceId: 'dead', channelId: 'a' }],
+          change: { kind: 'waveform', waveformId: 'tide', durationSec: 4 },
+        }),
+      ]),
+      context(harness, staleSnapshot),
+    )
+
+    expect(result.actions).toHaveLength(1)
+    expect(result.actions[0]?.status).toBe('rejected')
+    expect(result.actions[0]?.reason).toContain('NOT_CONNECTED')
+    // One registry attempt only: the waveform-free retry was not made.
+    expect(harness.records().filter(record => record.action === 'run_pattern')).toHaveLength(1)
+
+    const detail = planResolvedRecords(harness)[0]?.detail as Record<string, unknown>
+    const warnings = detail['warnings'] as string[]
+    expect(warnings.some(warning => warning.includes('waveform "tide" failed'))).toBe(false)
+  })
+
+  it('does not retry once the turn is aborted', async () => {
+    const controller = new AbortController()
+    let registry: ScriptedRunPatternRegistry | undefined
+    const harness = createHarness({
+      channels: WAVEFORM_CHANNELS,
+      registry: deps => {
+        registry = new ScriptedRunPatternRegistry(
+          { ...deps },
+          () => {
+            // The first attempt aborts the turn and then fails at the waveform
+            // stage: the catch must report it without a second registry call.
+            controller.abort()
+            return new SafetyError('UNKNOWN_WAVEFORM', 'waveform write aborted (fake)')
+          },
+        )
+        return registry
+      },
+    })
+    await connect(harness)
+
+    const result = await harness.executor.dispatch(
+      makePlan([
+        levelBeat('b1', {
+          targets: [{ deviceId: 'toy', channelId: 'a' }],
+          change: { kind: 'waveform', waveformId: 'tide', durationSec: 4 },
+        }),
+      ]),
+      context(harness),
+      undefined,
+      { signal: controller.signal },
+    )
+
+    expect(registry?.runPatternCalls).toBe(1)
+    expect(result.actions).toHaveLength(1)
+    expect(result.actions[0]?.status).toBe('rejected')
+    expect(result.actions[0]?.reason).toContain('UNKNOWN_WAVEFORM')
+
+    const detail = planResolvedRecords(harness)[0]?.detail as Record<string, unknown>
+    const warnings = detail['warnings'] as string[]
+    expect(warnings.some(warning => warning.includes('retrying as a plain pattern'))).toBe(false)
+  })
+})
+
 describe('dispatch preemption (wave-4 review B-3)', () => {
-  /** Explicit single-channel targets keep one command per beat. */
-  function toyBeat(id: string): Beat {
-    return levelBeat(id, { targets: [{ deviceId: 'toy', channelId: 'a' }] })
+  /**
+   * Explicit per-channel targets keep one command per beat. Beats must use
+   * distinct channels: the resolver's per-channel merge would otherwise keep
+   * only the last command in the turn.
+   */
+  function toyBeat(id: string, channelId = 'a'): Beat {
+    return levelBeat(id, { targets: [{ deviceId: 'toy', channelId }] })
+  }
+
+  /** Snapshot that believes the disconnected `dead` device is ready. */
+  function staleReadySnapshot(harness: Harness): ResolveRegistrySnapshot {
+    return {
+      ...harness.registry.snapshot(),
+      devices: harness.registry.snapshot().devices.map(device =>
+        device.id === 'dead' ? { ...device, lifecycle: 'ready' as const } : device,
+      ),
+    }
+  }
+
+  /** Third command on another device, so the plan keeps three distinct beats. */
+  function deadBeat(id: string): Beat {
+    return levelBeat(id, { targets: [{ deviceId: 'dead', channelId: 'a' }] })
   }
 
   it('dispatches nothing when the signal is already aborted', async () => {
@@ -357,8 +602,8 @@ describe('dispatch preemption (wave-4 review B-3)', () => {
     controller.abort()
 
     const result = await harness.executor.dispatch(
-      makePlan([toyBeat('b1'), toyBeat('b2')]),
-      context(harness),
+      makePlan([toyBeat('b1', 'a'), toyBeat('b2', 'b'), deadBeat('b3')]),
+      context(harness, staleReadySnapshot(harness)),
       undefined,
       { signal: controller.signal },
     )
@@ -366,7 +611,7 @@ describe('dispatch preemption (wave-4 review B-3)', () => {
     expect(result.blocked).toBe(false)
     expect(result.preempted).toBe(true)
     expect(result.actions).toEqual([])
-    expect(result.remainingBeats).toEqual(['b1', 'b2'])
+    expect(result.remainingBeats).toEqual(['b1', 'b2', 'b3'])
     expect(harness.toy.writes).toEqual([])
     expect(harness.probes.calls).toEqual([])
 
@@ -374,7 +619,7 @@ describe('dispatch preemption (wave-4 review B-3)', () => {
     expect(record?.detail).toMatchObject({
       blocked: false,
       preempted: true,
-      remainingBeats: ['b1', 'b2'],
+      remainingBeats: ['b1', 'b2', 'b3'],
       actions: [],
     })
     expect(harness.clock.pendingCount).toBe(0)
@@ -391,8 +636,8 @@ describe('dispatch preemption (wave-4 review B-3)', () => {
     })
     try {
       const result = await harness.executor.dispatch(
-        makePlan([toyBeat('b1'), toyBeat('b2'), toyBeat('b3')]),
-        context(harness),
+        makePlan([toyBeat('b1', 'a'), toyBeat('b2', 'b'), deadBeat('b3')]),
+        context(harness, staleReadySnapshot(harness)),
         undefined,
         { signal: controller.signal },
       )

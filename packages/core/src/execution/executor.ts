@@ -17,7 +17,12 @@
  *    `DeviceRegistry`.
  * 2. **A refused command never cancels the rest.** Every command is wrapped;
  *    a safety refusal becomes `status: 'rejected'` with its reason, and the
- *    batch continues. No retry, no escalation.
+ *    batch continues. No retry, no escalation. The one exception is a
+ *    waveform-stage failure on an otherwise valid pattern: the executor
+ *    retries the same envelope once **without** the waveform (texture is
+ *    optional, the amplitude envelope is still clamped by the registry) and
+ *    reports `degraded`; only a second failure rejects the command. Only
+ *    waveform-stage errors qualify, and a cancelled turn never retries.
  * 3. **Probe registration follows dispatch events, not time.** The registry
  *    emits exactly one event per accepted command and never per 50 ms tick,
  *    so a pattern that runs for a minute produces one probe, not a thousand.
@@ -248,7 +253,7 @@ export class PlanExecutor {
           break
         }
         const seen = events.length
-        const result = await this.dispatchCommand(command, warnings)
+        const result = await this.dispatchCommand(command, warnings, signal)
         actions.push(result.status)
         if (result.status.status === 'rejected') continue
         this.noteProbeTarget(result.accepted, events.slice(seen), command, probeDrafts)
@@ -341,6 +346,7 @@ export class PlanExecutor {
   private async dispatchCommand(
     command: ResolvedCommand,
     warnings: string[],
+    signal: AbortSignal | undefined,
   ): Promise<{ status: DispatchStatus; accepted: boolean }> {
     const base = { beatId: command.beatId, deviceId: command.deviceId, channelId: command.channelId }
     const body = command.body
@@ -358,14 +364,60 @@ export class PlanExecutor {
       }
       if (body.kind === 'pattern') {
         const waveformId = this.checkedWaveformId(body.waveformId, warnings)
-        await this.options.registry.runPattern(PLAN_ACTOR, {
-          deviceId: command.deviceId,
-          channelId: command.channelId,
-          envelope: body.envelope,
-          durationSec: body.durationSec,
-          ...(waveformId === undefined ? {} : { waveformId }),
-        })
-        return { status: { ...base, status: statusOf(command), percent: body.envelope.maxPercent }, accepted: true }
+        if (waveformId === undefined) {
+          await this.options.registry.runPattern(PLAN_ACTOR, {
+            deviceId: command.deviceId,
+            channelId: command.channelId,
+            envelope: body.envelope,
+            durationSec: body.durationSec,
+          })
+          return { status: { ...base, status: statusOf(command), percent: body.envelope.maxPercent }, accepted: true }
+        }
+        try {
+          await this.options.registry.runPattern(PLAN_ACTOR, {
+            deviceId: command.deviceId,
+            channelId: command.channelId,
+            envelope: body.envelope,
+            durationSec: body.durationSec,
+            waveformId,
+          })
+          return { status: { ...base, status: statusOf(command), percent: body.envelope.maxPercent }, accepted: true }
+        } catch (error) {
+          // Only a waveform-stage failure can be salvaged by dropping the
+          // texture. A channel/registry refusal (NOT_CONNECTED, LOCKED,
+          // INVALID_POLICY, …) would fail identically without the waveform, so
+          // retrying would just misreport it as a waveform problem
+          // (ui-v11-review §P2-1); rethrow for the outer catch instead.
+          if (!isWaveformStageFailure(error)) throw error
+          // A cancelled turn must not spend another registry call: report the
+          // original failure as this command's outcome and let the caller's
+          // abort handling take it from there.
+          if (isAborted(signal)) {
+            return {
+              status: { ...base, status: 'rejected', reason: describeError(error) },
+              accepted: false,
+            }
+          }
+          warnings.push(
+            `waveform "${waveformId}" failed on ${command.deviceId}/${command.channelId}`
+            + ` (${describeError(error)}); retrying as a plain pattern`,
+          )
+          await this.options.registry.runPattern(PLAN_ACTOR, {
+            deviceId: command.deviceId,
+            channelId: command.channelId,
+            envelope: body.envelope,
+            durationSec: body.durationSec,
+          })
+          return {
+            status: {
+              ...base,
+              status: 'degraded',
+              percent: body.envelope.maxPercent,
+              reason: `waveform "${waveformId}" failed (${describeError(error)}); ran a plain pattern`,
+            },
+            accepted: true,
+          }
+        }
       }
       await this.options.registry.setWaveform(PLAN_ACTOR, command.deviceId, command.channelId, body.waveformId)
       return { status: { ...base, status: statusOf(command) }, accepted: true }
@@ -450,4 +502,22 @@ function describeError(error: unknown): string {
     return typeof code === 'string' ? `${code}: ${error.message}` : error.message
   }
   return String(error)
+}
+
+/**
+ * Did `runPattern` fail at the waveform stage, where dropping the texture can
+ * still produce a valid plain pattern?
+ *
+ * `UNKNOWN_WAVEFORM` and `WRONG_CHANNEL_KIND` are the registry's asset-stage
+ * refusals; an unclassified error (`code === undefined`) is a backend write
+ * failure that may well be waveform-specific. Every other string code is a
+ * channel/transport/policy refusal that would reproduce without the waveform,
+ * so it must reject as before instead of being retried and mislabelled
+ * (`ui-v11-review.md` §P2-1).
+ */
+function isWaveformStageFailure(error: unknown): boolean {
+  const code = typeof error === 'object' && error !== null
+    ? (error as { readonly code?: unknown }).code
+    : undefined
+  return code === undefined || code === 'UNKNOWN_WAVEFORM' || code === 'WRONG_CHANNEL_KIND'
 }
