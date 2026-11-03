@@ -73,6 +73,7 @@ import {
   TurnEngine,
   WHOLE_BODY_REGION,
   withPlayableEnums,
+  WRITER_TEMPLATE_LINE,
   type AuditLog,
   type AppendOnlyStore,
   type Clock,
@@ -142,9 +143,11 @@ const PACK_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/u
 const TURN_PROTOCOL = [
   '本回合是单轮调用：devices_list、state_get、look、sensors_list、waveform_list 不会返回结果，不要调用它们。',
   '必须调用 apply_plan 恰好一次；intentId 和 regions 只能取自「本回合可用」，不要发明 id。',
+  'regions 只能取「已就位部位」里列出的名字（whole-body 例外）；不要使用没有出现在「已就位部位」里的内容包 id。',
+  '有已就位部位时，beats 里至少有一个动作带 regions；只写正文、不调用 apply_plan 的回合不会有任何设备输出。',
   '本端点工具调用不携带正文 content：给玩家看的完整正文必须写进 apply_plan 的 narration 字段（非空，篇幅遵循人设），不能只写在 reasoning 里，也不能只调用工具。',
   'narration 是玩家会看到的正文，不是计划摘要；环境/动作/身体反应用（）包裹，台词不加括号，不出现设备硬件词。',
-  'narration 必须体现本回合 beats 的 regions（使用玩家词表 label）和动作，不能写成与部位无关的泛泛台词。',
+  'narration 必须写清本回合 beats 实际作用的玩家部位（用这些名字）和动作，不能写没有下发动作的部位，也不能写成与部位无关的泛泛台词。',
   '玩家选项会作为下一回合用户消息（含选项文字和 tag）回传；必须据此改变动作与叙事，不要无视选项或复读上一回合。',
 ] as const
 
@@ -401,6 +404,26 @@ export class PlaySession {
   private maxCapUsed = 0
   /** Intent ids of the last two settled turns (`SessionState.recentBeats`). */
   private readonly turnBeats: string[][] = []
+  /**
+   * Pack waveform ids registered by this session's `start`.
+   *
+   * `dispose` removes exactly these from the session scratch: the human may
+   * import or author waveforms on the device page, and a full `clearSession`
+   * at a session boundary would silently delete them (review P1-4R). The host
+   * shutdown still clears the whole scratch, which is where human scratch is
+   * discarded by design.
+   */
+  private readonly packWaveformIds: string[] = []
+  /**
+   * Round-robin rotation seed handed to the resolver for the next turn.
+   *
+   * The resolver is a pure function that sees one cursor per turn, so every
+   * round-robin beat in the *same* plan picks the same channel (per-turn, not
+   * per-beat rotation — a documented limitation). Advancing the counter once
+   * per settled turn is what makes successive turns hit different channels.
+   * Process-local by design: a scheduling hint does not need persistence.
+   */
+  private roundRobinCursor = 0
   /** `metaReactions` opening brief, consumed by the opening turn only. */
   private openingBrief: OpeningBrief | undefined
   /**
@@ -568,6 +591,25 @@ export class PlaySession {
       },
     })
     this.pack = input.pack
+    // Pack waveforms live under `<packId>:<localId>` and the executor's lookup
+    // learns them through `pack.resolveWaveform`; the registry's own
+    // `WaveformLibrary` is what `runPattern` actually requires, and it knows
+    // nothing about the pack. Registering the pack assets in the session
+    // scratch is what stops every packed waveform from being rejected with
+    // `UNKNOWN_WAVEFORM` (the audit's turn 1/2/4).
+    //
+    // Deliberately *no* `clearSession()` here: the human may have imported or
+    // authored waveforms on the device page before 开局 (a human-only path that
+    // lands in the same scratch), and start must not throw them away. Only the
+    // end of the session removes what this start added (`dispose`), and host
+    // shutdown clears the whole scratch. Re-registering a pack's ids is
+    // overwrite-by-id, so a retried start cannot duplicate anything.
+    for (const waveform of input.pack.waveforms) {
+      this.env.waveforms.addSessionWaveform(waveform)
+      // Remembered per id so `dispose` removes exactly the pack assets this
+      // session owns — never a human import that shares the scratch map.
+      if (!this.packWaveformIds.includes(waveform.id)) this.packWaveformIds.push(waveform.id)
+    }
     this.scenario = scenario
     this.phases = phases
     this.store = store
@@ -575,6 +617,7 @@ export class PlaySession {
     this.archived = archived
     this.openingBrief = openingBrief
     this.turnBeats.length = 0
+    this.roundRobinCursor = 0
     this.maxCapUsed = 0
     this.ledgerClosed = false
     this.engine = engine
@@ -845,6 +888,13 @@ export class PlaySession {
    */
   dispose(): void {
     this.engine?.dispose()
+    // Remove only the pack waveforms this session registered. The same scratch
+    // map holds human imports/authors from the device page, and a session
+    // boundary must not delete those (review P1-4R: this was the cleanup
+    // regression a full `clearSession` caused). The remaining scratch is
+    // discarded at host shutdown, which is the human-scratch end of life.
+    for (const id of this.packWaveformIds) this.env.waveforms.removeSessionWaveform(id)
+    this.packWaveformIds.length = 0
   }
 
   private requireSnapshot(): PlaySnapshot {
@@ -917,7 +967,19 @@ export class PlaySession {
     // projection and the resolver must see the same snapshot, or the model
     // could be told a region is ready and be resolved against one that is not.
     const snapshot = this.env.registry.snapshot()
-    const resolveContext = resolveContextOf(snapshot, scenario, this.waveformLookup)
+    // The menu the model is offered and the parts the resolver can reach are
+    // the same list: a pack recommendation without a ready channel behind it
+    // would only produce a fallback everywhere (the audit's "导演只在写作文本").
+    const playableRegions = targetableRegions(scenario, snapshot).map(region => region.id)
+    const resolveContext = resolveContextOf(
+      snapshot,
+      scenario,
+      this.waveformLookup,
+      regionAliasesOf(scenario, snapshot),
+      // Per-turn rotation seed: same-plan round-robin beats share it, the next
+      // turn gets the advanced value (see `advanceRoundRobinCursor`).
+      this.roundRobinCursor,
+    )
     // Build the prompt (the opening brief, when present, is part of it), then
     // consume the brief: it belongs to the opening turn only, even if that
     // request ends in a fallback.
@@ -930,13 +992,14 @@ export class PlaySession {
     this.openingBrief = undefined
     const result = await runTurn({
       runner: this.modelRunnerFor(),
-      // The pack's intent menu and region vocabulary are the only legal values
-      // for `apply_plan`; injecting them keeps the static tool schema free of
-      // content while stopping the model from inventing ids (§4.9.2).
+      // The pack's intent menu and the reachable region vocabulary are the only
+      // legal values for `apply_plan`; injecting them keeps the static tool
+      // schema free of content while stopping the model from inventing ids
+      // (§4.9.2).
       tools: withPlayableEnums(
         M2_MODEL_TOOLS,
         [...resolveContext.intents.keys()],
-        resolveContext.regions,
+        playableRegions,
         pack.waveforms.map(waveform => waveform.id),
       ),
       executor,
@@ -960,10 +1023,24 @@ export class PlaySession {
       },
     })
 
-    const line = result.line
-    if (line.trim() !== '') {
+    // A plan can drive hardware with no prose at all: tool-call providers may
+    // put the whole reply in `apply_plan` and omit both `content` and
+    // `narration`. Per §3 of 导演与写作上下文契约.md a failed write settles with
+    // the template line while the actions still run, so a turn that planned or
+    // dispatched still owns a transcript entry — otherwise the player loses the
+    // effect box exactly when the devices were touched.
+    const dispatched = (result.dispatch?.actions ?? [])
+      .some(action => action.status !== 'rejected')
+    const needsPlaceholder = result.plan !== undefined || dispatched
+    const line = result.line.trim() !== ''
+      ? result.line
+      : needsPlaceholder
+        ? WRITER_TEMPLATE_LINE
+        : ''
+    if (line !== '') {
       // One entry serves both the writer's recent memory and the transcript:
       // no second write path, and `at` is the injected-clock settlement time.
+      // The placeholder is only a line, never an audit record or a plan value.
       this.recentEntries.push({
         turnId: request.turnId,
         at: this.env.clock.now(),
@@ -976,6 +1053,7 @@ export class PlaySession {
     // Ledger/archive facts for this turn: dispatched percentages (B2-T8
     // `maxCapUsed`, never a cap) and the intent ids of the last two turns.
     this.recordTurnFacts(result)
+    this.advanceRoundRobinCursor(result)
     const choices = result.plan?.choices
     return {
       line,
@@ -1066,7 +1144,46 @@ export class PlaySession {
   }
 
   /**
+   * Advance the session's round-robin rotation seed after one settled turn.
+   *
+   * At most one step per turn (review P2-R1): several round-robin beats in the
+   * same plan share the turn's cursor (the resolver is a pure function), so
+   * advancing per beat made an even-sized pool repeat the same channel forever
+   * (cursor 0→2→4 ≡ 0 mod 2). Only a *real* dispatch consumes a rotation slot:
+   * a turn with no plan, a rejected/narrative-only round-robin beat or a
+   * non-round-robin plan leaves the cursor alone, so the next round-robin turn
+   * still alternates instead of skipping a channel or replaying the previous
+   * one.
+   */
+  private advanceRoundRobinCursor(result: TurnResult): void {
+    const plan = result.plan
+    if (plan === undefined) return
+    const roundRobinIntents = new Set(
+      (this.scenario?.feedbackIntents ?? [])
+        .filter(intent => intent.distribution === 'round-robin')
+        .map(intent => intent.id),
+    )
+    const dispatchedBeats = new Set(
+      (result.dispatch?.actions ?? [])
+        .filter(action => action.status !== 'rejected')
+        .map(action => action.beatId),
+    )
+    const rotated = plan.beats.some(beat =>
+      roundRobinIntents.has(beat.intentId) && dispatchedBeats.has(beat.id))
+    if (rotated) this.roundRobinCursor += 1
+  }
+
+  /**
    * Human-facing summary of what this turn actually dispatched.
+   *
+   * Every non-rejected action is kept, whatever region the beat *asked* for:
+   * the resolver may route a request through a region alias or fall back to
+   * every online level channel, and the player's part is the channel's
+   * post-dispatch `region` label. Filtering on `beat.regions` (v9) hid exactly
+   * those fallback dispatches, which is why the transcript's effect box only
+   * appeared "偶尔一次" while actions really ran. Rows are deduplicated by
+   * `(device, channel, region, percent, waveformId)`, because several beats or
+   * route matches can drive the same channel with the same effect.
    *
    * Uses the post-dispatch registry snapshot so a waveform selected by this
    * turn's plan is already reflected; region labels use the same vocabulary the
@@ -1088,19 +1205,24 @@ export class PlaySession {
     }
     const beats = new Map((result.plan?.beats ?? []).map(beat => [beat.id, beat] as const))
     const effects: PlayTurnEffect[] = []
+    const seen = new Set<string>()
     for (const action of result.dispatch?.actions ?? []) {
       if (action.status === 'rejected') continue
       const beat = beats.get(action.beatId)
       const found = channels.get(`${action.deviceId}:${action.channelId}`)
       const channel = found?.channel
       const region = channel?.region
-      // A beat that asked for `chest` may fall back to every online channel;
-      // only channels that actually carry one of the requested regions belong
-      // in this turn's effect box. `whole-body` is the explicit wildcard.
-      if (beat !== undefined && !beat.regions.includes(WHOLE_BODY_REGION)) {
-        if (region === undefined || !beat.regions.includes(region)) continue
-      }
       const waveform = channel?.waveform
+      // One row per real effect; `\u0000` cannot occur in an id or a label.
+      const key = [
+        action.deviceId,
+        action.channelId,
+        region ?? '',
+        action.percent ?? '',
+        waveform?.id ?? '',
+      ].join('\u0000')
+      if (seen.has(key)) continue
+      seen.add(key)
       const intentId = beat?.intentId
       effects.push({
         deviceId: action.deviceId,
@@ -1205,14 +1327,19 @@ export class PlaySession {
    * region with only that kind of channel is not "ready". Channel labels are
    * not sent — a pack addresses body regions, never device/channel ids
    * (`导演与写作上下文契约.md` §2: 设备能力 is a region list).
+   *
+   * The region list is the *reachable* part of the session vocabulary: pack
+   * recommendations only make it when a ready channel carries them (or the
+   * player named a channel that way). The audit's world facts listed both the
+   * pack ids and the player's labels, and the model kept writing 内容包 ids
+   * while the player's own parts were the only ones that could feel anything.
    */
   private worldFacts(snapshot: RegistrySnapshot): readonly string[] {
     const scenario = this.scenario
     if (scenario === undefined) return []
     return buildWorldFacts({
       intents: scenario.feedbackIntents,
-      // Pack recommendations + player-named parts; the model may target either.
-      regions: sessionRegions(scenario, snapshot),
+      regions: targetableRegions(scenario, snapshot),
       channels: snapshot.devices.flatMap(device => device.channels
         .filter(channel => channel.kind === 'level')
         .map(channel => ({ region: channel.region, ready: device.lifecycle === 'ready' }))),
@@ -1613,19 +1740,109 @@ function sessionRegions(
   return regions
 }
 
+/**
+ * The session vocabulary a beat can actually reach this turn.
+ *
+ * Takes {@link sessionRegions} and keeps only the ids that sit on a *ready*
+ * level channel, so the prompt's 可用部位 line and the `apply_plan` region enum
+ * advertise parts the resolver can really reach. A pack recommendation with no
+ * ready channel behind it is not a target: leaving it in the menu is what made
+ * the model write `inner-thigh` while the player's channels were 阴蒂/小穴.
+ *
+ * `whole-body` stays out of this subset — it is the wildcard every plan may
+ * use, re-added by `buildWorldFacts`/`withPlayableEnums` at the head of the
+ * menu. When *no* ready channel is labelled the answer is the empty list, not
+ * the pack vocabulary: an unlabelled rig can still be driven through
+ * `whole-body`, but advertising pack ids there only makes the model name parts
+ * the resolver cannot match, which forces the "drive every channel" fallback
+ * and re-creates the audit's 文不对部位 symptom.
+ */
+function targetableRegions(
+  scenario: ScenarioDefinition,
+  snapshot: RegistrySnapshot,
+): readonly { readonly id: string; readonly label: string }[] {
+  const reachable = new Set<string>()
+  for (const device of snapshot.devices) {
+    if (device.lifecycle !== 'ready') continue
+    for (const channel of device.channels) {
+      if (channel.kind !== 'level') continue
+      if (channel.region !== undefined && channel.region !== '') reachable.add(channel.region)
+    }
+  }
+  if (reachable.size === 0) return []
+  return sessionRegions(scenario, snapshot).filter(region => reachable.has(region.id))
+}
+
+/**
+ * Pack region id → the player-named channel regions that mean the same part.
+ *
+ * A pack authors prose (`核心敏感区（阴部/阴茎/阴蒂/大腿内侧）`), while a channel
+ * carries the player's own word (`阴蒂`). The resolver's alias map makes a beat
+ * that uses the pack id land on the talked-about channel instead of falling
+ * back to every online level channel — and `narration` then names the part the
+ * player actually has. Matching is strictly "the player label is a substring
+ * of the pack label, and is not the region id"; entries are collected in
+ * stable device/channel order so the map (and the resolved plan) is
+ * deterministic. `whole-body` is already a wildcard, so it needs no alias.
+ */
+function regionAliasesOf(
+  scenario: ScenarioDefinition,
+  snapshot: RegistrySnapshot,
+): Map<string, readonly string[]> {
+  const channels: { readonly deviceId: string; readonly channelId: string; readonly region: string }[] = []
+  for (const device of snapshot.devices) {
+    for (const channel of device.channels) {
+      if (channel.kind !== 'level') continue
+      if (channel.region === undefined || channel.region === '') continue
+      channels.push({ deviceId: device.id, channelId: channel.id, region: channel.region })
+    }
+  }
+  channels.sort((left, right) => compareStrings(left.deviceId, right.deviceId)
+    || compareStrings(left.channelId, right.channelId))
+
+  const aliases = new Map<string, readonly string[]>()
+  for (const region of scenario.regions) {
+    if (region.id === WHOLE_BODY_REGION) continue
+    const matched: string[] = []
+    for (const channel of channels) {
+      if (channel.region === region.id) continue
+      if (!region.label.includes(channel.region)) continue
+      if (!matched.includes(channel.region)) matched.push(channel.region)
+    }
+    if (matched.length > 0) aliases.set(region.id, matched)
+  }
+  return aliases
+}
+
+/** Code-unit comparison: locale-independent, so a resolved plan is stable. */
+function compareStrings(left: string, right: string): number {
+  if (left < right) return -1
+  if (left > right) return 1
+  return 0
+}
+
 /** What the model may read about the world this turn: registry facts only. */
 function resolveContextOf(
   snapshot: RegistrySnapshot,
   scenario: ScenarioDefinition,
   waveforms: WaveformLookup,
+  regionAliases: ReadonlyMap<string, readonly string[]>,
+  roundRobinCursor: number,
 ): ResolveContext {
   const intents = new Map<string, FeedbackIntent>()
   for (const intent of scenario.feedbackIntents) intents.set(intent.id, intent)
   return {
     snapshot,
     intents,
+    // The resolver keeps the *full* session vocabulary: it is what accepts a
+    // player-named part and what makes the "region not in vocabulary" warning
+    // meaningful. Aliases are an optional extra route to a channel.
     regions: sessionRegions(scenario, snapshot).map(region => region.id),
     waveforms,
+    // Per-turn rotation seed for round-robin intents (production never moved
+    // it before; the resolver accepts it, so the host must supply it).
+    roundRobinCursor,
+    ...(regionAliases.size === 0 ? {} : { regionAliases }),
   }
 }
 

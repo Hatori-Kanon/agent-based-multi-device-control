@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { MAX_FREQ, MIN_FREQ, WaveformLibrary, type DeviceLifecycle } from '../src/index.ts'
+import {
+  MAX_FREQ,
+  MIN_FREQ,
+  WaveformLibrary,
+  type DeviceLifecycle,
+  type PulseFrame,
+  type Waveform,
+} from '../src/index.ts'
 import type {
   Beat,
   BeatChange,
@@ -18,9 +25,42 @@ import {
   type ResolveContext,
   type ResolveDeviceSnapshot,
   type ResolveRegistrySnapshot,
+  type WaveformLookup,
 } from '../src/scenario/intents.ts'
 
 const WAVEFORMS = new WaveformLibrary()
+
+/** Canonical ids shipped by a content pack, as `loader.ts` namespaces them. */
+const PACK_ID = 'tentacle-shadow'
+const PACK_WAVEFORM_ID = `${PACK_ID}:tentacle-crawl`
+
+function packWaveform(): Waveform {
+  const frames: readonly PulseFrame[] = [
+    { freq: [10, 10, 10, 10], intensity: [0, 0, 0, 0] },
+    { freq: [10, 10, 10, 10], intensity: [60, 60, 60, 60] },
+  ]
+  return { id: PACK_WAVEFORM_ID, name: '触手爬行', frames, loop: true, source: 'imported', tags: ['pack'] }
+}
+
+/**
+ * A stand-in for `PlaySession.waveformLookup` (play.ts): pack references
+ * resolve first (`builtin:`, `<packId>:<id>` and bare local ids), then the
+ * session library. Pack waveforms are installed with `addSessionWaveform`, so
+ * the canonical id the resolver returns is also the id dispatch will require.
+ */
+function packLookup(): { readonly lookup: WaveformLookup; readonly library: WaveformLibrary } {
+  const library = new WaveformLibrary()
+  const packed = packWaveform()
+  library.addSessionWaveform(packed)
+  const lookup: WaveformLookup = {
+    get: reference => {
+      if (reference.startsWith('builtin:')) return library.get(reference.slice('builtin:'.length))
+      if (reference.startsWith(`${PACK_ID}:`)) return library.get(reference)
+      return library.get(`${PACK_ID}:${reference}`) ?? library.get(reference)
+    },
+  }
+  return { lookup, library }
+}
 
 const AMBIENT: FeedbackIntent = {
   id: 'ambient-field',
@@ -86,6 +126,7 @@ function context(
   registry: ResolveRegistrySnapshot,
   intents: ReadonlyMap<string, FeedbackIntent> = DEFAULT_INTENT_MAP,
   roundRobinCursor?: number,
+  regionAliases?: ReadonlyMap<string, readonly string[]>,
 ): ResolveContext {
   return {
     snapshot: registry,
@@ -93,6 +134,7 @@ function context(
     regions: ['whole-body', 'chest', 'inner-thigh'],
     waveforms: WAVEFORMS,
     ...(roundRobinCursor === undefined ? {} : { roundRobinCursor }),
+    ...(regionAliases === undefined ? {} : { regionAliases }),
   }
 }
 
@@ -301,6 +343,27 @@ describe('region routing and distribution', () => {
     expect(picked(4)).toEqual(['b'])
   })
 
+  it('rotates over ready channels when a matching device is offline', () => {
+    const registry = snapshot(
+      // Offline duplicate first: a cursor must not land on it while `toy`
+      // still has deliverable channels for the same region.
+      device('dead', [channel('a', 'chest')], 'disconnected'),
+      device('toy', [channel('a', 'chest'), channel('b', 'chest')]),
+    )
+    const rotating = new Map<string, FeedbackIntent>([
+      ['ambient-field', { ...AMBIENT, distribution: 'round-robin' }],
+    ])
+    const fixture = plan([levelBeat('b1', { regions: ['chest'] })])
+    const picked = (cursor: number): string[] =>
+      resolvePlan(fixture, context(registry, rotating, cursor)).commands.map(command => command.channelId)
+
+    expect(picked(0)).toEqual(['a'])
+    expect(picked(1)).toEqual(['b'])
+    // The offline channel is not part of the rotation, so it never produces a
+    // silent turn while another channel can play the same region.
+    expect(picked(2)).toEqual(['a'])
+  })
+
   it('falls back to every online level channel when no channel carries the region', () => {
     const registry = snapshot(device('toy', [channel('a'), channel('b')]))
     const resolved = resolvePlan(plan([levelBeat('b1', { regions: ['chest'] })]), context(registry))
@@ -367,6 +430,43 @@ describe('offline devices and degraded commands', () => {
 
     expect(() => resolvePlan(fixture, context(registry))).not.toThrow()
     const resolved = resolvePlan(fixture, context(registry))
+    expect(resolved.commands).toEqual([])
+    expect(resolved.narrativeOnlyBeats).toEqual(['b1'])
+    expect(resolved.warnings.some(warning => warning.includes('disconnected'))).toBe(true)
+  })
+
+  it('prefers a ready duplicate region match over an offline device for a primary intent', () => {
+    const registry = snapshot(
+      // Exactly the adversarial-review repro: the offline device sorts first
+      // in the snapshot, so the old id-only order made `primary` pick it, drop
+      // the command, and leave the whole beat silent.
+      device('dead', [channel('a', 'chest')], 'disconnected'),
+      device('toy', [channel('a', 'chest')]),
+    )
+    const fixture = plan([
+      levelBeat('b1', { intentId: 'probe-touch', regions: ['chest'], strength: 'low' }),
+    ])
+
+    const resolved = resolvePlan(fixture, context(registry))
+
+    expect(resolved.commands).toHaveLength(1)
+    expect(resolved.commands[0]?.deviceId).toBe('toy')
+    expect(resolved.commands[0]?.channelId).toBe('a')
+    expect(resolved.narrativeOnlyBeats).toEqual([])
+    expect(resolved.warnings.some(warning => warning.includes('disconnected'))).toBe(false)
+  })
+
+  it('keeps the beat narrative-only when every matching channel is offline', () => {
+    const registry = snapshot(
+      device('dead', [channel('a', 'chest')], 'disconnected'),
+      device('gone', [channel('a', 'chest')], 'failed'),
+    )
+    const fixture = plan([
+      levelBeat('b1', { intentId: 'probe-touch', regions: ['chest'], strength: 'low' }),
+    ])
+
+    const resolved = resolvePlan(fixture, context(registry))
+
     expect(resolved.commands).toEqual([])
     expect(resolved.narrativeOnlyBeats).toEqual(['b1'])
     expect(resolved.warnings.some(warning => warning.includes('disconnected'))).toBe(true)
@@ -506,5 +606,97 @@ describe('pattern bodies', () => {
       { kind: 'level', percent: 0, durationSec: 0 },
     ])
     expect(resolved.commands.every(command => !command.clamped)).toBe(true)
+  })
+})
+
+describe('waveform references resolve to dispatchable canonical ids', () => {
+  it('returns the canonical id for bare, builtin: and namespaced references', () => {
+    const registry = snapshot(device('toy', [channel('a', 'chest', { supportsWaveform: true })]))
+    const { lookup, library } = packLookup()
+    const cases = [
+      // The model / intent may write any of the three shapes; the host library
+      // only answers to the canonical one.
+      { reference: 'tentacle-crawl', expected: PACK_WAVEFORM_ID },
+      { reference: 'builtin:tide', expected: 'tide' },
+      { reference: PACK_WAVEFORM_ID, expected: PACK_WAVEFORM_ID },
+    ] as const
+
+    for (const { reference, expected } of cases) {
+      const intent: FeedbackIntent = {
+        ...AMBIENT,
+        suggest: { preset: 'wave', waveform: reference, durationSec: 30, strength: 'med' },
+      }
+      const command = firstCommand(resolvePlan(
+        plan([levelBeat('b1', { regions: ['chest'] })]),
+        { ...context(registry, new Map([['ambient-field', intent]])), waveforms: lookup },
+      ).commands)
+
+      expect(command.degraded).toBeUndefined()
+      expect(command.body.kind).toBe('pattern')
+      if (command.body.kind === 'pattern') expect(command.body.waveformId).toBe(expected)
+      // This is exactly what dispatch (`registry.setWaveform` → `require`) asks
+      // for; echoing the request reference instead failed with UNKNOWN_WAVEFORM.
+      expect(library.require(expected)).toBeDefined()
+    }
+  })
+
+  it('canonicalizes a change waveform reference too', () => {
+    const registry = snapshot(device('toy', [channel('a', 'chest', { supportsWaveform: true })]))
+    const { lookup } = packLookup()
+    const command = firstCommand(resolvePlan(
+      plan([
+        levelBeat('b1', {
+          intentId: 'plain',
+          regions: ['chest'],
+          change: { kind: 'waveform', waveformId: 'tentacle-crawl', durationSec: 4 },
+        }),
+      ]),
+      { ...context(registry, PLAIN_INTENT_MAP), waveforms: lookup },
+    ).commands)
+
+    expect(command.degraded).toBeUndefined()
+    expect(command.body.kind).toBe('pattern')
+    if (command.body.kind === 'pattern') expect(command.body.waveformId).toBe(PACK_WAVEFORM_ID)
+  })
+})
+
+describe('region aliases bridge pack vocabulary and player-named channels', () => {
+  const ALIASES = new Map([['inner-thigh', ['阴蒂']]])
+
+  /** The pack declares `inner-thigh`; the player labelled the channel `阴蒂`. */
+  function aliasRegistry(): ResolveRegistrySnapshot {
+    return snapshot(device('toy', [channel('clit', '阴蒂'), channel('thigh', '大腿内侧')]))
+  }
+
+  it('routes a pack region id to the aliased channel instead of falling back', () => {
+    const resolved = resolvePlan(
+      plan([levelBeat('b1', { intentId: 'plain', regions: ['inner-thigh'] })]),
+      context(aliasRegistry(), PLAIN_INTENT_MAP, undefined, ALIASES),
+    )
+
+    expect(resolved.commands.map(command => command.channelId)).toEqual(['clit'])
+    expect(resolved.commands[0]?.degraded).toBeUndefined()
+    expect(resolved.warnings.some(warning => warning.includes('falling back'))).toBe(false)
+  })
+
+  it('falls back to every online channel when no alias is declared', () => {
+    const resolved = resolvePlan(
+      plan([levelBeat('b1', { intentId: 'plain', regions: ['inner-thigh'] })]),
+      context(aliasRegistry(), PLAIN_INTENT_MAP),
+    )
+
+    expect(resolved.commands.map(command => command.channelId)).toEqual(['clit', 'thigh'])
+    expect(resolved.commands.every(command => command.degraded === 'no-region-match')).toBe(true)
+    expect(resolved.warnings.some(warning => warning.includes('falling back'))).toBe(true)
+  })
+
+  it('does not match when an alias exists for the region but names another part', () => {
+    const resolved = resolvePlan(
+      plan([levelBeat('b1', { intentId: 'plain', regions: ['inner-thigh'] })]),
+      context(aliasRegistry(), PLAIN_INTENT_MAP, undefined, new Map([['inner-thigh', ['胸口']]])),
+    )
+
+    expect(resolved.commands.map(command => command.channelId)).toEqual(['clit', 'thigh'])
+    expect(resolved.commands.every(command => command.degraded === 'no-region-match')).toBe(true)
   })
 })

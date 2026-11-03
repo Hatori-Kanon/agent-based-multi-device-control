@@ -664,7 +664,11 @@ describe('settings API', () => {
     await installDemoPack(root)
     const gateway = new FixtureGateway([
       { text: '第一回合。', plan: simplePlan() },
-      { text: '第二回合。' },
+      // Every scripted turn carries `apply_plan`: a prose-only reply now gets
+      // one corrective retry (the model must always plan), and that retry is a
+      // second HTTP call to the gateway. This test asserts the *runner swap*
+      // via `gateway.calls` length, so both turns must be single-call.
+      { text: '第二回合。', plan: simplePlan() },
     ])
     const host = await start({ llmFetch: gateway.fetch, llmEnv: {} })
     const client = clientOf(host)

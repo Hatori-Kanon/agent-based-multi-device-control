@@ -309,7 +309,10 @@ describe('TurnPipeline (single call / split call)', () => {
     const singleRunner: ModelRunner = {
       async run() {
         singleTimers.push(singleClock.pendingCount)
-        return { text: '嗯。', toolCalls: [], finishReason: 'stop' }
+        // The plan must be present: a prose-only reply now triggers the loop's
+        // one corrective request, while this test asserts D6's single
+        // controller/timer, not the number of model requests.
+        return { text: '嗯。', toolCalls: [APPLY_PLAN_CALL], finishReason: 'tool-calls' }
       },
     }
     const singleStore = new MemoryAppendOnlyStore()

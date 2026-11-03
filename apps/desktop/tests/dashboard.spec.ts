@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { deflateRawSync } from 'node:zlib'
 import {
@@ -908,7 +908,13 @@ interface PacksResponse {
 }
 
 interface ImportResponse extends PacksResponse {
-  readonly pack: { readonly id: string; readonly version: string; readonly active: boolean }
+  readonly pack: {
+    readonly id: string
+    readonly version: string
+    readonly active: boolean
+    /** 同 id@version 重导时宿主返回 true（覆盖安装，不是首次导入）。 */
+    readonly replaced: boolean
+  }
 }
 
 describe('content pack API (B2-T14)', () => {
@@ -928,7 +934,7 @@ describe('content pack API (B2-T14)', () => {
     })
     expect(response.status).toBe(200)
     let imported = await response.json() as ImportResponse
-    expect(imported.pack).toEqual({ id: 'demo-pack', version: '1.0.0', active: true })
+    expect(imported.pack).toEqual({ id: 'demo-pack', version: '1.0.0', active: true, replaced: false })
     expect(imported.packs[0]?.activeVersion).toBe('1.0.0')
 
     // 新版本安装后默认切到新版本；旧版仍保留，可随时切回（回滚）。
@@ -939,7 +945,7 @@ describe('content pack API (B2-T14)', () => {
     })
     expect(response.status).toBe(200)
     imported = await response.json() as ImportResponse
-    expect(imported.pack).toEqual({ id: 'demo-pack', version: '1.1.0', active: true })
+    expect(imported.pack).toEqual({ id: 'demo-pack', version: '1.1.0', active: true, replaced: false })
     expect(imported.packs[0]?.versions.map(version => version.version)).toEqual(['1.0.0', '1.1.0'])
     expect(imported.packs[0]?.activeVersion).toBe('1.1.0')
 
@@ -952,6 +958,74 @@ describe('content pack API (B2-T14)', () => {
     const switched = await response.json() as PacksResponse
     expect(switched.packs[0]?.activeVersion).toBe('1.0.0')
     expect(switched.packs[0]?.versions.find(version => version.active)?.version).toBe('1.0.0')
+  })
+
+  it('overwrites an installed id@version when the same zip is imported again', async () => {
+    // The product rule: an import extracts into the project's own directory and
+    // same-named files are overwritten — a duplicate pack is never "already
+    // installed". End-to-end through the real host, FsPackStore and HTTP route.
+    const host = await start()
+    const token = host.dashboardToken
+    const url = base(host)
+    const packPath = join(root, 'content', 'packs', 'demo-pack', '1.0.0')
+
+    // The literal user scenario: pick the very same zip file twice.
+    const original = packZipOf('demo-pack', '1.0.0', '初版', {
+      files: { 'notes/old.md': '旧附注' },
+    })
+    let response = await fetch(`${url}/api/packs/import`, {
+      method: 'POST',
+      headers: headers(token),
+      body: packUpload(original),
+    })
+    expect(response.status).toBe(200)
+    expect((await response.json() as ImportResponse).pack).toEqual({
+      id: 'demo-pack',
+      version: '1.0.0',
+      active: true,
+      replaced: false,
+    })
+    expect(await readFile(join(packPath, 'notes', 'old.md'), 'utf8')).toBe('旧附注')
+
+    response = await fetch(`${url}/api/packs/import`, {
+      method: 'POST',
+      headers: headers(token),
+      body: packUpload(original),
+    })
+    expect(response.status).toBe(200)
+    const identical = await response.json() as ImportResponse
+    expect(identical.pack).toEqual({ id: 'demo-pack', version: '1.0.0', active: true, replaced: true })
+    expect(identical.packs[0]?.versions).toHaveLength(1)
+    expect(identical.packs[0]?.activeVersion).toBe('1.0.0')
+
+    // A changed archive for the same id@version overwrites the same-named files
+    // and drops the file this archive no longer contains (stale cleanup).
+    response = await fetch(`${url}/api/packs/import`, {
+      method: 'POST',
+      headers: headers(token),
+      body: packUpload(packZipOf('demo-pack', '1.0.0', '修订版')),
+    })
+    expect(response.status).toBe(200)
+    const overwritten = await response.json() as ImportResponse
+    expect(overwritten.pack).toEqual({
+      id: 'demo-pack',
+      version: '1.0.0',
+      active: true,
+      replaced: true,
+    })
+
+    // The bytes on disk really changed, and the file only the first archive had
+    // is gone.
+    const manifest = JSON.parse(await readFile(join(packPath, 'pack.json'), 'utf8')) as { name: string }
+    expect(manifest.name).toBe('修订版')
+    expect(await readFile(join(packPath, 'persona.md'), 'utf8')).toContain('修订版')
+    await expect(readFile(join(packPath, 'notes', 'old.md'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+
+    // The list route agrees: one version, still active, refreshed metadata.
+    const listed = await (await fetch(`${url}/api/packs`, { headers: headers(token) })).json() as PacksResponse
+    expect(listed.packs[0]?.versions).toHaveLength(1)
+    expect(listed.packs[0]?.versions[0]?.version).toBe('1.0.0')
+    expect(listed.packs[0]?.activeVersion).toBe('1.0.0')
   })
 
   it('serves the declared body regions of one installed pack', async () => {
@@ -1376,6 +1450,10 @@ describe('play page (B2-T12)', () => {
     expect(js).toContain('/api/packs/regions')
     // The lobby imports zip packs through the same host route the installer uses.
     expect(js).toContain('/api/packs/import')
+    // A duplicate import overwrites and the status line says so (the host sends
+    // `replaced`); without it the unchanged version number looks like a no-op.
+    expect(js).toContain('replaced')
+    expect(js).toContain('已导入（覆盖）')
     // Autopilot is session-scoped; end uses the in-page confirmation helper.
     expect(js).toContain('/api/session/autopilot')
     expect(js).toContain('embodiedConfirm')

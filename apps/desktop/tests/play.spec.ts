@@ -13,6 +13,8 @@ import {
   SensorRegistry,
   WaveformLibrary,
   type AuditRecord,
+  type Channel,
+  type DispatchStatus,
   type EngineEvent,
   type LoadedPack,
   type ModelRunner,
@@ -57,6 +59,97 @@ function choicePlanCall(id = 'call_1'): ToolCall {
       choices: [{ id: 'c1', label: '退开', tag: 'resist' }],
     },
   }
+}
+
+/** A plan that drives every ready channel with one packaged waveform reference. */
+function waveformPlanCall(waveformId: string, id = 'call_wave'): ToolCall {
+  return {
+    id,
+    name: 'apply_plan',
+    arguments: {
+      pacing: 'probe',
+      beats: [{
+        id: 'b1',
+        intentId: 'cilia-tickle',
+        regions: ['whole-body'],
+        strength: 'low',
+        change: { kind: 'waveform', waveformId, durationSec: 5 },
+      }],
+    },
+  }
+}
+
+/** A level plan that names one pack region id. */
+function regionPlanCall(region: string, id = 'call_region'): ToolCall {
+  return {
+    id,
+    name: 'apply_plan',
+    arguments: {
+      pacing: 'probe',
+      beats: [{
+        id: 'b1',
+        intentId: 'pause-watch',
+        regions: [region],
+        strength: 'low',
+        change: { kind: 'level', targetPercent: 20, durationSec: 3 },
+      }],
+    },
+  }
+}
+
+/** Two beats on a region no channel carries: exercises the fallback route. */
+function fallbackPlanCall(id = 'call_fallback'): ToolCall {
+  return {
+    id,
+    name: 'apply_plan',
+    arguments: {
+      pacing: 'probe',
+      beats: [
+        { id: 'b1', intentId: 'pause-watch', regions: ['waist'], strength: 'low' },
+        { id: 'b2', intentId: 'pause-watch', regions: ['waist'], strength: 'low' },
+      ],
+    },
+  }
+}
+
+/** One round-robin beat; the rotation seed should make the next turn differ. */
+function rotationPlanCall(id = 'call_rotation'): ToolCall {
+  return {
+    id,
+    name: 'apply_plan',
+    arguments: {
+      pacing: 'probe',
+      beats: [{
+        id: 'b1',
+        intentId: 'sweep-touch',
+        regions: ['whole-body'],
+        strength: 'low',
+      }],
+    },
+  }
+}
+
+/** Two round-robin beats in one plan: they share the turn's cursor. */
+function doubleRotationPlanCall(id = 'call_double_rotation'): ToolCall {
+  return {
+    id,
+    name: 'apply_plan',
+    arguments: {
+      pacing: 'probe',
+      beats: [
+        { id: 'b1', intentId: 'sweep-touch', regions: ['whole-body'], strength: 'low' },
+        { id: 'b2', intentId: 'sweep-touch', regions: ['whole-body'], strength: 'low' },
+      ],
+    },
+  }
+}
+
+/** Every dispatch action recorded by the executor's `plan_resolved` audit lines. */
+function planActions(records: readonly AuditRecord[]): readonly DispatchStatus[] {
+  return records
+    .filter(record => record.action === 'plan_resolved')
+    .flatMap(record =>
+      (record.detail as { readonly actions?: readonly DispatchStatus[] } | undefined)?.actions ?? [])
 }
 
 /** A scripted, offline {@link ModelRunner}; records every request. */
@@ -143,6 +236,80 @@ function narrativePack(): Promise<LoadedPack> {
   return cachedScenarioPack
 }
 
+let cachedTentaclePack: Promise<LoadedPack> | undefined
+
+/**
+ * A scenario pack shaped like the user's installed 内容包 (audit evidence).
+ *
+ * Its regions are the pack's own ids (`inner-thigh`/`anal`/`chest`/`waist`)
+ * whose prose labels contain the words the player labels channels with
+ * (`阴蒂`/`后穴`/`乳房`), and it ships one `waveforms/*.json` asset. That is
+ * exactly the shape that produced the audit's `UNKNOWN_WAVEFORM` rejects and
+ * "部位对不上" prose: the pack ids were in the menu, the player's parts were
+ * not mapped anywhere.
+ */
+function tentaclePack(): Promise<LoadedPack> {
+  cachedTentaclePack ??= loadPack(new MemoryContentSource({
+    'pack.json': JSON.stringify({
+      id: 'tentacle',
+      name: '触手包',
+      version: '0.3.0',
+      engine: '>=0.2 <1.0',
+      mode: 'scenario',
+      rating: '18+',
+      boundaries: ['不做真实伤害'],
+    }),
+    'persona.md': '# 阿岚\n\n## 导演摘要\n\n温柔的试探者，先观察再靠近。\n',
+    'setting.md': '一间只有台灯的房间。\n',
+    'scenario.json': JSON.stringify({
+      session: { plannedMinutes: 30, phaseWindows: [], aftercareMin: 0 },
+      regions: [
+        { id: 'inner-thigh', label: '核心敏感区（阴部/阴茎/阴蒂/大腿内侧）' },
+        { id: 'anal', label: '深层区域（后穴/内部深处）' },
+        { id: 'chest', label: '胸部敏感区（乳房/乳尖）' },
+        { id: 'waist', label: '躯干束缚（腰腹/四肢固定）' },
+        { id: 'whole-body', label: '全身/环境场' },
+      ],
+      phases: [{ id: 'scene', goal: '自由互动', next: [] }],
+      feedbackIntents: [
+        {
+          id: 'cilia-tickle',
+          meaning: '细密撩拨',
+          regions: ['inner-thigh', 'chest', 'anal'],
+          suggest: { preset: 'wave', waveform: 'saw-spin', durationSec: 10, strength: 'low' },
+        },
+        {
+          id: 'pause-watch',
+          meaning: '停顿观察',
+          regions: ['inner-thigh', 'anal', 'chest'],
+          suggest: { preset: 'steady', durationSec: 4, strength: 'low' },
+        },
+        {
+          id: 'soothe',
+          meaning: '安抚或降档',
+          regions: ['whole-body'],
+          suggest: { preset: 'wave', waveform: 'builtin:tide', durationSec: 15, strength: 'low' },
+        },
+        {
+          // Round-robin intent: the host must rotate its cursor across turns.
+          id: 'sweep-touch',
+          meaning: '轮流扫过',
+          regions: ['whole-body'],
+          distribution: 'round-robin',
+          suggest: { preset: 'steady', durationSec: 4, strength: 'low' },
+        },
+      ],
+    }),
+    'waveforms/saw-spin.json': JSON.stringify({
+      name: '回旋锯齿',
+      loop: true,
+      sensation: '细密先拍',
+      frames: ['0A0A0A0A50505050', '1010101064646464'],
+    }),
+  }))
+  return cachedTentaclePack
+}
+
 interface Harness {
   readonly session: PlaySession
   readonly host: PlayHost
@@ -157,10 +324,16 @@ interface Harness {
   records(): AuditRecord[]
 }
 
+interface HarnessOptions {
+  /** Mock device channels; defaults to the two plain pulse channels. */
+  readonly channels?: readonly Channel[]
+}
+
 /** Build a real registry (mock devices) + scripted model + in-memory audit. */
 async function createHarness(
   turns: readonly ModelTurnResult[],
   pack?: LoadedPack,
+  options?: HarnessOptions,
 ): Promise<Harness> {
   const clock = new FakeClock()
   const store = new MemoryAppendOnlyStore()
@@ -180,7 +353,7 @@ async function createHarness(
     clock,
     keepAliveMs: 400,
     refreshMs: 100,
-    channels: [
+    channels: options?.channels ?? [
       { id: 'a', kind: 'level', label: 'A 通道' },
       { id: 'b', kind: 'level', label: 'B 通道' },
     ],
@@ -224,7 +397,7 @@ describe('play session', () => {
   it('starts a session from a freeform pack and answers the first turn', async () => {
     const h = await createHarness([
       scriptedTurn('他轻轻靠近。', [planCall()]),
-      scriptedTurn('这次他没有退。'),
+      scriptedTurn('这次他没有退。', [planCall('call_2')]),
     ])
     const pack = await freeformPack()
 
@@ -287,7 +460,10 @@ describe('play session', () => {
   })
 
   it('refuses a second start while open and allows a new one after end', async () => {
-    const h = await createHarness([scriptedTurn('第一次。'), scriptedTurn('第二次。')])
+    const h = await createHarness([
+      scriptedTurn('第一次。', [planCall()]),
+      scriptedTurn('第二次。', [planCall('call_2')]),
+    ])
 
     const first = await h.host.start({ packId: 'demo', plannedMinutes: 30 })
     await expect(h.host.start({ packId: 'demo', plannedMinutes: 30 }))
@@ -762,7 +938,7 @@ describe('play session archive and ledger (B2-T7/T8)', () => {
     const h = await createArchivedHarness({
       turns: [
         scriptedTurn('第一句。', [planCall()]),
-        scriptedTurn('第二句。'),
+        scriptedTurn('第二句。', [planCall('call_2')]),
       ],
     })
 
@@ -822,7 +998,7 @@ describe('play session archive and ledger (B2-T7/T8)', () => {
     }
     const clock = new FakeClock()
     const crashed = await createArchivedHarness({
-      turns: [scriptedTurn('第一局。', [planCall()]), scriptedTurn('第二回合。')],
+      turns: [scriptedTurn('第一局。', [planCall()]), scriptedTurn('第二回合。', [planCall('call_2')])],
       backing,
       clock,
     })
@@ -833,7 +1009,7 @@ describe('play session archive and ledger (B2-T7/T8)', () => {
     crashed.host.dispose()
 
     const restarted = await createArchivedHarness({
-      turns: [scriptedTurn('重新开始。')],
+      turns: [scriptedTurn('重新开始。', [planCall()])],
       backing,
       clock,
     })
@@ -867,13 +1043,21 @@ describe('play session archive and ledger (B2-T7/T8)', () => {
     }
 
     // A first session ends `left_early`; the opening had no ledger to read.
-    const firstRun = await createArchivedHarness({ turns: [scriptedTurn('冷。')], pack, backing })
+    const firstRun = await createArchivedHarness({
+      turns: [scriptedTurn('冷。', [planCall()])],
+      pack,
+      backing,
+    })
     await firstRun.host.start({ packId: 'demo', plannedMinutes: 45 })
     expect(firstRun.runner.requests[0]!.messages[0]!.content).not.toContain('开场指引')
     await firstRun.host.end('left_early')
 
     // The next session reads the ledger and receives the brief.
-    const secondRun = await createArchivedHarness({ turns: [scriptedTurn('你回来了。')], pack, backing })
+    const secondRun = await createArchivedHarness({
+      turns: [scriptedTurn('你回来了。', [planCall()])],
+      pack,
+      backing,
+    })
     await secondRun.host.start({ packId: 'demo', plannedMinutes: 45 })
     const system = secondRun.runner.requests[0]!.messages[0]!.content
     expect(system).toContain('开场指引')
@@ -882,7 +1066,10 @@ describe('play session archive and ledger (B2-T7/T8)', () => {
     await secondRun.host.end('stop')
 
     // A pack that does not read the ledger stays neutral even with entries.
-    const silentRun = await createArchivedHarness({ turns: [scriptedTurn('嗯。')], backing })
+    const silentRun = await createArchivedHarness({
+      turns: [scriptedTurn('嗯。', [planCall()])],
+      backing,
+    })
     await silentRun.host.start({ packId: 'demo', plannedMinutes: 45 })
     expect(silentRun.runner.requests[0]!.messages[0]!.content).not.toContain('开场指引')
   })
@@ -944,9 +1131,12 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
     expect(system).toContain('soothe=安抚或降档')
     expect(system).toContain('可用部位')
     expect(system).toContain('hands=手')
-    expect(system).toContain('shoulders=肩背')
     expect(system).toContain('whole-body=全身')
     expect(system).toContain('已就位部位：hands')
+    // A pack recommendation with no ready channel behind it is not a target:
+    // 肩背 stays out of the menu, so the model cannot aim at hardware that is
+    // not there (the audit's "部位输出只偶尔出现" root cause).
+    expect(system).not.toContain('shoulders=肩背')
     // The facts live in the mandatory `world` section, not in the budgeted
     // narrative briefs: a long persona can never hide the menu.
     expect(system).toContain('## 本回合可用（意图与部位）')
@@ -970,7 +1160,7 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
       }
     }).properties.beats.items.properties
     expect(beat.intentId.enum).toEqual(['probe-touch', 'soothe'])
-    expect(beat.regions.items.enum).toEqual(['whole-body', 'hands', 'shoulders'])
+    expect(beat.regions.items.enum).toEqual(['whole-body', 'hands'])
 
     await h.host.end('stop')
   })
@@ -993,7 +1183,7 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
   it('does not wait forever on a choice in autopilot mode', async () => {
     const h = await createHarness([
       scriptedTurn('开场带选项。', [choicePlanCall()]),
-      scriptedTurn('超时后继续。'),
+      scriptedTurn('超时后继续。', [planCall('call_2')]),
     ])
     await h.host.start({
       packId: 'demo',
@@ -1015,8 +1205,8 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
 
   it('sends a synthetic continuation user turn for auto turns', async () => {
     const h = await createHarness([
-      scriptedTurn('开场。'),
-      scriptedTurn('自动回合。'),
+      scriptedTurn('开场。', [planCall()]),
+      scriptedTurn('自动回合。', [planCall('call_2')]),
     ])
     await h.host.start({
       packId: 'demo',
@@ -1036,7 +1226,10 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
   })
 
   it('adds the single-call narration protocol and the opening scene instruction', async () => {
-    const h = await createHarness([scriptedTurn('第一句。'), scriptedTurn('第二句。')])
+    const h = await createHarness([
+      scriptedTurn('第一句。', [planCall()]),
+      scriptedTurn('第二句。', [planCall('call_2')]),
+    ])
     await h.host.start({ packId: 'demo', plannedMinutes: 30 })
 
     const opening = h.runner.requests[0]?.messages.find(message => message.role === 'system')?.content ?? ''
@@ -1044,6 +1237,11 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
     expect(opening).toContain('narration')
     expect(opening).toContain('开场回合')
     expect(opening).toContain('不要调用它们')
+    // The player's own part names are the only legal regions (whole-body is
+    // the wildcard), and a prose-only turn is called out as producing nothing.
+    expect(opening).toContain('已就位部位')
+    expect(opening).toContain('不要使用没有出现在「已就位部位」里的内容包 id')
+    expect(opening).toContain('只写正文')
     const applyPlan = h.runner.requests[0]?.tools.find(tool => tool.name === 'apply_plan')
     const properties = (applyPlan?.parameters as { properties: Record<string, unknown> }).properties
     expect(properties).toHaveProperty('narration')
@@ -1060,22 +1258,339 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
   it('adds player-named parts to the session vocabulary', async () => {
     const h = await createHarness([scriptedTurn('好。', [planCall()])], await narrativePack())
     // v6: the player may name a part freely; it becomes a region key the model
-    // can target, alongside the pack's recommendations.
+    // can target. Since v10 the prompt offers *only* reachable parts, so the
+    // pack's other recommendations (no channel behind them) leave the menu.
     await h.host.setRegion('mock-pulse', 'b', '左胸')
     await h.host.start({ packId: 'narrative', plannedMinutes: 30 })
 
     const system = h.runner.requests[0]?.messages.find(message => message.role === 'system')?.content ?? ''
-    expect(system).toContain('hands=手')
     expect(system).toContain('左胸=左胸')
     expect(system).toContain('已就位部位：左胸')
+    // The pack vocabulary is not offered as a substitute for the player's part.
+    expect(system).not.toContain('hands=手')
+    expect(system).not.toContain('shoulders=肩背')
 
     const applyPlan = h.runner.requests[0]?.tools.find(tool => tool.name === 'apply_plan')
     const beat = (applyPlan!.parameters as {
       properties: { beats: { items: { properties: { regions: { items: { enum: readonly string[] } } } } } }
     }).properties.beats.items.properties
-    expect(beat.regions.items.enum).toEqual(['whole-body', 'hands', 'shoulders', '左胸'])
+    expect(beat.regions.items.enum).toEqual(['whole-body', '左胸'])
 
     await h.host.end('stop')
+  })
+})
+
+// ── Audit regressions: packed waveforms, player parts, real effect rows ────
+
+/** The `apply_plan` region enum the model is actually offered this turn. */
+function regionsEnumOf(request: ModelTurnRequest): readonly string[] {
+  const applyPlan = request.tools.find(tool => tool.name === 'apply_plan')
+  const beat = (applyPlan!.parameters as {
+    properties: { beats: { items: { properties: { regions: { items: { enum: readonly string[] } } } } } }
+  }).properties.beats.items.properties
+  return beat.regions.items.enum
+}
+
+describe('packed waveforms, player parts and true effect rows (audit fixes)', () => {
+  /** The pulse pair that can actually play a waveform (Coyote-like). */
+  const waveformChannels: readonly Channel[] = [
+    { id: 'a', kind: 'level', label: 'A 通道', supportsWaveform: true },
+    { id: 'b', kind: 'level', label: 'B 通道', supportsWaveform: true },
+  ]
+
+  it('registers pack waveforms so a packed id survives dispatch', async () => {
+    const h = await createHarness(
+      [
+        // The audit's model used the bare asset id (`saw-spin`).
+        scriptedTurn('（细密的电流贴着皮肤散开。）', [waveformPlanCall('saw-spin')]),
+        // The waveform menu advertises the namespaced id; both must work.
+        scriptedTurn('（纹理换了方向。）', [waveformPlanCall('tentacle:saw-spin', 'call_wave_2')]),
+      ],
+      await tentaclePack(),
+      { channels: waveformChannels },
+    )
+
+    const started = await h.host.start({ packId: 'tentacle', plannedMinutes: 30 })
+    expect(started.state).toBe('idle')
+    // The registry dispatches through its own WaveformLibrary, not the
+    // executor's pack-aware lookup; the asset must be in the session scratch
+    // there, or dispatch rejects with `UNKNOWN_WAVEFORM` (the audit's turn
+    // 1/2/4). PlaySession.start registers every pack waveform.
+    expect(h.env.waveforms.get('tentacle:saw-spin')?.name).toBe('回旋锯齿')
+
+    // No ready channel carries a label here. The menu must NOT fall back to the
+    // pack's recommended ids: the resolver cannot match them, so they only
+    // produce the "drive every channel" fallback and the audit's 文不对部位
+    // symptom. The only legal target is the wildcard, which still drives all
+    // channels.
+    const request = h.runner.requests[0]!
+    const system = request.messages.find(message => message.role === 'system')?.content ?? ''
+    expect(system).toContain('可用部位：whole-body=全身（作用于全部通道）')
+    expect(system).toContain('已就位部位：无')
+    expect(system).not.toContain('inner-thigh=')
+    expect(regionsEnumOf(request)).toEqual(['whole-body'])
+
+    const opening = h.host.transcript()[0]!
+    expect(opening.text).toContain('细密')
+    // One whole-body beat over two channels is two rows: the dedupe key
+    // includes device+channel, so different parts are never merged.
+    expect(opening.effects).toHaveLength(2)
+    expect(opening.effects.map(effect => effect.channelId)).toEqual(['a', 'b'])
+    for (const effect of opening.effects) {
+      expect(effect).toMatchObject({
+        deviceId: 'mock-pulse',
+        status: 'dispatched',
+        waveformId: 'tentacle:saw-spin',
+        waveformName: '回旋锯齿',
+        percent: expect.any(Number),
+      })
+    }
+    expect(planActions(h.records()).every(action => action.status !== 'rejected')).toBe(true)
+    expect(h.records().some(record => record.action === 'run_pattern' && record.result === 'rejected'))
+      .toBe(false)
+
+    // The namespaced id the prompt's waveform menu advertises works too.
+    await h.host.message('继续。')
+    const second = h.host.transcript()[1]!
+    expect(second.effects.map(effect => effect.waveformId))
+      .toEqual(['tentacle:saw-spin', 'tentacle:saw-spin'])
+    const patternWrites = h.records().filter(record => record.action === 'run_pattern')
+    expect(patternWrites.length).toBeGreaterThan(0)
+    expect(patternWrites.every(record => record.result === 'ok')).toBe(true)
+
+    await h.host.end('stop')
+    // Session scratch is per session: disposing it discards the pack assets.
+    h.host.dispose()
+    expect(h.env.waveforms.get('tentacle:saw-spin')).toBeUndefined()
+  })
+
+  it('keeps human session waveforms across start and a session boundary', async () => {
+    const h = await createHarness([scriptedTurn('好。', [planCall()])])
+    // The device page imports waveforms into the session scratch before 开局
+    // (a human path, not a pack asset). `start` must not wipe them, and
+    // `dispose` may only remove the pack assets this session registered.
+    const imported = h.env.waveforms.importFrames('人类导入波', ['0A0A0A0A50505050'])
+    expect(h.env.waveforms.get(imported.id)?.name).toBe('人类导入波')
+
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    expect(h.env.waveforms.get(imported.id)?.name).toBe('人类导入波')
+
+    await h.host.end('stop')
+    h.host.dispose()
+    // The freeform pack registered no asset, so dispose removes nothing; the
+    // human import lives until host shutdown clears the scratch by design.
+    expect(h.env.waveforms.get(imported.id)?.name).toBe('人类导入波')
+  })
+
+  it('keeps a human waveform when the next start disposes the old session', async () => {
+    const h = await createHarness([
+      scriptedTurn('第一局。', [planCall()]),
+      scriptedTurn('第二局。', [planCall('call_2')]),
+    ])
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    // Imported while the old session exists: 结束 then 开局 disposes the old
+    // session, and that cleanup must not delete the human waveform (P1-4R).
+    const imported = h.env.waveforms.importFrames('局中导入', ['0A0A0A0A50505050'])
+    await h.host.end('stop')
+
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    expect(h.env.waveforms.get(imported.id)?.name).toBe('局中导入')
+    await h.host.end('stop')
+    h.host.dispose()
+  })
+
+  it('routes a pack region id through the player label and reports that label', async () => {
+    const h = await createHarness(
+      [scriptedTurn('（指腹压在那处。）', [regionPlanCall('inner-thigh')])],
+      await tentaclePack(),
+    )
+    // Exactly the words in the audit's state/regions.json.
+    await h.host.setRegion('mock-pulse', 'a', '阴蒂')
+    await h.host.setRegion('mock-pulse', 'b', '小穴')
+    await h.host.start({ packId: 'tentacle', plannedMinutes: 30 })
+
+    const opening = h.host.transcript()[0]!
+    expect(opening.effects).toHaveLength(1)
+    expect(opening.effects[0]).toMatchObject({
+      deviceId: 'mock-pulse',
+      channelId: 'a',
+      region: '阴蒂',
+      regionLabel: '阴蒂',
+      // 20 % relative through the channel's default 0-20 interval: the safety
+      // mapping is unchanged, only the *route* is new.
+      percent: 4,
+      status: 'dispatched',
+    })
+    // The action really landed on the aliased channel; the "every online
+    // channel" fallback would have driven b too and marked it degraded.
+    const actions = planActions(h.records())
+    expect(actions).toHaveLength(1)
+    expect(actions[0]).toMatchObject({ channelId: 'a', status: 'dispatched' })
+    const resolved = h.records().find(record => record.action === 'plan_resolved')
+    expect((resolved?.detail as { readonly warnings?: readonly string[] } | undefined)?.warnings?.join('\n') ?? '')
+      .not.toContain('falling back')
+  })
+
+  it('offers only player-named parts that a ready channel can reach', async () => {
+    const h = await createHarness(
+      [scriptedTurn('（试探。）', [regionPlanCall('whole-body')])],
+      await tentaclePack(),
+    )
+    await h.host.setRegion('mock-pulse', 'a', '阴蒂')
+    await h.host.setRegion('mock-pulse', 'b', '乳房')
+    await h.host.start({ packId: 'tentacle', plannedMinutes: 30 })
+
+    const request = h.runner.requests[0]!
+    const system = request.messages.find(message => message.role === 'system')?.content ?? ''
+    expect(system).toContain('可用部位')
+    expect(system).toContain('whole-body=全身')
+    expect(system).toContain('已就位部位：阴蒂、乳房')
+    // The pack's recommended ids are not a substitute for the player's words.
+    expect(system).not.toContain('inner-thigh=')
+    expect(system).not.toContain('waist=')
+    expect(regionsEnumOf(request)).toEqual(['whole-body', '阴蒂', '乳房'])
+  })
+
+  it('keeps fallback dispatch rows in the effect box, deduplicated', async () => {
+    const h = await createHarness(
+      [scriptedTurn('（动作落到没有标注的地方。）', [fallbackPlanCall()])],
+      await tentaclePack(),
+    )
+    await h.host.setRegion('mock-pulse', 'a', '小穴')
+    await h.host.setRegion('mock-pulse', 'b', '后穴')
+    await h.host.start({ packId: 'tentacle', plannedMinutes: 30 })
+
+    // `waist` has no channel and no alias, so the resolver falls back to both
+    // ready channels and marks each command `no-region-match`. v9 filtered
+    // exactly these successful dispatches out of the effect box.
+    const effects = h.host.transcript()[0]!.effects
+    expect(effects.map(effect => effect.channelId)).toEqual(['a', 'b'])
+    expect(effects.map(effect => effect.regionLabel)).toEqual(['小穴', '后穴'])
+    expect(effects.every(effect => effect.status === 'degraded')).toBe(true)
+    // Two beats drove the same two channels with the same effect: four
+    // dispatched actions, two effect rows.
+    expect(planActions(h.records())).toHaveLength(4)
+  })
+
+  it('rotates round-robin intents across turns', async () => {
+    const h = await createHarness(
+      [
+        scriptedTurn('（第一拍。）', [rotationPlanCall('call_1')]),
+        scriptedTurn('（第二拍。）', [rotationPlanCall('call_2')]),
+      ],
+      await tentaclePack(),
+    )
+    // The rig is unlabelled: whole-body is the only legal region and both
+    // ready channels match it, so the intent's round-robin distribution picks
+    // exactly one channel per turn.
+    await h.host.start({ packId: 'tentacle', plannedMinutes: 30 })
+    const first = h.host.transcript()[0]!
+    expect(first.effects).toHaveLength(1)
+
+    await h.host.message('继续。')
+    const second = h.host.transcript()[1]!
+    expect(second.effects).toHaveLength(1)
+
+    // Per-turn rotation: the same plan lands on the other ready channel next
+    // turn instead of pinning `a` forever (roundRobinCursor was never supplied
+    // by the host before, so production never rotated).
+    expect(first.effects[0]).toMatchObject({ deviceId: 'mock-pulse', channelId: 'a' })
+    expect(second.effects[0]).toMatchObject({ deviceId: 'mock-pulse', channelId: 'b' })
+  })
+
+  it('advances one rotation step for a plan with two round-robin beats', async () => {
+    const h = await createHarness(
+      [
+        scriptedTurn('（第一拍。）', [doubleRotationPlanCall('call_1')]),
+        scriptedTurn('（第二拍。）', [doubleRotationPlanCall('call_2')]),
+      ],
+      await tentaclePack(),
+    )
+    await h.host.start({ packId: 'tentacle', plannedMinutes: 30 })
+    // Both beats of one plan share the turn's cursor: turn 1 = a+a, not a+b.
+    expect(planActions(h.records()).map(action => action.channelId)).toEqual(['a', 'a'])
+
+    await h.host.message('继续。')
+    // The turn advances the cursor by exactly one (not by the beat count):
+    // turn 2 = b+b. With +2 per turn an even pool would stay on `a` forever.
+    expect(planActions(h.records()).slice(2).map(action => action.channelId)).toEqual(['b', 'b'])
+  })
+
+  it('does not jump channels when a no-plan turn is interleaved', async () => {
+    const h = await createHarness(
+      [
+        scriptedTurn('（第一拍。）', [rotationPlanCall('call_1')]),
+        // Both attempts omit apply_plan: the turn settles with no plan and no
+        // dispatch, so it must not consume a rotation slot.
+        scriptedTurn('（沉默。）'),
+        scriptedTurn('（还是没有计划。）'),
+        scriptedTurn('（第三拍。）', [rotationPlanCall('call_3')]),
+      ],
+      await tentaclePack(),
+    )
+    await h.host.start({ packId: 'tentacle', plannedMinutes: 30 })
+    expect(h.host.transcript()[0]!.effects[0]).toMatchObject({ channelId: 'a' })
+
+    await h.host.message('继续。')
+    const noPlan = h.host.transcript()[1]!
+    expect(noPlan.effects).toHaveLength(0)
+
+    await h.host.message('继续。')
+    const third = h.host.transcript()[2]!
+    // Strict alternation across round-robin turns: a → (no plan) → b. The
+    // no-plan turn must not move the cursor back onto `a`.
+    expect(third.effects[0]).toMatchObject({ channelId: 'b' })
+  })
+
+  it('corrects a prose-only reply until apply_plan is dispatched', async () => {
+    const h = await createHarness(
+      [
+        scriptedTurn('（他写了正文，但没有给动作。）'),
+        scriptedTurn('（这一次动作真的落下去。）', [regionPlanCall('whole-body')]),
+      ],
+      await tentaclePack(),
+    )
+    await h.host.setRegion('mock-pulse', 'a', '小穴')
+    await h.host.start({ packId: 'tentacle', plannedMinutes: 30 })
+
+    // One settled turn, two model requests: the second is the correction.
+    expect(h.runner.requests).toHaveLength(2)
+    const first = h.runner.requests[0]!
+    const retry = h.runner.requests[1]!
+    expect(retry.messages.length).toBeGreaterThan(first.messages.length)
+    const correction = retry.messages.at(-1)
+    expect(correction?.role).toBe('user')
+    expect(correction?.content).toContain('apply_plan')
+    // The retry's line and plan are the turn's results: prose-only turns no
+    // longer settle with nothing on the hardware.
+    expect(h.host.snapshot()?.state).toBe('idle')
+    expect(h.host.transcript()).toHaveLength(1)
+    expect(h.host.transcript()[0]!.text).toContain('动作真的落下去')
+    expect(h.host.transcript()[0]!.effects.length).toBeGreaterThan(0)
+    expect(planActions(h.records()).some(action => action.status === 'dispatched')).toBe(true)
+  })
+
+  it('keeps the effect box when a plan dispatched but the write failed', async () => {
+    const h = await createHarness(
+      // Tool-call providers can return a plan with neither `content` nor
+      // `narration`: the write fails while the actions are authorised.
+      [scriptedTurn('', [regionPlanCall('whole-body')])],
+      await tentaclePack(),
+    )
+    await h.host.start({ packId: 'tentacle', plannedMinutes: 30 })
+
+    // §3 of the writer contract: a failed write settles with the template line
+    // and the actions still run. The transcript must therefore keep the turn
+    // (and its effect box) instead of silently dropping it.
+    const entries = h.host.transcript()
+    expect(entries).toHaveLength(1)
+    expect(entries[0]!.text).toBe('（短暂停顿）')
+    expect(entries[0]!.effects.length).toBeGreaterThan(0)
+    expect(entries[0]!.effects.every(effect => effect.status !== 'rejected')).toBe(true)
+    // The player-visible snapshot shows the same placeholder, and the host did
+    // not invent a `plan_fallback` audit line for a turn that really executed.
+    expect(h.host.snapshot()?.lastLine).toBe('（短暂停顿）')
+    expect(h.records().some(record => record.action === 'plan_fallback')).toBe(false)
   })
 })
 
@@ -1085,7 +1600,7 @@ describe('session controls (B2-T11)', () => {
   it('pauses only after the current turn settles and stops every effect', async () => {
     const h = await createHarness([
       scriptedTurn('第一句。', [planCall()]),
-      scriptedTurn('第二句。'),
+      scriptedTurn('第二句。', [planCall('call_2')]),
     ])
     await h.host.start({ packId: 'demo', plannedMinutes: 30 })
     expect(h.runner.requests).toHaveLength(1)
@@ -1158,7 +1673,7 @@ describe('session controls (B2-T11)', () => {
   it('opens a new turn when an offered choice is picked', async () => {
     const h = await createHarness([
       scriptedTurn('第一句。', [choicePlanCall()]),
-      scriptedTurn('第二句。'),
+      scriptedTurn('第二句。', [planCall('call_2')]),
     ])
     const started = await h.host.start({ packId: 'demo', plannedMinutes: 30 })
     expect(started.choices).toEqual([{ id: 'c1', label: '退开', tag: 'resist' }])
@@ -1180,7 +1695,7 @@ describe('session controls (B2-T11)', () => {
   it('keeps the opening and later lines in the transcript', async () => {
     const h = await createHarness([
       scriptedTurn('第一句。', [planCall()]),
-      scriptedTurn('第二句。'),
+      scriptedTurn('第二句。', [planCall('call_2')]),
     ])
     await h.host.start({ packId: 'demo', plannedMinutes: 30 })
 
@@ -1203,7 +1718,7 @@ describe('session controls (B2-T11)', () => {
   })
 
   it('rejects a second session start while the first is still starting', async () => {
-    const h = await createHarness([scriptedTurn('第一句。')])
+    const h = await createHarness([scriptedTurn('第一句。', [planCall()])])
 
     const results = await Promise.allSettled([
       h.host.start({ packId: 'demo', plannedMinutes: 30 }),
@@ -1222,7 +1737,7 @@ describe('session controls (B2-T11)', () => {
   })
 
   it('rejects a concurrent PlaySession.start before the opening turn settles', async () => {
-    const h = await createHarness([scriptedTurn('第一句。')])
+    const h = await createHarness([scriptedTurn('第一句。', [planCall()])])
     const pack = await freeformPack()
 
     const results = await Promise.allSettled([
@@ -1295,7 +1810,7 @@ describe('narrative-only session with no sensors and no devices (F-6)', () => {
       sensors: new SensorRegistry({ clock }),
       runner: new ScriptedRunner([
         { text: '（风声）', toolCalls: [planCall()], finishReason: 'tool-calls' },
-        { text: '……', toolCalls: [], finishReason: 'stop' },
+        { text: '……', toolCalls: [planCall('call_2')], finishReason: 'tool-calls' },
       ]),
       savePolicy: async (): Promise<void> => {},
     }

@@ -85,9 +85,25 @@ export interface ResolveContext {
   readonly snapshot: ResolveRegistrySnapshot
   readonly intents: ReadonlyMap<string, FeedbackIntent>
   readonly regions: readonly string[]
+  /**
+   * Optional expansion from a plan's region id to the player's channel names.
+   *
+   * A content pack names body parts in its own vocabulary (`inner-thigh`),
+   * while the human may label the matching channel with a different word
+   * (`阴蒂`). Matching only on `channel.region === region` then finds nothing
+   * and falls back to *every* online channel, driving unrelated parts and
+   * marking the command `no-region-match` (play-session audit). The host
+   * builds the map per turn; the resolver only reads it, so it stays pure.
+   */
+  readonly regionAliases?: ReadonlyMap<string, readonly string[]>
   /** Used only to answer "does this waveform id exist". */
   readonly waveforms: WaveformLookup
-  /** Held by the engine; the resolver never increments it. */
+  /**
+   * Rotation seed for the `round-robin` distribution.
+   *
+   * Supplied by the caller (today: the play host, once per turn) and treated as
+   * read-only here: the resolver is a pure function and never increments it.
+   */
   readonly roundRobinCursor?: number
 }
 
@@ -240,7 +256,7 @@ function collectMatches(beat: Beat, ctx: ResolveContext, warnings: string[]): Ch
     for (const device of ctx.snapshot.devices) {
       for (const channel of device.channels) {
         if (channel.kind !== 'level') continue
-        if (!channelMatchesRegion(channel, region)) continue
+        if (!channelMatchesRegion(channel, region, ctx)) continue
         const key = matchKey(device.id, channel.id)
         if (seen.has(key)) continue
         seen.add(key)
@@ -248,7 +264,7 @@ function collectMatches(beat: Beat, ctx: ResolveContext, warnings: string[]): Ch
       }
     }
   }
-  if (matches.length > 0) return sortMatches(matches)
+  if (matches.length > 0) return sortMatches(matches, true)
 
   // §4.4 step 2 / `内容包规范.md` §8 S15 ③: nothing maps to the requested
   // region, so fall back to every online level channel and mark the command.
@@ -266,9 +282,25 @@ function collectMatches(beat: Beat, ctx: ResolveContext, warnings: string[]): Ch
   return sortMatches(fallback)
 }
 
-function channelMatchesRegion(channel: ResolveChannelSnapshot, region: string): boolean {
+/**
+ * Does one channel serve the requested region?
+ *
+ * Direct equality comes first: a player-named region is its own id and needs
+ * no alias. Host-provided aliases then bridge the pack's vocabulary onto the
+ * player's words. Explicit `beats[].targets` never reach this function — a
+ * script that names devices bypasses region expansion entirely.
+ */
+function channelMatchesRegion(
+  channel: ResolveChannelSnapshot,
+  region: string,
+  ctx: ResolveContext,
+): boolean {
   if (region === WHOLE_BODY_REGION) return true
-  return channel.region === region
+  if (channel.region === region) return true
+  const aliases = ctx.regionAliases
+  if (aliases === undefined || channel.region === undefined) return false
+  const names = aliases.get(region)
+  return names !== undefined && names.includes(channel.region)
 }
 
 /**
@@ -292,21 +324,49 @@ function selectMatches(
   }
   if (distribution === 'round-robin') {
     if (matches.length === 0) return []
+    // Rotate over deliverable channels when any exist: a cursor landing on an
+    // offline duplicate of the same region must not silence a turn that
+    // another device could play (P1-2's round-robin variant). All-offline
+    // matches keep the old path and end up narrative-only.
+    const ready = matches.filter(match => match.device.lifecycle === 'ready')
+    const pool = ready.length > 0 ? ready : matches
     const cursor = ctx.roundRobinCursor
     const raw = cursor === undefined || !Number.isFinite(cursor) ? 0 : Math.trunc(cursor)
-    const index = ((raw % matches.length) + matches.length) % matches.length
-    const chosen = matches[index]
+    const index = ((raw % pool.length) + pool.length) % pool.length
+    const chosen = pool[index]
     return chosen === undefined ? [] : [chosen]
   }
   return matches
 }
 
-function sortMatches(matches: ChannelMatch[]): ChannelMatch[] {
+/**
+ * Deterministic order for a beat's matches.
+ *
+ * Region expansion passes `readyFirst`: a registered but not-ready device
+ * still matches the region, and {@link buildCommand} will drop it. If it
+ * sorted ahead of a deliverable channel, `primary` would spend the beat's one
+ * slot on a device that cannot run, leaving the whole beat silent even though
+ * a ready channel serves the same region (adversarial review P1-2). Lifecycle
+ * therefore ranks first, while the long-standing device/channel-id order is
+ * kept inside each group so the resolved JSON stays byte-stable. Explicit
+ * `beats[].targets` and the all-online fallback keep the original id-only
+ * order (their semantics must not change).
+ */
+function sortMatches(matches: ChannelMatch[], readyFirst = false): ChannelMatch[] {
   return matches.sort((left, right) => {
+    if (readyFirst) {
+      const byReady = readyRank(left) - readyRank(right)
+      if (byReady !== 0) return byReady
+    }
     const byDevice = compareStrings(left.device.id, right.device.id)
     if (byDevice !== 0) return byDevice
     return compareStrings(left.channel.id, right.channel.id)
   })
+}
+
+/** 0 for a deliverable device, 1 for everything else (stable partition key). */
+function readyRank(match: ChannelMatch): number {
+  return match.device.lifecycle === 'ready' ? 0 : 1
 }
 
 /* ------------------------------------------------------------------------- */
@@ -561,27 +621,35 @@ function envelopeDefaults(preset: EnvelopePreset): EnvelopeDefaults | undefined 
 /**
  * §4.4 step 7: a missing waveform degrades to a plain pattern; a channel that
  * cannot play one does too. Never throws.
+ *
+ * The returned id is the **resolved waveform's canonical id**, not the request
+ * reference. The lookup accepts pack-relative references (`tentacle-crawl`),
+ * `builtin:` refs and fully namespaced ids, but dispatch goes to the registry,
+ * whose library is keyed by canonical ids (`tentacle-shadow:tentacle-crawl`,
+ * `tide`). Echoing the reference made every packed suggestion fail at dispatch
+ * with UNKNOWN_WAVEFORM after the model had already committed to the plan
+ * (play-session audit).
  */
 function resolveWaveform(
-  waveformId: string | undefined,
+  reference: string | undefined,
   channel: ResolveChannelSnapshot,
   ctx: ResolveContext,
   beatId: string,
   warnings: string[],
 ): { waveformId?: string; degraded: ResolvedCommand['degraded'] } {
-  if (waveformId === undefined) return { degraded: undefined }
-  const waveform = ctx.waveforms.get(waveformId)
+  if (reference === undefined) return { degraded: undefined }
+  const waveform = ctx.waveforms.get(reference)
   if (waveform === undefined) {
-    warnings.push(`beat ${beatId}: waveform "${waveformId}" was not found; falling back to a plain pattern`)
+    warnings.push(`beat ${beatId}: waveform "${reference}" was not found; falling back to a plain pattern`)
     return { degraded: 'unknown-waveform' }
   }
   if (channel.supportsWaveform !== true) {
     warnings.push(
-      `beat ${beatId}: ${channel.id} cannot play waveform "${waveformId}"; falling back to a plain pattern`,
+      `beat ${beatId}: ${channel.id} cannot play waveform "${reference}"; falling back to a plain pattern`,
     )
     return { degraded: 'unsupported-waveform' }
   }
-  return { waveformId, degraded: undefined }
+  return { waveformId: waveform.id, degraded: undefined }
 }
 
 /* ------------------------------------------------------------------------- */

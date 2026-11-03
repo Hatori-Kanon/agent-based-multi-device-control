@@ -27,6 +27,21 @@ function waveform(frames: readonly PulseFrame[], loop = true): Waveform {
   return { id: 'test', name: 'test', frames, loop, source: 'authored', tags: [] }
 }
 
+/** A pack-shaped waveform with an explicit canonical id (e.g. `pack:wave`). */
+function waveformWithId(id: string, name = id): Waveform {
+  return {
+    id,
+    name,
+    frames: [
+      { freq: [10, 10, 10, 10], intensity: [0, 0, 0, 0] },
+      { freq: [10, 10, 10, 10], intensity: [80, 80, 80, 80] },
+    ],
+    loop: true,
+    source: 'imported',
+    tags: ['pack'],
+  }
+}
+
 async function safetyError(run: () => unknown): Promise<SafetyError> {
   let caught: unknown
   try {
@@ -338,6 +353,87 @@ describe('WaveformLibrary', () => {
     expect(imported.source).toBe('imported')
     expect(library.scopeOf(imported.id)).toBe('session')
     expect(imported.frames).toHaveLength(2)
+  })
+
+  it('installs host-provided pack waveforms so dispatch can require them', () => {
+    const library = new WaveformLibrary()
+    const packed = waveformWithId('tentacle-shadow:tentacle-crawl', '触手爬行')
+    library.addSessionWaveform(packed)
+
+    // The executor hands the plan's canonical id to the registry, whose
+    // `setWaveform` calls `require`; before this seam a packed waveform only
+    // existed in the pack adapter and the whole action was rejected with
+    // UNKNOWN_WAVEFORM (play-session audit).
+    expect(library.require(packed.id)).toBe(packed)
+    expect(library.scopeOf(packed.id)).toBe('session')
+    expect(library.list().find(entry => entry.id === packed.id)).toMatchObject({
+      scope: 'session',
+      source: 'imported',
+      name: '触手爬行',
+    })
+    // Host-registered pack material is session scratch, never durable state.
+    expect(library.exportLibrary()).toEqual([])
+  })
+
+  it('replaces a host waveform by id instead of allocating a session suffix', () => {
+    const library = new WaveformLibrary()
+    const before = library.list().length
+    library.addSessionWaveform(waveformWithId('pack:wave', '第一次'))
+    library.addSessionWaveform(waveformWithId('pack:wave', '第二次'))
+
+    expect(library.require('pack:wave').name).toBe('第二次')
+    expect(library.list().length).toBe(before + 1)
+    expect(library.list().filter(entry => entry.id === 'pack:wave')).toHaveLength(1)
+  })
+
+  it('removes exactly one host-registered session waveform', () => {
+    const library = new WaveformLibrary()
+    library.addSessionWaveform(waveformWithId('pack:a'))
+    library.addSessionWaveform(waveformWithId('pack:b'))
+
+    expect(library.removeSessionWaveform('pack:a')).toBe(true)
+    expect(library.get('pack:a')).toBeUndefined()
+    // Only the named host asset goes; the rest of the pack stays dispatchable.
+    expect(library.require('pack:b').id).toBe('pack:b')
+
+    // Session teardown calls this only with the ids it installed; removing the
+    // same id twice, an unknown id, or a durable builtin is a no-op and never
+    // touches human/agent scratch or the durable library.
+    expect(library.removeSessionWaveform('pack:a')).toBe(false)
+    expect(library.removeSessionWaveform('absent')).toBe(false)
+    expect(library.removeSessionWaveform('tide')).toBe(false)
+    expect(library.require('tide').id).toBe('tide')
+  })
+
+  it('does not cap host-registered pack waveforms, and they do not consume the agent budget', async () => {
+    const library = new WaveformLibrary()
+    // A content pack is validated on its own terms and may legally ship more
+    // than the agent scratch cap; failing the whole session start over that
+    // count was P1-3. The host path is trusted and unbounded.
+    const packedCount = MAX_SESSION_WAVEFORMS + 8
+    for (let index = 0; index < packedCount; index += 1) {
+      library.addSessionWaveform(waveformWithId(`pack:wave-${index}`))
+    }
+    expect(library.list().filter(entry => entry.scope === 'session')).toHaveLength(packedCount)
+    expect(library.require(`pack:wave-${packedCount - 1}`)).toBeDefined()
+
+    // P2-N1: host pack assets share scratch but must not eat the 64 slots the
+    // agent/human paths share, so a human import still fits after 72 of them.
+    const imported = library.importFrames('human waveform', ['0A0A0A0A00000000'])
+    expect(library.scopeOf(imported.id)).toBe('session')
+
+    // 1 import + 63 authored = the agent/human budget; the next one fails.
+    for (let index = 1; index < MAX_SESSION_WAVEFORMS; index += 1) {
+      library.author({ name: `agent-${index}`, segments: [{ ms: 100, freq: 20, intensity: 30 }] })
+    }
+    const error = await safetyError(() => library.author({
+      name: 'one too many',
+      segments: [{ ms: 100, freq: 20, intensity: 30 }],
+    }))
+    expect(error.code).toBe('INVALID_WAVEFORM')
+    expect(error.message).toContain(String(MAX_SESSION_WAVEFORMS))
+    // The cap only governs agent/human scratch; host material is untouched.
+    expect(library.require('pack:wave-0')).toBeDefined()
   })
 
   it('round-trips durable non-builtin waveforms for persistence', () => {

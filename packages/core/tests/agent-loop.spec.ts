@@ -132,6 +132,206 @@ describe('runTurn (single-call turn)', () => {
     expect(result.warnings.some(warning => warning.includes('empty model reply'))).toBe(true)
   })
 
+  it('retries a prose-only reply once and adopts the plan from the correction', async () => {
+    const { calls, executor } = recordingExecutor()
+    const firstLine = '他只是看着你，没有碰你。'
+    const retryNarration = '（指尖压上胸口，慢慢收紧。）……'
+    const requests: ModelTurnRequest[] = []
+    const runner: ModelRunner = {
+      async run(request) {
+        requests.push(request)
+        if (requests.length === 1) {
+          // Prose without a plan drives no device: the exact shape the play
+          // audit identified as "director did nothing" turns.
+          emitText(request, [firstLine])
+          return textTurn([firstLine])
+        }
+        const call: ToolCall = {
+          id: 'call_after_prose',
+          name: 'apply_plan',
+          arguments: { ...PLAN_ARGS, narration: retryNarration },
+        }
+        request.onToolCall?.(call)
+        return { text: '', toolCalls: [call], finishReason: 'tool-calls' }
+      },
+    }
+
+    const result = await runTurn({
+      runner,
+      tools: M2_MODEL_TOOLS,
+      executor,
+      input: inputFixture(),
+      clock: new FakeClock(),
+    })
+
+    expect(requests).toHaveLength(2)
+    const retryMessages = requests[1]?.messages ?? []
+    // The correction names the missing tool and carries the failed reply back
+    // as the assistant turn, so the model can move that prose into narration.
+    expect(retryMessages.at(-1)).toMatchObject({ role: 'user' })
+    expect(retryMessages.at(-1)?.content ?? '').toContain('apply_plan')
+    expect(retryMessages.at(-2)).toMatchObject({ role: 'assistant', content: firstLine })
+    expect(calls).toHaveLength(1)
+    expect(result.plan?.beats.map(beat => beat.id)).toEqual(['b1'])
+    expect(result.line).toBe(retryNarration)
+    expect(result.line).not.toBe(firstLine)
+    expect(result.dispatch).toBeDefined()
+    expect(result.warnings.some(warning => warning.includes('prose-only'))).toBe(true)
+  })
+
+  it('keeps the first reply when the apply_plan retry still produces no prose', async () => {
+    const { calls, executor } = recordingExecutor()
+    const firstLine = '他只是看着你。'
+    const requests: ModelTurnRequest[] = []
+    const runner: ModelRunner = {
+      async run(request) {
+        requests.push(request)
+        if (requests.length === 1) {
+          emitText(request, [firstLine])
+          return textTurn([firstLine])
+        }
+        return { text: '', toolCalls: [], finishReason: 'stop' }
+      },
+    }
+
+    const result = await runTurn({
+      runner,
+      tools: M2_MODEL_TOOLS,
+      executor,
+      input: inputFixture(),
+      clock: new FakeClock(),
+    })
+
+    expect(requests).toHaveLength(2)
+    expect(calls).toHaveLength(0)
+    expect(result.plan).toBeUndefined()
+    // The retry reset the line first; with no replacement prose the first
+    // reply is the turn's line instead of a silent turn.
+    expect(result.line).toBe(firstLine)
+    expect(result.warnings.some(warning => warning.includes('kept the first reply'))).toBe(true)
+  })
+
+  it('keeps the first reply when the corrective retry fails in transport', async () => {
+    const { calls, executor } = recordingExecutor()
+    const firstLine = '他只是看着你。'
+    const requests: ModelTurnRequest[] = []
+    const runner: ModelRunner = {
+      async run(request) {
+        requests.push(request)
+        if (requests.length === 1) {
+          emitText(request, [firstLine])
+          return textTurn([firstLine])
+        }
+        // The correction is an extra request, not the turn's contract: a
+        // transport failure there must not regress a turn that used to work.
+        throw new ModelError('socket hang up', { code: 'network', retryable: true })
+      },
+    }
+
+    const result = await runTurn({
+      runner,
+      tools: M2_MODEL_TOOLS,
+      executor,
+      input: inputFixture(),
+      clock: new FakeClock(),
+    })
+
+    expect(requests).toHaveLength(2)
+    expect(calls).toHaveLength(0)
+    expect(result.plan).toBeUndefined()
+    expect(result.dispatch).toBeUndefined()
+    expect(result.line).toBe(firstLine)
+    expect(result.warnings.some(
+      warning => warning.includes('plan-required retry failed: socket hang up'),
+    )).toBe(true)
+  })
+
+  it('still rejects when the caller aborts during the corrective retry', async () => {
+    const caller = new AbortController()
+    const clock = new FakeClock()
+    const firstLine = '他只是看着你。'
+    let runs = 0
+    const runner: ModelRunner = {
+      async run(request) {
+        runs += 1
+        if (runs === 1) {
+          emitText(request, [firstLine])
+          return textTurn([firstLine])
+        }
+        // A cancelled retry is a control event, not a best-effort failure: the
+        // abort must win over the "keep the first line" fallback below.
+        caller.abort()
+        return new Promise<never>(() => {})
+      },
+    }
+    const { executor } = recordingExecutor()
+
+    const error = await failure(runTurn({
+      runner,
+      tools: M2_MODEL_TOOLS,
+      executor,
+      input: inputFixture(),
+      clock,
+      signal: caller.signal,
+    }))
+
+    expect((error as ModelError).code).toBe('aborted')
+    expect(runs).toBe(2)
+    expect(clock.pendingCount).toBe(0)
+  })
+
+  it('uses the retry prose when the retry also omits apply_plan', async () => {
+    const { calls, executor } = recordingExecutor()
+    const requests: ModelTurnRequest[] = []
+    const runner: ModelRunner = {
+      async run(request) {
+        requests.push(request)
+        const line = requests.length === 1 ? '第一段。' : '第二段。'
+        emitText(request, [line])
+        return textTurn([line])
+      },
+    }
+
+    const result = await runTurn({
+      runner,
+      tools: M2_MODEL_TOOLS,
+      executor,
+      input: inputFixture(),
+      clock: new FakeClock(),
+    })
+
+    expect(requests).toHaveLength(2)
+    expect(calls).toHaveLength(0)
+    expect(result.plan).toBeUndefined()
+    // Reset semantics: the corrected reply owns the line; the first one is
+    // only a fallback, never appended, so the player is not shown two scenes.
+    expect(result.line).toBe('第二段。')
+  })
+
+  it('does not ask again when the first reply already called apply_plan', async () => {
+    const { calls, executor } = recordingExecutor()
+    const requests: ModelTurnRequest[] = []
+    const runner: ModelRunner = {
+      async run(request) {
+        requests.push(request)
+        request.onToolCall?.(APPLY_PLAN_CALL)
+        return { text: '好。', toolCalls: [APPLY_PLAN_CALL], finishReason: 'tool-calls' }
+      },
+    }
+
+    const result = await runTurn({
+      runner,
+      tools: M2_MODEL_TOOLS,
+      executor,
+      input: inputFixture(),
+      clock: new FakeClock(),
+    })
+
+    expect(requests).toHaveLength(1)
+    expect(calls).toHaveLength(1)
+    expect(result.plan?.beats.map(beat => beat.id)).toEqual(['b1'])
+  })
+
   it('uses apply_plan.narration when the provider sends no content text', async () => {
     const { executor } = recordingExecutor()
     const narration = '（暗室的湿冷裹上来，触手从阴影里浮出。）咕啾~……'
@@ -256,8 +456,10 @@ describe('runTurn (single-call turn)', () => {
   it('emits a narrative-only turn when the model calls no tool', async () => {
     const clock = new FakeClock()
     const { calls, executor } = recordingExecutor()
+    const requests: ModelTurnRequest[] = []
     const runner: ModelRunner = {
       async run(request) {
+        requests.push(request)
         emitText(request, ['他只是', '看着你。'])
         return textTurn(['他只是', '看着你。'], { inputTokens: 12, outputTokens: 5 })
       },
@@ -271,12 +473,15 @@ describe('runTurn (single-call turn)', () => {
       clock,
     })
 
+    // A prose-only reply now gets one corrective request; when the correction
+    // is narrative-only too, the turn settles as a narrative-only turn.
+    expect(requests).toHaveLength(2)
     expect(calls).toHaveLength(0)
     expect(result.line).toBe('他只是看着你。')
     expect(result.plan).toBeUndefined()
     expect(result.dispatch).toBeUndefined()
     expect(result.dropped).toEqual([])
-    expect(result.warnings).toEqual([])
+    expect(result.warnings.some(warning => warning.includes('prose-only'))).toBe(true)
     expect(result.usage).toEqual({ inputTokens: 12, outputTokens: 5 })
     // The turn timer is cleaned up on the success path.
     expect(clock.pendingCount).toBe(0)
@@ -334,8 +539,9 @@ describe('runTurn (single-call turn)', () => {
       async run(request) {
         runs += 1
         if (runs === 1) throw new ModelError('socket hang up', { code: 'network', retryable: true })
+        request.onToolCall?.(APPLY_PLAN_CALL)
         emitText(request, ['好。'])
-        return textTurn(['好。'])
+        return { text: '好。', toolCalls: [APPLY_PLAN_CALL], finishReason: 'tool-calls' }
       },
     }
 
@@ -349,7 +555,8 @@ describe('runTurn (single-call turn)', () => {
 
     expect(runs).toBe(2)
     expect(result.line).toBe('好。')
-    expect(calls).toHaveLength(0)
+    expect(calls).toHaveLength(1)
+    expect(result.plan).toBeDefined()
     expect(result.warnings.some(warning => warning.includes('retried once'))).toBe(true)
   })
 
@@ -420,7 +627,8 @@ describe('runTurn (single-call turn)', () => {
     const runner: ModelRunner = {
       async run(request) {
         emitText(request, ['他', '靠近'])
-        return textTurn(['他', '靠近'])
+        request.onToolCall?.(APPLY_PLAN_CALL)
+        return { text: '他靠近', toolCalls: [APPLY_PLAN_CALL], finishReason: 'tool-calls' }
       },
     }
     const { executor } = recordingExecutor()

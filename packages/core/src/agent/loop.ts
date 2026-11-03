@@ -23,6 +23,16 @@
  *   remaining beats are dispatched, and the turn continues. A fully invalid
  *   plan becomes an empty plan → narrative-only dispatch.
  *
+ * A turn that settles without `apply_plan` is corrected **once** with a
+ * user-role reminder, whether it was empty or prose-only: prose without a plan
+ * drives no device, and the audit showed that shape was the common cause of
+ * silent turns. The corrective request is only sent while no plan was applied
+ * (so it can never double-drive), and the first reply's line is kept as the
+ * fallback when the correction still produces no prose. A failure of the
+ * correction itself is not a turn failure either: the first line survives with
+ * a warning — unless the caller aborted or the turn deadline hit, which keep
+ * their existing rejection semantics.
+ *
  * Per-turn tool limits: at most one `apply_plan` and one `look`; later calls are
  * ignored with a warning that the engine can audit. `look` has no in-request
  * side effect in the single-call MVP (its snapshot would arrive after the
@@ -68,6 +78,18 @@ const MAX_ATTEMPTS = 2
 /** Corrective user turn when the model answers with neither prose nor a plan. */
 const EMPTY_TURN_REMINDER = '你刚才的回复既没有正文，也没有调用 apply_plan。'
   + '单轮调用不会执行查询工具；现在请直接调用 apply_plan，并把给玩家看的完整正文写进 narration 字段。'
+
+/**
+ * Corrective user turn when the model narrates but never calls `apply_plan`.
+ *
+ * A prose-only reply is not a harmless turn: without the tool call the engine
+ * dispatches nothing, which is exactly the "导演没起作用" failure mode in the
+ * play-session audit. The correction repeats the single-call contract and
+ * points at the region vocabulary the resolver will actually accept.
+ */
+const PROSE_ONLY_REMINDER = '你刚才只写了正文，但没有调用 apply_plan，所以这一回合没有任何设备动作。'
+  + '现在必须调用 apply_plan 恰好一次：把给玩家看的完整正文写进 narration 字段（不要重复上一回合），'
+  + 'beats 的 regions 只能取「本回合可用」里已就位部位的名字。'
 
 /**
  * Everything `runTurn` needs that the engine already owns.
@@ -329,21 +351,57 @@ export async function runTurn(options: TurnLoopOptions): Promise<TurnResult> {
     consume(result)
     await settleDispatch()
 
-    // Some providers (or a model that decides to inspect devices first) answer
-    // with neither prose nor a plan. In the single-call MVP read-only tools have
-    // no follow-up request, so that would settle as a silent turn. Retry once
-    // with an explicit correction before giving up; effects are still untouched
-    // because `applied` is false and no dispatch started.
-    if (lineParts.length === 0 && plan === undefined && !applied
-      && !timedOut && !isAborted(callerSignal)) {
-      warnings.push('empty model reply retried with the narration reminder')
-      const retryRequest: ModelTurnRequest = {
-        ...request,
-        messages: [...input.messages, { role: 'user', content: EMPTY_TURN_REMINDER }],
+    // A turn that settles without `apply_plan` drives no device at all, even
+    // when it produced prose. The audit showed this was the common shape of
+    // "the director did nothing" turns, so a prose-only reply is corrected
+    // once too — not just a completely empty one. `applied` is still false and
+    // no dispatch started here, so the retry cannot double-drive the devices.
+    if (plan === undefined && !applied && !timedOut
+      && !isAborted(callerSignal) && !controller.signal.aborted) {
+      const firstLine = lineParts.join('')
+      const hadProse = firstLine.trim() !== ''
+      warnings.push(hadProse
+        ? 'prose-only reply retried with the apply_plan reminder'
+        : 'empty model reply retried with the narration reminder')
+      const correction = hadProse ? PROSE_ONLY_REMINDER : EMPTY_TURN_REMINDER
+      // Feed the first prose back as the assistant turn so the model can move
+      // that same narration into the tool call instead of inventing a new
+      // scene — and so the correction is about a reply it can see.
+      const retryMessages: LlmMessage[] = hadProse
+        ? [...input.messages, { role: 'assistant', content: firstLine }, { role: 'user', content: correction }]
+        : [...input.messages, { role: 'user', content: correction }]
+      // The retry owns the line from here; the first line is fallback only.
+      lineParts.length = 0
+      const retryRequest: ModelTurnRequest = { ...request, messages: retryMessages }
+      try {
+        const retry = await Promise.race([runner.run(retryRequest), abortRace])
+        consume(retry)
+        await settleDispatch()
+      } catch (error) {
+        // Cancellation and the turn deadline are control events, never a
+        // retry failure: they must keep their existing rejection semantics.
+        if (timedOut) throw timeoutError(timeoutMs)
+        if (isAborted(callerSignal) || controller.signal.aborted) throw abortedError()
+        // A plan that started dispatching during the failed retry is final
+        // (effects are not rolled back); follow the transport-failure policy
+        // and surface the error after the dispatch settles.
+        if (applied || pendingDispatch !== undefined) {
+          await settleDispatch()
+          throw error
+        }
+        if (!hadProse) throw error
+        // The correction is best-effort. Before this retry existed a prose-only
+        // turn succeeded, so a failed correction must not turn it into a
+        // failed turn: restore the first reply, record why no plan was made,
+        // and settle as a narrative-only success.
+        warnings.push(`plan-required retry failed: ${describeError(error)}`)
+        lineParts.length = 0
+        lineParts.push(firstLine)
       }
-      const retry = await Promise.race([runner.run(retryRequest), abortRace])
-      consume(retry)
-      await settleDispatch()
+      if (lineParts.length === 0 && hadProse) {
+        lineParts.push(firstLine)
+        warnings.push('the apply_plan retry produced no prose; kept the first reply')
+      }
     }
     // A late dispatch that resolves after the deadline must not be reported as
     // a successful turn.

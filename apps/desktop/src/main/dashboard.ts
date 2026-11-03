@@ -78,6 +78,11 @@ export interface PackImportSummary {
   readonly version: string
   /** 本次导入是否立即成为 active 版本。 */
   readonly active: boolean
+  /**
+   * 本次导入是否覆盖了已安装的同 id@version（同前缀、同名文件覆盖）。
+   * UI 用它把状态写成"已导入（覆盖）"，而不是假装首次安装。
+   */
+  readonly replaced: boolean
 }
 
 /** Compact waveform chart data (per-slot protocol values, not full frames). */
@@ -1277,6 +1282,7 @@ export class DashboardServer {
       }
       try {
         // 导入即激活：新装/升级后立即可玩；要保留旧版就用 activate 切回去。
+        // 同 id@version 重复导入是覆盖（同一前缀重写文件），不是 400。
         const pack = await this.options.deps.importPack(bytes)
         sendJson(response, 200, { pack, packs: await this.options.deps.listPacks() })
       } catch (error) {

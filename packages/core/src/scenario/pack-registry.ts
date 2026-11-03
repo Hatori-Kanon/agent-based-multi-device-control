@@ -11,10 +11,13 @@
  * 1. **Several versions of one id coexist, exactly one is active.** The active
  *    version is what the next session starts from (`内容包规范.md` §6.4: no
  *    hot-swapping mid-session).
- * 2. **Install is all-or-nothing.** The pack is fully validated through
- *    `loadPack` (which runs `validatePack`) *before* a single byte is written,
- *    and a failure while writing rolls the written files back. A broken archive
- *    never leaves a half-installed pack behind.
+ * 2. **Validation happens before any write.** The pack is fully validated
+ *    through `loadPack` (which runs `validatePack`) *before* a single byte is
+ *    written, and a failure while writing rolls back the files this call
+ *    created. Re-importing an installed `id@version` replaces it in place
+ *    instead of being rejected — the product rule is "解压到项目目录，同名文件
+ *    覆盖" — so a failed re-import cannot restore bytes it already overwrote;
+ *    see `PackRegistry.install` for the exact failure contract.
  * 3. **Uninstall only removes `content/packs/…` and the registry entry.** User
  *    saves (`state/…`, `memory/…`) are never touched — the port is rooted at
  *    `<dataDir>` precisely so that rule is structural rather than a convention.
@@ -96,7 +99,6 @@ export class MemoryPackStore implements PackStore {
 export type PackRegistryErrorCode =
   | 'not-found'
   | 'not-installed'
-  | 'already-installed'
   | 'invalid-argument'
   | 'invalid-registry'
   | 'no-active-version'
@@ -145,6 +147,13 @@ export interface InstallResult {
   readonly version: string
   /** True when this install became the active version. */
   readonly active: boolean
+  /**
+   * True when this install replaced an already-installed `id@version` (the
+   * archive was extracted over the existing `content/packs/<id>/<version>/`
+   * prefix). False for a first install. The host surfaces this so the import UI
+   * can say "已导入（覆盖）" instead of pretending it was a fresh install.
+   */
+  readonly replaced: boolean
   /** The fully validated pack; the host may start a session from it directly. */
   readonly pack: LoadedPack
 }
@@ -260,6 +269,26 @@ function packPrefix(id: string, version: string): string {
   return prefix
 }
 
+/**
+ * Case-fold a pack-store key for *set comparisons only*.
+ *
+ * Windows uses case-insensitive filesystems (NTFS), so two spellings of a path
+ * can address the same physical file. When a re-imported archive renames
+ * `phases/Resist.md` to `phases/resist.md`, the earlier `store.list(prefix)`
+ * still reports the old casing while the write already replaced the same file.
+ * Compared verbatim, the old key would look "stale" and removing it would
+ * delete the file that was just written. Folding is used only to decide
+ * created/overwritten/stale membership; `remove()` still receives the original
+ * key returned by `store.list`.
+ *
+ * On a case-sensitive filesystem the error direction is the safe one: a
+ * case-only rename leaves the old-cased file behind instead of deleting a file
+ * that is still part of the pack.
+ */
+function foldPackKey(key: string): string {
+  return key.toLowerCase()
+}
+
 function parseRegistry(raw: string): RegistryDocument {
   let parsed: unknown
   try {
@@ -344,9 +373,31 @@ export class PackRegistry {
   /**
    * Validate and install a zip archive.
    *
+   * **Re-importing an installed `id@version` replaces it in place.** Per the
+   * product rule the import is "extract into the project's own directory,
+   * overwrite files with the same name", never "refuse because it exists".
+   * Concretely, in this order:
+   *
+   * 1. the archive is fully validated (`loadPack`) — a rejected archive touches
+   *    nothing, including when it claims an already-installed `id@version`;
+   * 2. every file of the new archive is written under
+   *    `content/packs/<id>/<version>/`, overwriting same-named files;
+   * 3. files the previous install had but the new archive does not are removed,
+   *    so an updated pack can drop optional files without stale content being
+   *    picked up by `load()`;
+   * 4. `content/registry.json` is rewritten (fresh `installedAt`, new
+   *    name/mode/rating, `activate:true` still decides the active version).
+   *
+   * Failure contract: validation failures never touch the store. Once writing
+   * started, the rollback can only delete the keys this call *created* —
+   * overwritten bytes cannot be restored (the {@link PackStore} port has no
+   * backup/rename-in-place primitive) — so those keys keep the new content
+   * instead of being deleted, which would leave the installed version missing
+   * files. The registry is not updated on failure; importing again repairs it.
+   *
    * @throws {ZipError} when the archive is unreadable/unsupported.
    * @throws {import('./loader.ts').ContentPackError} when the pack fails validation.
-   * @throws {PackRegistryError} when the version is already installed or the store fails.
+   * @throws {PackRegistryError} when the store fails.
    */
   async install(bytes: Uint8Array, options: InstallPackOptions = {}): Promise<InstallResult> {
     const archive = await readZip(bytes, this.inflateRaw === undefined ? {} : { inflateRaw: this.inflateRaw })
@@ -354,29 +405,53 @@ export class PackRegistry {
     if (files.size === 0) throw new PackRegistryError('empty-pack', 'the archive contains no pack files')
     const engineVersion = options.engineVersion ?? this.engineVersion
     const loadOptions = engineVersion === undefined ? {} : { engineVersion }
-    // Validate completely before touching the store: a rejected pack leaves no
-    // half-installed files behind.
+    // Validate completely before touching the store: a rejected pack leaves the
+    // installed version byte-for-byte untouched, and a rejected *re-import*
+    // must not damage what is already installed.
     const pack = await loadPack(new MemoryContentSource(Object.fromEntries(files)), loadOptions)
     const { id, version } = pack.manifest
     validateArguments(id, version)
 
     const registry = await this.readRegistry()
     const existing = registry.packs[id]
-    if (existing !== undefined && Object.hasOwn(existing.versions, version)) {
-      throw new PackRegistryError('already-installed', `pack "${id}"@${version} is already installed`)
-    }
-
+    // Same id@version already installed: overwrite it instead of failing.
+    const replaced = existing !== undefined && Object.hasOwn(existing.versions, version)
     const prefix = packPrefix(id, version)
-    const written: string[] = []
+    // Created/overwritten/stale membership is decided on case-folded keys, not
+    // verbatim ones: on Windows the same physical file can be listed under the
+    // old casing (`phases/Resist.md`) while this archive writes the new casing
+    // (`phases/resist.md`). Removing the "stale" old-cased key would delete the
+    // file just written. See `foldPackKey`.
+    const incoming = new Set([...files.keys()].map(path => foldPackKey(`${prefix}${path}`)))
+
+    // Read the old file set before writing (read-only, so a failure here has no
+    // side effects): overwritten keys are known up front and stale keys are the
+    // difference to the new archive.
+    const previous = await this.listPrefix(prefix)
+    const previousFolded = new Set(previous.map(foldPackKey))
+
+    const created: string[] = []
     try {
       for (const [path, data] of files) {
         const key = `${prefix}${path}`
         await this.store.write(key, data)
-        written.push(key)
+        if (!previousFolded.has(foldPackKey(key))) created.push(key)
       }
     } catch (failure) {
-      await this.rollback(written)
+      await this.rollback(created)
       throw new PackRegistryError('store-failure', `could not write pack files: ${(failure as Error).message}`, failure)
+    }
+
+    // Drop files this install no longer contains (the actual remove calls keep
+    // the store's original casing). The writes above already completed, so an
+    // interrupted cleanup still leaves a loadable superset (the registry update
+    // below is what commits the new version as a whole).
+    const stale = previous.filter(key => key.startsWith(prefix) && !incoming.has(foldPackKey(key)))
+    try {
+      for (const key of stale) await this.store.remove(key)
+    } catch (failure) {
+      await this.rollback(created)
+      throw new PackRegistryError('store-failure', `could not remove stale pack files: ${(failure as Error).message}`, failure)
     }
 
     const active = options.activate === true ? version : existing?.active
@@ -385,6 +460,8 @@ export class PackRegistry {
       name: pack.manifest.name,
       mode: pack.manifest.mode,
       rating: pack.manifest.rating,
+      // A re-import counts as a reinstall: the timestamp tracks the bytes that
+      // are on disk now, not the first time this version was seen.
       installedAt: new Date(this.clock.now()).toISOString(),
     }
     const packs: Record<string, RegistryPack> = { ...registry.packs }
@@ -392,11 +469,15 @@ export class PackRegistry {
     try {
       await this.writeRegistry({ version: 1, packs })
     } catch (failure) {
-      await this.rollback(written)
+      // Best effort, same rule as above: only files this call created are
+      // removed. For a re-import that already deleted stale files the old key
+      // set cannot be rebuilt either; the registry still describes the previous
+      // install, so the user-facing repair is to import the archive again.
+      await this.rollback(created)
       throw new PackRegistryError('store-failure', `could not update the registry: ${(failure as Error).message}`, failure)
     }
 
-    return { id, version, active: active === version, pack }
+    return { id, version, active: active === version, replaced, pack }
   }
 
   /** Make an installed version the one the next session starts from. */
@@ -539,6 +620,15 @@ export class PackRegistry {
     return loadPack(new MemoryContentSource(files), loadOptions)
   }
 
+  /** `store.list` with the registry's error mapping (used before install writes). */
+  private async listPrefix(prefix: string): Promise<readonly string[]> {
+    try {
+      return await this.store.list(prefix)
+    } catch (failure) {
+      throw new PackRegistryError('store-failure', `could not list pack files: ${(failure as Error).message}`, failure)
+    }
+  }
+
   private async readRegistry(): Promise<RegistryDocument> {
     let raw: Uint8Array | undefined
     try {
@@ -554,8 +644,15 @@ export class PackRegistry {
     await this.store.write(REGISTRY_KEY, serializeRegistry(document))
   }
 
-  private async rollback(written: readonly string[]): Promise<void> {
-    for (const key of [...written].reverse()) {
+  /**
+   * Best-effort removal of the keys a failed install *created*.
+   *
+   * Keys this call overwrote are deliberately left alone: their old bytes are
+   * already gone (the store port has no way to restore them), and deleting the
+   * new bytes on top would leave the installed version missing files.
+   */
+  private async rollback(created: readonly string[]): Promise<void> {
+    for (const key of [...created].reverse()) {
       try {
         await this.store.remove(key)
       } catch {

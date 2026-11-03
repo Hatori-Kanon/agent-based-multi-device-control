@@ -74,6 +74,15 @@ export interface WaveformLibraryOptions {
 export class WaveformLibrary {
   private readonly durable = new Map<string, Waveform>()
   private readonly scratch = new Map<string, Waveform>()
+  /**
+   * Scratch ids installed through {@link addSessionWaveform}.
+   *
+   * Host pack assets share `scratch` with agent/human work but must not count
+   * against {@link MAX_SESSION_WAVEFORMS} (P2-N1); this set is how the two
+   * populations are told apart. Invariant: every id here is also in
+   * `scratch`, maintained by remove/promote/clear below.
+   */
+  private readonly hostRegistered = new Set<string>()
 
   constructor(options: WaveformLibraryOptions = {}) {
     for (const waveform of options.builtins ?? createBuiltinWaveforms()) {
@@ -121,6 +130,47 @@ export class WaveformLibrary {
     })
   }
 
+  /**
+   * Install a host-owned waveform into session scope, keyed by its own id.
+   *
+   * Content packs ship waveforms under canonical ids (`<packId>:<localId>`),
+   * and the executor dispatches through the registry, which resolves a plan's
+   * `waveformId` with {@link require}. Before this seam the resolver could find
+   * a packed waveform while the registry could not, so an otherwise valid plan
+   * was rejected with `UNKNOWN_WAVEFORM` (play-session audit). The host calls
+   * this once per pack at session start; replace-by-id keeps a retried start
+   * cheap.
+   *
+   * This is a **trusted host path, not an agent path**, so it deliberately
+   * ignores {@link MAX_SESSION_WAVEFORMS}: a content pack is validated on its
+   * own terms and may legally ship more waveforms than the agent scratch cap,
+   * and failing the whole session start over that count is unacceptable
+   * (adversarial review P1-3). Only `author`/`importFrames` keep the cap, so a
+   * model loop still cannot exhaust memory.
+   */
+  addSessionWaveform(waveform: Waveform): void {
+    this.scratch.set(waveform.id, waveform)
+    this.hostRegistered.add(waveform.id)
+  }
+
+  /**
+   * Remove exactly one host-installed session waveform.
+   *
+   * Session teardown (normal end, failed start, pack switch) must be able to
+   * drop the pack assets this session installed without clearing human
+   * imports or agent scratch via {@link clearSession}. Durable waveforms are
+   * never touched — a builtin id such as `tide` is simply not in scratch — and
+   * a host id also leaves the {@link hostRegistered} bookkeeping so the agent
+   * cap reflects the smaller host population again.
+   *
+   * @returns true when a scratch entry was removed, false for an absent id.
+   */
+  removeSessionWaveform(id: string): boolean {
+    const removed = this.scratch.delete(id)
+    this.hostRegistered.delete(id)
+    return removed
+  }
+
   /** Bring a shared waveform in from the hex interchange format. */
   importFrames(name: string, frames: readonly string[], tags: readonly string[] = []): Waveform {
     const trimmed = name.trim()
@@ -148,6 +198,7 @@ export class WaveformLibrary {
       throw new SafetyError('UNKNOWN_WAVEFORM', `no session waveform with id "${id}"`)
     }
     this.scratch.delete(id)
+    this.hostRegistered.delete(id)
     this.durable.set(id, waveform)
     return waveform
   }
@@ -155,6 +206,7 @@ export class WaveformLibrary {
   /** Discard scratch space at the end of a session. */
   clearSession(): void {
     this.scratch.clear()
+    this.hostRegistered.clear()
   }
 
   /** Durable, non-builtin waveforms, for the host to persist. */
@@ -173,7 +225,7 @@ export class WaveformLibrary {
   }
 
   private addToSession(waveform: Waveform): Waveform {
-    if (this.scratch.size >= MAX_SESSION_WAVEFORMS) {
+    if (this.agentScratchCount() >= MAX_SESSION_WAVEFORMS) {
       throw new SafetyError(
         'INVALID_WAVEFORM',
         `the session already holds ${MAX_SESSION_WAVEFORMS} waveforms; reuse one or ask the operator to promote and clear`,
@@ -181,6 +233,23 @@ export class WaveformLibrary {
     }
     this.scratch.set(waveform.id, waveform)
     return waveform
+  }
+
+  /**
+   * Scratch entries owned by the agent/human paths.
+   *
+   * Host-registered pack waveforms are excluded: a pack may legally ship more
+   * than {@link MAX_SESSION_WAVEFORMS}, and those assets must not consume the
+   * 64 slots the model and the human importer share (adversarial review
+   * P2-N1). Counting by membership rather than `size - hostRegistered.size`
+   * stays correct even if a bookkeeping entry ever outlives its scratch entry.
+   */
+  private agentScratchCount(): number {
+    let count = 0
+    for (const id of this.scratch.keys()) {
+      if (!this.hostRegistered.has(id)) count += 1
+    }
+    return count
   }
 
   private uniqueId(base: string): string {

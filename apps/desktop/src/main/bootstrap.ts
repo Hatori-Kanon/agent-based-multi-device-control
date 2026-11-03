@@ -1385,10 +1385,17 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     }),
     importPack: async bytes => {
       const installed = await runPackOp(async () => await packRegistry.install(bytes, { activate: true }))
-      // A reinstall of the same id@version is rejected, but an uninstall +
-      // reinstall could in principle change the files behind a cache key.
+      // Re-importing the same id@version now overwrites the files in place (the
+      // product's "同名文件覆盖" import rule), so a cache entry keyed by
+      // `id@version` may point at the *previous* bytes even though the id@version
+      // did not change. The region vocabularies are tiny; clear them all.
       regionCache.clear()
-      return { id: installed.id, version: installed.version, active: installed.active }
+      return {
+        id: installed.id,
+        version: installed.version,
+        active: installed.active,
+        replaced: installed.replaced,
+      }
     },
     activatePack: async (id, version) => {
       await runPackOp(async () => { await packRegistry.activate(id, version) })

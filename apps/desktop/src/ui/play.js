@@ -1528,7 +1528,11 @@
         && typeof body.pack === 'object' ? body.pack : undefined
       const packId = imported !== undefined && typeof imported.id === 'string' ? imported.id : ''
       const version = imported !== undefined && typeof imported.version === 'string' ? imported.version : ''
-      setPackImportStatus(packId === '' ? '已导入' : `已导入 ${packId}${version === '' ? '' : ` @ ${version}`}`)
+      // 同 id@version 重导是覆盖安装（宿主返回 replaced），状态文案要说清楚，
+      // 否则玩家会以为导入没生效（版本号没变）。
+      const replaced = imported !== undefined && imported.replaced === true
+      const verb = replaced ? '已导入（覆盖）' : '已导入'
+      setPackImportStatus(packId === '' ? verb : `${verb} ${packId}${version === '' ? '' : ` @ ${version}`}`)
       await refreshPacks()
       if (packId !== '') {
         el.packSelect.value = packId

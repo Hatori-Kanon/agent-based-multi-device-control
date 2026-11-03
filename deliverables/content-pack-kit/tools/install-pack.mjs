@@ -35,7 +35,7 @@ const HELP = `用法:
   --data-dir <path>          数据目录（默认: EMBODIED_DATA_DIR / 仓库 .dev-data / Electron app data）
   --zip <out.zip>            只生成 zip，不上传
   --list                     列出已安装内容包
-  --activate <id@version>    切换 active 版本（导入会默认激活新版本）
+  --activate <id@version>    切换 active 版本（导入会默认激活该版本；同版本重导会覆盖安装）
   --no-validate              跳过仓库校验器的预检（不推荐）
   -h, --help                 显示帮助
 `
@@ -250,7 +250,10 @@ async function main() {
     })
     const pack = body?.pack
     if (pack !== undefined) {
-      console.log(`✅ 已安装并激活 ${pack.id}@${pack.version}`)
+      // 同 id@version 重导是覆盖安装（宿主返回 replaced），提示里区分开，
+      // 否则版本号没变看起来像没生效。
+      const verb = pack.replaced === true ? '已安装并激活（覆盖）' : '已安装并激活'
+      console.log(`✅ ${verb} ${pack.id}@${pack.version}`)
     } else {
       console.log('✅ 已导入')
     }

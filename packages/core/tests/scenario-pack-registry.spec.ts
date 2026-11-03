@@ -98,9 +98,22 @@ function zipOf(files: Readonly<Record<string, string | Uint8Array>>): Uint8Array
 
 const PERSONA = '# 角色\n\n温柔而克制的引导者。\n\n## 导演摘要\n\n行动倾向：先观察再靠近；称呼：你。\n'
 
-function freeformZip(id: string, version: string, name: string, directory?: string): Uint8Array {
+/**
+ * Build a freeform pack archive.
+ *
+ * `extra` adds (or overrides, for `persona.md`) files relative to the pack root;
+ * the re-import tests use it to change bytes and to drop a file that only the
+ * older archive had.
+ */
+function freeformZipWith(
+  id: string,
+  version: string,
+  name: string,
+  extra: Readonly<Record<string, string>> = {},
+  directory?: string,
+): Uint8Array {
   const prefix = directory === undefined ? '' : `${directory}/`
-  return zipOf({
+  const files: Record<string, string> = {
     [`${prefix}pack.json`]: JSON.stringify({
       id,
       name,
@@ -112,7 +125,13 @@ function freeformZip(id: string, version: string, name: string, directory?: stri
       aftercare: { text: '慢慢缓过来。' },
     }),
     [`${prefix}persona.md`]: PERSONA,
-  })
+  }
+  for (const [path, value] of Object.entries(extra)) files[`${prefix}${path}`] = value
+  return zipOf(files)
+}
+
+function freeformZip(id: string, version: string, name: string, directory?: string): Uint8Array {
+  return freeformZipWith(id, version, name, {}, directory)
 }
 
 function scenarioZip(): Uint8Array {
@@ -173,13 +192,20 @@ async function registryError(promise: Promise<unknown>): Promise<PackRegistryErr
   }
 }
 
-/** Store that fails the write for a chosen key so rollback behaviour is testable. */
+/**
+ * Store that fails selected calls so rollback/failure behaviour is testable.
+ *
+ * Both switches are mutable: an install can be prepared on a healthy store and
+ * the failure only armed for the follow-up (re-import) call.
+ */
 class FailingStore implements PackStore {
   private readonly inner = new MemoryPackStore()
-  private readonly failOn: string
+  failOn: string | undefined
+  failRemoveOn: string | undefined
 
-  constructor(failOn: string) {
+  constructor(failOn?: string, failRemoveOn?: string) {
     this.failOn = failOn
+    this.failRemoveOn = failRemoveOn
   }
 
   read(key: string): Promise<Uint8Array | undefined> {
@@ -187,11 +213,16 @@ class FailingStore implements PackStore {
   }
 
   write(key: string, bytes: Uint8Array): Promise<void> {
-    if (key.includes(this.failOn)) return Promise.reject(new Error('simulated disk full'))
+    if (this.failOn !== undefined && key.includes(this.failOn)) {
+      return Promise.reject(new Error('simulated disk full'))
+    }
     return this.inner.write(key, bytes)
   }
 
   remove(key: string): Promise<void> {
+    if (this.failRemoveOn !== undefined && key.includes(this.failRemoveOn)) {
+      return Promise.reject(new Error('simulated delete failure'))
+    }
     return this.inner.remove(key)
   }
 
@@ -201,6 +232,51 @@ class FailingStore implements PackStore {
 
   keys(): readonly string[] {
     return this.inner.keys()
+  }
+}
+
+/**
+ * PackStore that behaves like a case-insensitive filesystem (Windows NTFS):
+ * keys differing only in casing address the same physical file, while `list`
+ * reports the casing of the most recent write. A re-import therefore lists the
+ * *old* casing (the snapshot is taken before writing) and writes the new one.
+ */
+class CaseInsensitiveStore implements PackStore {
+  private readonly files = new Map<string, { readonly key: string; readonly bytes: Uint8Array }>()
+
+  private static fold(key: string): string {
+    return key.toLowerCase()
+  }
+
+  read(key: string): Promise<Uint8Array | undefined> {
+    const entry = this.files.get(CaseInsensitiveStore.fold(key))
+    return Promise.resolve(entry === undefined ? undefined : new Uint8Array(entry.bytes))
+  }
+
+  write(key: string, bytes: Uint8Array): Promise<void> {
+    this.files.set(CaseInsensitiveStore.fold(key), { key, bytes: new Uint8Array(bytes) })
+    return Promise.resolve()
+  }
+
+  remove(key: string): Promise<void> {
+    // NTFS `unlink` resolves the path case-insensitively: removing the old
+    // casing would delete the file the re-import just wrote under a new casing.
+    this.files.delete(CaseInsensitiveStore.fold(key))
+    return Promise.resolve()
+  }
+
+  list(prefix: string): Promise<readonly string[]> {
+    return Promise.resolve(
+      [...this.files.values()]
+        .map(entry => entry.key)
+        .filter(key => key.startsWith(prefix))
+        .sort(),
+    )
+  }
+
+  /** Every physically stored path, in list order (test convenience). */
+  keys(): readonly string[] {
+    return [...this.files.values()].map(entry => entry.key).sort()
   }
 }
 
@@ -311,16 +387,203 @@ describe('content-pack registry', () => {
     expect(await registry.list()).toEqual([])
   })
 
-  it('installs the same id and version only once', async () => {
+  it('replaces an installed id@version instead of refusing the import', async () => {
+    const store = new MemoryPackStore()
+    const clock = new FakeClock(Date.UTC(2026, 10, 1, 12, 0, 0))
+    const registry = new PackRegistry({ store, clock })
+
+    const first = await registry.install(
+      freeformZipWith('tentacle', '0.1.0', '触手 · 初版', { 'notes/extra.md': '旧附注' }),
+      { activate: true },
+    )
+    expect(first.replaced).toBe(false)
+    expect(first.active).toBe(true)
+    expect(store.keys()).toEqual([
+      'content/packs/tentacle/0.1.0/notes/extra.md',
+      'content/packs/tentacle/0.1.0/pack.json',
+      'content/packs/tentacle/0.1.0/persona.md',
+      'content/registry.json',
+    ])
+
+    // Same id@version, changed bytes and one dropped file: the import must
+    // succeed, overwrite same-named files, and delete the file the new archive
+    // no longer contains.
+    clock.advance(60 * 60 * 1000)
+    const second = await registry.install(
+      freeformZipWith('tentacle', '0.1.0', '触手 · 修订版', { 'persona.md': '# 角色\n\n修订后的角色。\n' }),
+      { activate: true },
+    )
+    expect(second.replaced).toBe(true)
+    expect(second.active).toBe(true)
+    expect(second.pack.manifest.name).toBe('触手 · 修订版')
+
+    expect(store.keys()).toEqual([
+      'content/packs/tentacle/0.1.0/pack.json',
+      'content/packs/tentacle/0.1.0/persona.md',
+      'content/registry.json',
+    ])
+    const persona = new TextDecoder().decode(
+      (await store.read('content/packs/tentacle/0.1.0/persona.md')) ?? new Uint8Array(),
+    )
+    expect(persona).toContain('修订后的角色')
+    const manifest = JSON.parse(
+      new TextDecoder().decode((await store.read('content/packs/tentacle/0.1.0/pack.json')) ?? new Uint8Array()),
+    ) as { name: string }
+    expect(manifest.name).toBe('触手 · 修订版')
+
+    // Still exactly one version, with a fresh installedAt; reloading the pack
+    // reads the new bytes (no stale copy is left behind).
+    const entries = await registry.list()
+    expect(entries).toHaveLength(1)
+    expect(entries[0]!.versions).toHaveLength(1)
+    expect(entries[0]!.versions[0]!.installedAt).toBe('2026-11-01T13:00:00.000Z')
+    expect(entries[0]!.versions[0]!.name).toBe('触手 · 修订版')
+    expect(entries[0]!.activeVersion).toBe('0.1.0')
+    const loaded = await registry.load('tentacle')
+    expect(loaded.manifest.name).toBe('触手 · 修订版')
+    expect(loaded.persona).toContain('修订后的角色')
+  })
+
+  it('keeps the active version and other versions untouched when a stale version is re-imported', async () => {
     const store = new MemoryPackStore()
     const registry = new PackRegistry({ store })
-    const archive = freeformZip('tentacle', '0.1.0', '触手')
-    await registry.install(archive)
-    const keysAfterInstall = store.keys()
+    await registry.install(
+      freeformZipWith('tentacle', '0.1.0', '旧版', { 'notes/extra.md': '只有旧版有的附注' }),
+      { activate: true },
+    )
+    await registry.install(freeformZip('tentacle', '0.2.0', '新版'), { activate: true })
+    const v2Keys = store.keys().filter(key => key.includes('/0.2.0/'))
+    expect(v2Keys).toHaveLength(2)
 
-    const duplicate = await registryError(registry.install(archive))
-    expect(duplicate.code).toBe('already-installed')
-    expect(store.keys()).toEqual(keysAfterInstall)
+    // Re-import the *inactive* older version without `activate`: the files under
+    // that prefix update, but the active slot keeps pointing at 0.2.0.
+    const reinstalled = await registry.install(freeformZip('tentacle', '0.1.0', '旧版 · 重导'))
+    expect(reinstalled.replaced).toBe(true)
+    expect(reinstalled.active).toBe(false)
+
+    const entries = await registry.list()
+    expect(entries[0]!.activeVersion).toBe('0.2.0')
+    expect(entries[0]!.versions.map(version => version.version)).toEqual(['0.1.0', '0.2.0'])
+    expect(entries[0]!.versions.map(version => version.active)).toEqual([false, true])
+    expect(entries[0]!.versions[0]!.name).toBe('旧版 · 重导')
+    expect(await store.read('content/packs/tentacle/0.1.0/notes/extra.md')).toBeUndefined()
+    // Stale cleanup is scoped to the re-imported prefix: 0.2.0 is untouched.
+    expect(store.keys().filter(key => key.includes('/0.2.0/'))).toEqual(v2Keys)
+    expect((await registry.load('tentacle')).manifest.name).toBe('新版')
+    expect((await registry.load('tentacle', '0.1.0')).manifest.name).toBe('旧版 · 重导')
+  })
+
+  it('leaves the installed bytes and registry untouched when a re-import fails validation', async () => {
+    const store = new MemoryPackStore()
+    const clock = new FakeClock(Date.UTC(2026, 10, 1, 12, 0, 0))
+    const registry = new PackRegistry({ store, clock })
+    await registry.install(
+      freeformZipWith('tentacle', '0.1.0', '触手', { 'notes/extra.md': '旧附注' }),
+      { activate: true },
+    )
+    const keysBefore = store.keys()
+    const decode = (bytes: Uint8Array | undefined): string => new TextDecoder().decode(bytes ?? new Uint8Array())
+    const registryBefore = decode(await store.read('content/registry.json'))
+
+    // Same id/version but no persona.md: validation rejects before any write.
+    clock.advance(60 * 60 * 1000)
+    const broken = zipOf({
+      'pack.json': JSON.stringify({
+        id: 'tentacle',
+        name: '坏包',
+        version: '0.1.0',
+        engine: '>=0.2 <1.0',
+        mode: 'freeform',
+        rating: 'all',
+      }),
+    })
+    await expect(registry.install(broken, { activate: true })).rejects.toBeInstanceOf(ContentPackError)
+
+    expect(store.keys()).toEqual(keysBefore)
+    expect(decode(await store.read('content/registry.json'))).toBe(registryBefore)
+    expect((await registry.load('tentacle')).manifest.name).toBe('触手')
+    expect(decode(await store.read('content/packs/tentacle/0.1.0/persona.md'))).toBe(PERSONA)
+  })
+
+  it('keeps the old key set when cleanup of a dropped file fails', async () => {
+    const store = new FailingStore(undefined, 'notes/extra.md')
+    const registry = new PackRegistry({ store })
+    await registry.install(
+      freeformZipWith('tentacle', '0.1.0', '触手', {
+        'notes/extra.md': '旧附注',
+        'notes/keep.md': '保留',
+      }),
+      { activate: true },
+    )
+    const keysBefore = store.keys()
+
+    // The new archive drops both notes; the first remove fails, so the created
+    // keys are rolled back and the previous key set stays in place.
+    const error = await registryError(registry.install(freeformZip('tentacle', '0.1.0', '触手 · 新')))
+    expect(error.code).toBe('store-failure')
+    expect(store.keys()).toEqual(keysBefore)
+    // Registry metadata is only committed after every file operation succeeded.
+    expect((await registry.list())[0]!.versions[0]!.name).toBe('触手')
+  })
+
+  it('rolls back only the files a failed re-import created, keeping overwritten bytes', async () => {
+    const store = new FailingStore()
+    const registry = new PackRegistry({ store })
+    await registry.install(freeformZip('tentacle', '0.1.0', '触手 · 初版'), { activate: true })
+    const keysBefore = store.keys()
+
+    // The new archive adds one file and changes pack.json; the persona write
+    // fails after those two succeeded. Old bytes of overwritten keys cannot be
+    // restored, so they keep the new content and only the created key is
+    // removed — the key set is back to exactly what the previous install had.
+    store.failOn = 'persona.md'
+    const error = await registryError(
+      registry.install(freeformZipWith('tentacle', '0.1.0', '触手 · 修订', { 'aaa-extra.md': '新文件' })),
+    )
+    expect(error.code).toBe('store-failure')
+    expect(store.keys()).toEqual(keysBefore)
+    const manifest = JSON.parse(
+      new TextDecoder().decode((await store.read('content/packs/tentacle/0.1.0/pack.json')) ?? new Uint8Array()),
+    ) as { name: string }
+    expect(manifest.name).toBe('触手 · 修订')
+    // The registry was not updated: it still reports the first install.
+    expect((await registry.list())[0]!.versions[0]!.name).toBe('触手 · 初版')
+  })
+
+  it('does not delete a freshly written file when a re-import only changes its case (Windows)', async () => {
+    // NTFS is case-insensitive: `phases/Resist.md` -> `phases/resist.md` is the
+    // same physical file. The pre-write `list` reports the old casing while the
+    // write replaces that file under the new casing, so a verbatim stale
+    // comparison would `remove` the old-cased key and delete the new bytes.
+    const store = new CaseInsensitiveStore()
+    const registry = new PackRegistry({ store })
+    await registry.install(
+      freeformZipWith('tentacle', '0.1.0', '触手', {
+        'phases/Resist.md': '旧内容',
+        'notes/old.md': '旧附注',
+      }),
+      { activate: true },
+    )
+    expect(store.keys()).toContain('content/packs/tentacle/0.1.0/phases/Resist.md')
+
+    const result = await registry.install(
+      freeformZipWith('tentacle', '0.1.0', '触手 · 修订', { 'phases/resist.md': '新内容' }),
+      { activate: true },
+    )
+    expect(result.replaced).toBe(true)
+
+    // The case-only rename overwrote the same physical file; the new bytes must
+    // still be there (the old-cased remove must not be issued).
+    const renamed = await store.read('content/packs/tentacle/0.1.0/phases/resist.md')
+    expect(new TextDecoder().decode(renamed ?? new Uint8Array())).toBe('新内容')
+    expect(store.keys()).toContain('content/packs/tentacle/0.1.0/phases/resist.md')
+    expect(store.keys()).not.toContain('content/packs/tentacle/0.1.0/phases/Resist.md')
+
+    // A file the new archive genuinely dropped is still cleaned up, and the
+    // installed pack still loads.
+    expect(await store.read('content/packs/tentacle/0.1.0/notes/old.md')).toBeUndefined()
+    expect(store.keys()).not.toContain('content/packs/tentacle/0.1.0/notes/old.md')
+    expect((await registry.load('tentacle')).manifest.name).toBe('触手 · 修订')
   })
 
   it('imports a pack wrapped in a folder and ignores OS junk', async () => {
@@ -329,6 +592,7 @@ describe('content-pack registry', () => {
     const result = await registry.install(freeformZip('wrapped', '0.1.0', '包装包', 'WrappedPack'), { activate: true })
 
     expect(result.pack.manifest.id).toBe('wrapped')
+    expect(result.replaced).toBe(false)
     expect(store.keys()).toContain('content/packs/wrapped/0.1.0/pack.json')
     expect(store.keys()).toContain('content/packs/wrapped/0.1.0/persona.md')
     expect(store.keys().some(key => key.includes('__MACOSX') || key.includes('.DS_Store'))).toBe(false)
