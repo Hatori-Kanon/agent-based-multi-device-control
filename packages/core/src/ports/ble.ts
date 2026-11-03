@@ -45,12 +45,14 @@ export interface BleFilter {
   /**
    * Pin the chooser to one platform device id.
    *
-   * This is the id Web Bluetooth exposes as `BluetoothDevice.id` and Electron's
-   * chooser reports as `deviceId`. The host persists it per device card so two
-   * units with the **same advertised name** keep a stable physical identity
-   * across reconnects: when the pinned candidate is present the chooser answers
+   * This is the **chooser's** device id (Electron's `select-bluetooth-device`
+   * `deviceId`; on Windows the BLE address), *not* Web Bluetooth's
+   * `BluetoothDevice.id` — the latter is an origin-scoped hash and never matches
+   * a later candidate list. The host persists the chooser id per device card so
+   * two units with the same advertised name keep a stable physical identity
+   * across reconnects. When the pinned candidate is present the chooser answers
    * with it and will not substitute another unit. Omitted, the chooser picks
-   * among matching candidates that are not already connected to another card.
+   * among matching candidates that are not connected/reserved elsewhere.
    */
   readonly deviceId?: string
   /**
@@ -73,11 +75,12 @@ export interface BlePeripheral {
   /** Platform-assigned identity; not stable across pairings on every platform. */
   readonly id: string
   /**
-   * Platform identity of the connected unit (`BluetoothDevice.id`), when the
-   * transport can report it.
+   * Platform identity of the connected unit, in the **chooser's** id space
+   * (Electron `deviceId` / BLE address), when the transport can report it.
    *
-   * This is *not* the transport handle: it is the value the host persists to
-   * keep a device card bound to one physical unit when several share a name.
+   * Not the transport handle, and not `BluetoothDevice.id` (an origin-scoped
+   * hash in a different id space). The host persists this value to keep a
+   * device card bound to one physical unit when several share a name.
    */
   readonly platformId: string | undefined
   readonly name: string | undefined

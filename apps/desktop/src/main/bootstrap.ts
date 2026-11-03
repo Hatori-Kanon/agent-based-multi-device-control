@@ -284,8 +284,8 @@ export interface HostRuntime {
   /**
    * Connect one card, then persist the physical unit the chooser picked.
    *
-   * Two units can share one advertised name; recording `BluetoothDevice.id`
-   * keeps the card (and its label) bound to the same box on later connects.
+   * Two units can share one advertised name; recording the chooser's platform
+   * id keeps the card (and its label) bound to the same box on later connects.
    */
   connectDevice(key: string): Promise<void>
   /** Stop, close, and forget a device. */
@@ -326,11 +326,14 @@ export interface DeviceManifestEntry {
   /** Scan filter override (e.g. an ANKNI family name); raw name only. */
   readonly bleName?: string
   /**
-   * Platform device id (`BluetoothDevice.id`) the card is paired with.
+   * Platform device id the card is paired with.
    *
-   * Coyote units advertise the same name, so the first successful connect
-   * records which physical box this card got; later connects pin the chooser
-   * to it. Cleared by "重新配对".
+   * This is the **chooser's** id (Electron `deviceId`; on Windows the BLE
+   * address), *not* Web Bluetooth's `BluetoothDevice.id` (an origin-scoped hash
+   * that cannot be matched against later candidate lists). Coyote units
+   * advertise the same name, so the first successful connect records which
+   * physical box this card got; later connects pin the chooser to it. Cleared
+   * by "重新配对".
    */
   readonly bleId?: string
 }
@@ -347,6 +350,11 @@ export interface DeviceManagerEntry {
   readonly bound: boolean
   /** True when "重新配对" is meaningful (BLE backends with a chooser). */
   readonly canRebind: boolean
+  /**
+   * The paired unit's chooser id (BLE address on Windows), when bound — shown
+   * in the console so the operator can match a card to the OS/Chrome listing.
+   */
+  readonly pairedId?: string
 }
 
 /** File format version; bumped when the well-known device list changes. */
@@ -1386,6 +1394,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
         channels: live === undefined ? [] : live.channels.map(channel => channel.id),
         bound: entry.bleId !== undefined,
         canRebind: REBINDABLE_PROTOCOLS.has(entry.protocol),
+        ...(entry.bleId === undefined ? {} : { pairedId: entry.bleId }),
       }
     })
   }

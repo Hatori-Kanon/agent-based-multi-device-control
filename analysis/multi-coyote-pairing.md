@@ -1,9 +1,10 @@
 # 多台同型号郊狼：设备名与稳定配对（2026-11-04）
 
-> 用户报告：链接多台郊狼时出问题——蓝牙广告名相同，需要按设备名区分。
-> 处理：设备卡可重命名；首次连接把选中的**平台设备 id**（Web Bluetooth `BluetoothDevice.id` /
-> Electron chooser 的 `deviceId`）持久化到 manifest，之后重连钉在同一台；未绑定的卡在选设备时
-> **跳过已被其他卡占用的设备**；提供「重新配对」。
+> 用户报告：链接多台郊狼时出问题——蓝牙广告名相同，需要按设备名区分；后续补充：**连着一台时另一台
+> 搜不到/连不上，Chrome 的 xtoys 能按设备地址区分两台**。
+> 处理：设备卡可重命名；首次连接把 **chooser 的平台设备 id**（Electron `select-bluetooth-device`
+> 的 `deviceId`，Windows 上即 BLE 地址）持久化到 manifest，之后重连钉在同一台；未绑定的卡在选设备时
+> **跳过已被其他卡连接/保留的设备**；提供「重新配对」；设备卡显示配对地址。
 
 ## 1. 根因
 
@@ -18,13 +19,23 @@
 - manifest 里早有 `label`/`bleName` 字段：启动时 `label` 会作为 backend 名字、`bleName` 会作为扫描过滤，
   但**没有重命名 UI、没有展示层覆盖、也没有"哪张卡对应哪台盒子"的持久化**；而且重复点「连接」会再次扫描、
   失败后把仍在线的一台标记为 `failed`（旧 `registry.connect` 不幂等）。
+- **关键 id 空间错误（v18 首版实测发现）**：首版把 Web Bluetooth 的 `BluetoothDevice.id`（worker 里的
+  origin-scoped hash）当作持久化/pin 的 id；但 Electron `select-bluetooth-device` 候选列表里的
+  `deviceId` 是**另一个 id 空间（Windows 上是 BLE 地址）**。结果：
+  - 审计 `connect error ... (wanted: 47L121000; bound unit: SzsD/vOS4gB6Q2xHxeZp3A==); found 2 device(s)
+    but none matched`：扫描明明找到两台，pin 却永远匹配不上（hash ≠ 地址）；
+  - `connectedDeviceIds` 也记的是 hash，无法与候选地址比对 → 排除逻辑失效，两张卡可能连到同一台，
+    随后一条链路 `link_lost`；用户体感就是"连着一台时另一台连不上/搜不到"。
+  - 修复：**统一使用 chooser 的 `deviceId`（地址）** 作为持久化/pin/占用的唯一 id；worker 返回的
+    `BluetoothDevice.id` 只作诊断，不参与身份。候选 miss 时把候选 id 写进 selection trace。
 
 ## 2. 设计
 
 ### 2.1 稳定配对（pin）
 
 - `BleFilter` 新增可选 `deviceId`：把 chooser 钉到某一台平台设备；`BlePeripheral` 新增
-  `platformId`（连接成功后由 worker 的 `device.id` 带回）。
+  `platformId`（连接成功后由 **chooser 实际选中的 `deviceId`** 带回，不是 worker 的
+  `BluetoothDevice.id`）。
 - 核心后端（coyote / xhtkj / ankni）：
   - options 新增 `bleDeviceId?: () => string | undefined`（每次 connect 读取，重配立即生效）；
   - connect 时若已有绑定，把它放进 filter；连接成功后把 `peripheral.platformId` 记到
@@ -59,7 +70,9 @@
   `registry.disconnect`（新增 API：停输出、关链路、lifecycle 回 disconnected，但**保留注册**与
   策略/部位状态）→ 清除 `bleId`；之后点「连接」重新扫描、重新绑定。若 close 失败，
   lifecycle 记 `failed` 且**不清 `bleId`**（链路可能还在，不能换绑）。
-- 卡片头部显示 `已配对` 标记；`GET /api/devices` 的每条记录新增 `bound` / `canRebind`。
+- 卡片头部显示 `已配对` 标记；`GET /api/devices` 的每条记录新增 `bound` / `canRebind` / `pairedId`；
+  设备卡在有配对时显示一行 `配对地址 · D4:04:F3:8E:CC:A6`（即 chooser 的 `deviceId`），
+  方便和 Windows/Chrome 的设备列表对照。
 
 ### 2.4 已连接的稳定身份
 
@@ -112,3 +125,31 @@
 9. **CDP 证据是 stub 宿主**：`.ui-shots/t23-multi-coyote/` 只验证 UI 线路/DOM/请求命中，不是端到端；
    真实断链/停输出由 core 测试与真机回归覆盖。
 10. **重命名弹窗**有焦点陷阱与 Enter 保存；空名=清除（placeholder 已提示"留空恢复默认名"）。
+
+## 5. v18 第二版修复：统一用 chooser 的 id（地址）
+
+首版上线后用户实测：连着一台时另一台连不上；Chrome/xtoys 的配对窗可以按地址区分两台
+（`47L121000 (D4:04:F3:8E:CC:A6)` / `47L121000 (CC:E3:81:07:09:3D)`）。审计证据：
+
+```
+connect error NOT_CONNECTED: ... (wanted: 47L121000; bound unit: SzsD/vOS4gB6Q2xHxeZp3A==);
+found 2 device(s) but none matched; ...
+```
+
+- 扫描确实找到 2 台；但持久化的 `bound unit` 是 base64 hash（Web Bluetooth `BluetoothDevice.id`），
+  与 chooser 候选列表里的 `deviceId`（Windows 上是 MAC 地址）不在同一 id 空间 → pin 永远不匹配；
+  同时 `connectedDeviceIds` 也记 hash，无法排除已连接设备 → 两张卡可能连到同一台，随后 `link_lost`。
+- 修法：
+  1. `electron-bridge` 在 `answer()` 时记录**实际回调给 chooser 的 deviceId**，连接成功后把它作为
+     `platformId` 返回给 transport（worker 的 `device.id` 只留在 diagnostic）；
+  2. 持久化 `bleId`、pin、`excludeDeviceIds`、`connectedDeviceIds` 全部改用该 chooser id；
+  3. chooser miss 的 selection trace 里输出候选 id 列表，便于以后对不上时一眼定位；
+  4. 设备卡显示 `配对地址 · <id>`，与 Windows/Chrome 的设备列表可直接对照。
+- 升级注意：首版写下的 `bleId` 是 hash，升级后旧 pin 会匹配不上（会提示"找不到已绑定设备"）；
+  每张卡点一次「重新配对」再「连接」即可得到地址格式的新绑定。
+
+> Chromium 源码依据（`content/browser/bluetooth/bluetooth_device_chooser_controller.cc` 的
+> `AddFilteredDevice`）：chooser 侧用 `device.GetAddress()` 作为 `device_id` 传给
+> `BluetoothChooser::AddOrUpdateDevice`，而 Web Bluetooth 暴露给页面的 `BluetoothDevice.id` 是
+> 对地址做 origin hash 后的结果——这正是"chooser 地址 ≠ JS hash"、pin 永远不匹配的原因；
+> 用 chooser 地址做持久化/pin 才是跨会话稳定的。

@@ -231,3 +231,24 @@ LOADED: [["xhtkj",...,false],["ankni",...,true]]   ← coyote(label:null) 整张
 > 复核之后 Lead 又改了 core/host/UI/测试与文档；本文件 §1–§6 是复核时刻的结论，最终门禁与数字以
 > Lead 提交前复跑为准。
 
+
+---
+
+## 10. 真机实测追加修复（Lead，2026-11-04 04:05）
+
+复核时无法发现的一类问题在用户真机实测中暴露：首版用 **Web Bluetooth `BluetoothDevice.id`（origin
+hash）** 作为 `bleId`/pin，但 Electron `select-bluetooth-device` 候选列表的 `deviceId` 是
+**BLE 地址**（Chromium `bluetooth_device_chooser_controller.cc` 用 `device.GetAddress()`）。两者 id
+空间不同，导致：
+
+- 重连永远报 `found 2 device(s) but none matched; bound unit: <hash>`（审计 19:53/19:55/19:56 多次）；
+- `connectedDeviceIds` 记的是 hash，排除逻辑对候选地址无效 → 可能两张卡连到同一台，随后 `link_lost`
+  （审计 19:55:09、19:57:11）。
+
+修复（仍属本特性范围）：`electron-bridge.answer()` 记录实际回调给 chooser 的 `deviceId`，连接成功后
+以它作为 `platformId`；`bleId`/pin/`excludeDeviceIds`/`connectedDeviceIds` 全部统一到 chooser id
+（地址）空间；miss 时 trace 输出候选 id；设备卡显示 `配对地址 · <address>` 便于和 Windows/Chrome
+列表对照。升级后旧 hash pin 会失效一次，每张卡点「重新配对」再连接即可。
+
+这一条说明复核的边界：静态复核只能证明"同一 id 空间内的逻辑正确"，**跨 id 空间的假设需要真机/真环境
+验证**；后续同类"平台标识"改动应优先找机会在真机上确认一次。

@@ -70,12 +70,13 @@ export interface DeviceBackend {
   readonly name: string
   readonly channels: readonly Channel[]
   /**
-   * Platform identity of the connected unit (`BluetoothDevice.id`), when the
-   * transport reports one.
+   * Platform identity of the connected unit in the chooser's id space
+   * (Electron `deviceId` / BLE address), when the transport reports one.
    *
-   * The host persists this to keep a device card bound to the same physical
-   * unit when several units share one advertised name. Backends that do not
-   * connect over Web Bluetooth leave it `undefined`.
+   * Not `BluetoothDevice.id` (a different, origin-scoped hash). The host
+   * persists this to keep a device card bound to the same physical unit when
+   * several units share one advertised name. Backends that do not connect over
+   * Web Bluetooth leave it `undefined`.
    */
   readonly platformDeviceId: string | undefined
 

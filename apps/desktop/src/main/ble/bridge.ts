@@ -18,9 +18,9 @@ export interface BleBridge {
    * Request and connect one matching device.
    *
    * `deviceId` pins the choice when the platform chooser already ran; omitted,
-   * the worker asks the OS to pick. The resolved `deviceId` is the platform
-   * identity of the chosen unit (`BluetoothDevice.id`), which the host persists
-   * so a card stays bound to one of several same-named units.
+   * the worker asks the OS to pick. The resolved `deviceId` is the **chooser's**
+   * platform id (on Windows the BLE address; not `BluetoothDevice.id`), which
+   * the host persists so a card stays bound to one of several same-named units.
    */
   request(filter: BleFilter, deviceId?: string): Promise<{ handle: string; name?: string; deviceId?: string }>
   /**
@@ -96,7 +96,7 @@ class BridgedPeripheral implements BlePeripheral {
     readonly id: string,
     readonly name: string | undefined,
     private readonly bridge: BleBridge,
-    /** Platform identity of the chosen unit (`BluetoothDevice.id`). */
+    /** Platform identity of the chosen unit, in the chooser's id space. */
     readonly platformId: string | undefined,
   ) {}
 

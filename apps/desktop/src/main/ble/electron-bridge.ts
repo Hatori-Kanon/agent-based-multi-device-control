@@ -56,6 +56,15 @@ interface PendingSelection {
   callbackStored: boolean
   timer: ReturnType<typeof setTimeout>
   answered: boolean
+  /**
+   * The chooser's own platform id for the selected unit (Electron's
+   * `deviceId`, on Windows the BLE address).
+   *
+   * This is the id space the host must persist and pin with: Web Bluetooth's
+   * `BluetoothDevice.id` is an origin-scoped hash and never matches the ids in
+   * a later `select-bluetooth-device` candidate list (the bug this fixes).
+   */
+  chosenDeviceId?: string
 }
 
 class ElectronBleBridge implements BleBridge {
@@ -138,17 +147,18 @@ class ElectronBleBridge implements BleBridge {
       }
       this.pending = pending
       void this.call<{ handle: string; name?: string; deviceId?: string }>(`window.__ble.connect(${literal(filter)})`).then(raw => {
-        this.selectionTrace.push(`connect-settled:${raw?.handle ?? 'none'}`)
-        // Remember which physical unit this card got: the host persists it and
-        // later choosers must not give the same unit to another card.
-        const platformId = raw?.deviceId
+        this.selectionTrace.push(`connect-settled:${raw?.handle ?? 'none'} chosen:${pending.chosenDeviceId ?? 'none'}`)
+        // Persist the *chooser's* id, not the worker's BluetoothDevice.id: the
+        // two are different id spaces and only the chooser id can be matched
+        // against later candidate lists (and pinned back to the chooser).
+        const platformId = pending.chosenDeviceId ?? raw?.deviceId
         if (raw?.handle !== undefined && platformId !== undefined) {
           this.connectedDeviceIds.add(platformId)
           this.handleDeviceIds.set(raw.handle, platformId)
         }
         // The chooser answer (if any) has already happened or will happen via
         // the grace timer; the connection itself is the payload here.
-        resolve(raw)
+        resolve({ handle: raw.handle, ...(raw.name === undefined ? {} : { name: raw.name }), ...(platformId === undefined ? {} : { deviceId: platformId }) })
       }).catch((error: unknown) => {
         // The platform refused the request outright — usually the Bluetooth
         // adapter being off/unavailable. Never let that reason vanish: it is
@@ -186,6 +196,7 @@ class ElectronBleBridge implements BleBridge {
     this.pending = undefined
     clearTimeout(pending.timer)
     if (deviceId !== undefined) {
+      pending.chosenDeviceId = deviceId
       this.selectionTrace.push(`answered:explicit:${deviceId} (${pending.devices.size} candidates)`)
       pending.selectCallback(deviceId)
       return
@@ -193,12 +204,16 @@ class ElectronBleBridge implements BleBridge {
     const choice = chooseCandidate(pending.filter, [...pending.devices.values()], this.connectedDeviceIds)
     if (choice.kind !== 'none' && choice.deviceId !== undefined) {
       this.selectionReason = undefined
+      pending.chosenDeviceId = choice.deviceId
       this.selectionTrace.push(`answered:${choice.kind}:${choice.deviceId} (${pending.devices.size} candidates)`)
       pending.selectCallback(choice.deviceId)
       return
     }
     this.selectionReason = choice.reason
-    this.selectionTrace.push(`answered:none (${choice.reason ?? 'none'}, ${pending.devices.size} candidates)`)
+    // Log the candidate ids: without them a pin mismatch is impossible to
+    // diagnose from the console (e.g. a stored hash vs the chooser's address).
+    const candidateIds = [...pending.devices.keys()].join(',')
+    this.selectionTrace.push(`answered:none (${choice.reason ?? 'none'}, ${pending.devices.size} candidates: ${candidateIds})`)
     // Nothing can be chosen: cancel and let the transport retry/report.
     pending.selectCallback('')
     if (!pending.callbackStored) {

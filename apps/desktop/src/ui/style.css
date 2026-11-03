@@ -1700,6 +1700,14 @@ body.in-session .main-play {
   font-size: 10px;
 }
 
+/* Saved pairing id (BLE address) so two same-named units are distinguishable. */
+.device .bound-address {
+  margin: 8px 0 0 2px;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
 .modal-actions {
   display: flex;
   justify-content: flex-end;

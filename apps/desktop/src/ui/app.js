@@ -779,15 +779,26 @@
       const actions = document.createElement('div')
       actions.className = 'device-actions'
       const managed = managedDevices.get(device.id)
+      const boundAddress = managed?.bound === true ? managed.pairedId : undefined
       if (managed?.bound === true) {
         const paired = document.createElement('span')
         paired.className = 'tag'
         paired.textContent = '已配对'
-        paired.title = '已与一台实体设备绑定；重连会回到同一台'
+        paired.title = boundAddress === undefined ? '已与一台实体设备绑定；重连会回到同一台' : `已配对 · ${boundAddress}`
         header.append(title, paired, life, actions)
       } else {
         header.append(title, life, actions)
       }
+      // Show the saved chooser id (BLE address) so the operator can match a card
+      // against the Windows/Chrome device list; it is also what "重新配对" clears.
+      const boundLine = boundAddress === undefined
+        ? null
+        : (() => {
+            const line = document.createElement('div')
+            line.className = 'meta bound-address'
+            line.textContent = `配对地址 · ${boundAddress}`
+            return line
+          })()
 
       if (device.lifecycle === 'failed' || device.lifecycle === 'disconnected') {
         const connect = document.createElement('button')
@@ -882,10 +893,10 @@
         const empty = document.createElement('div')
         empty.className = 'empty'
         empty.textContent = device.canScan ? '未发现设备' : '无可用通道'
-        card.append(header, empty)
+        card.append(header, ...(boundLine === null ? [] : [boundLine]), empty)
         return card
       }
-      card.append(header, ...channels.map(channel => channelRow(device.id, channel, locked)))
+      card.append(header, ...(boundLine === null ? [] : [boundLine]), ...channels.map(channel => channelRow(device.id, channel, locked)))
       return card
     })
 

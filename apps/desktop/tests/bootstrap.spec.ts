@@ -257,6 +257,7 @@ describe('host runtime with a BLE transport', () => {
     // the host records which physical box the card got.
     expect(transport.requests.at(-1)?.deviceId).toBeUndefined()
     expect(runtime.listDevices().find(device => device.key === 'coyote')?.bound).toBe(true)
+    expect(runtime.listDevices().find(device => device.key === 'coyote')?.pairedId).toBe('unit-a-1f2e')
     expect(runtime.snapshot().devices.find(device => device.id === 'coyote')?.lifecycle).toBe('ready')
 
     const manifest = JSON.parse(await readFile(join(root, 'state', 'devices.json'), 'utf8')) as {
