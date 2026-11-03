@@ -25,6 +25,8 @@ function refKey(ref: BleCharacteristicRef): string {
 export interface MockBlePeripheralOptions {
   readonly id?: string
   readonly name?: string
+  /** Platform identity the host would persist to bind a card to this unit. */
+  readonly platformId?: string
   readonly clock: Clock
   /** Return an error to fail a specific write. */
   readonly failWrite?: (ref: BleCharacteristicRef, data: Uint8Array) => Error | undefined
@@ -35,6 +37,7 @@ export interface MockBlePeripheralOptions {
 export class MockBlePeripheral implements BlePeripheral {
   readonly id: string
   readonly name: string | undefined
+  readonly platformId: string | undefined
   readonly writes: MockBleWrite[] = []
   /** Characteristics `read` was called on, in order. */
   readonly reads: string[] = []
@@ -47,6 +50,7 @@ export class MockBlePeripheral implements BlePeripheral {
   constructor(private readonly options: MockBlePeripheralOptions) {
     this.id = options.id ?? 'mock-peripheral'
     this.name = options.name
+    this.platformId = options.platformId
     for (const [key, value] of Object.entries(options.reads ?? {})) {
       this.readValues.set(key.toLowerCase(), Uint8Array.from(value))
     }
@@ -126,6 +130,8 @@ export interface MockBleTransportOptions {
   readonly clock: Clock
   readonly id?: string
   readonly name?: string
+  /** Platform id stamped on every peripheral this transport hands out. */
+  readonly platformId?: string
   /** Reject `request` with this error instead of connecting. */
   readonly failRequest?: Error
   readonly failWrite?: (ref: BleCharacteristicRef, data: Uint8Array) => Error | undefined
@@ -170,6 +176,7 @@ export class MockBleTransport implements BleTransport {
       clock: this.options.clock,
       ...(this.options.id === undefined ? {} : { id: `${this.options.id}-${this.sessions.length + 1}` }),
       ...(this.options.name === undefined ? {} : { name: this.options.name }),
+      ...(this.options.platformId === undefined ? {} : { platformId: this.options.platformId }),
       ...(this.options.failWrite === undefined ? {} : { failWrite: this.options.failWrite }),
       ...(this.options.reads === undefined ? {} : { reads: this.options.reads }),
     })

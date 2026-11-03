@@ -281,13 +281,41 @@ export interface HostRuntime {
   listDevices(): DeviceManagerEntry[]
   /** Add one device of the chosen protocol; registers and connects it. */
   addDevice(protocol: DeviceProtocol): Promise<DeviceManagerEntry>
+  /**
+   * Connect one card, then persist the physical unit the chooser picked.
+   *
+   * Two units can share one advertised name; recording `BluetoothDevice.id`
+   * keeps the card (and its label) bound to the same box on later connects.
+   */
+  connectDevice(key: string): Promise<void>
   /** Stop, close, and forget a device. */
   removeDevice(key: string): Promise<void>
+  /** Rename one device card; `undefined`/empty clears the override. */
+  setDeviceLabel(key: string, label: string | undefined): Promise<DeviceManagerEntry[]>
+  /** Forget the paired physical unit; the next connect scans again. */
+  rebindDevice(key: string): Promise<DeviceManagerEntry[]>
 }
 
 /** Protocols an operator can add at run time. */
 export const DEVICE_PROTOCOLS = ['coyote', 'xhtkj', 'ankni', 'mock'] as const
 export type DeviceProtocol = (typeof DEVICE_PROTOCOLS)[number]
+
+/**
+ * Backend-default display names.
+ *
+ * These are the names a card falls back to when its manifest `label` is absent
+ * (or cleared): the backend name is fixed at construction time, so a cleared
+ * label must not leave the old override behind (see `decoratedSnapshot`).
+ */
+const DEFAULT_DEVICE_NAMES: Readonly<Record<DeviceProtocol, string>> = {
+  coyote: 'DG-LAB Coyote 3.0',
+  xhtkj: '谜姬 / XHTKJ 直连',
+  ankni: '安可尼 流式玩具',
+  mock: 'Mock 设备',
+}
+
+/** BLE protocols whose pairing can be reset through the chooser. */
+const REBINDABLE_PROTOCOLS: ReadonlySet<DeviceProtocol> = new Set(['coyote', 'xhtkj', 'ankni'])
 
 /** One entry of the persisted device manifest. */
 export interface DeviceManifestEntry {
@@ -295,8 +323,16 @@ export interface DeviceManifestEntry {
   readonly protocol: DeviceProtocol
   /** Display name override; the backend default is used when omitted. */
   readonly label?: string
-  /** Scan filter override (Coyote family name); use when several units share a name. */
+  /** Scan filter override (e.g. an ANKNI family name); raw name only. */
   readonly bleName?: string
+  /**
+   * Platform device id (`BluetoothDevice.id`) the card is paired with.
+   *
+   * Coyote units advertise the same name, so the first successful connect
+   * records which physical box this card got; later connects pin the chooser
+   * to it. Cleared by "重新配对".
+   */
+  readonly bleId?: string
 }
 
 /** Manifest entry merged with live registry state, for the UI. */
@@ -307,6 +343,10 @@ export interface DeviceManagerEntry {
   readonly lifecycle: DeviceLifecycle | 'unregistered'
   readonly canScan: boolean
   readonly channels: readonly string[]
+  /** True once the card is paired with one physical unit (`bleId`). */
+  readonly bound: boolean
+  /** True when "重新配对" is meaningful (BLE backends with a chooser). */
+  readonly canRebind: boolean
 }
 
 /** File format version; bumped when the well-known device list changes. */
@@ -332,10 +372,37 @@ function isDeviceProtocol(value: unknown): value is DeviceProtocol {
   return typeof value === 'string' && (DEVICE_PROTOCOLS as readonly string[]).includes(value)
 }
 
-function isManifestEntry(value: unknown): value is DeviceManifestEntry {
-  if (typeof value !== 'object' || value === null) return false
+/**
+ * Coerce one manifest record, dropping corrupt optional fields instead of the
+ * whole card.
+ *
+ * `key`/`protocol` are structural and a bad value really does make the entry
+ * unusable; `label`/`bleName`/`bleId` are metadata, and a hand-edited `null`
+ * there must not make a device disappear (and then be persisted as removed).
+ * Empty strings are treated as absent: a blank `bleId` would otherwise mark a
+ * card "paired" with a unit that can never match.
+ */
+function normalizeManifestEntry(value: unknown): DeviceManifestEntry | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
   const entry = value as Record<string, unknown>
-  return typeof entry.key === 'string' && entry.key.length > 0 && isDeviceProtocol(entry.protocol)
+  if (typeof entry.key !== 'string' || entry.key.length === 0) return undefined
+  if (!isDeviceProtocol(entry.protocol)) return undefined
+  const optional = (field: 'label' | 'bleName' | 'bleId'): string | undefined => {
+    const raw = entry[field]
+    if (typeof raw !== 'string') return undefined
+    const trimmed = raw.trim()
+    return trimmed.length === 0 ? undefined : trimmed
+  }
+  const label = optional('label')
+  const bleName = optional('bleName')
+  const bleId = optional('bleId')
+  return {
+    key: entry.key,
+    protocol: entry.protocol,
+    ...(label === undefined ? {} : { label }),
+    ...(bleName === undefined ? {} : { bleName }),
+    ...(bleId === undefined ? {} : { bleId }),
+  }
 }
 
 /**
@@ -1088,10 +1155,10 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
         const parsed: unknown = JSON.parse(raw)
         if (Array.isArray(parsed)) {
           // v1 files were a bare array.
-          manifest = parsed.filter(isManifestEntry)
+          manifest = parsed.map(normalizeManifestEntry).filter((entry): entry is DeviceManifestEntry => entry !== undefined)
         } else if (typeof parsed === 'object' && parsed !== null) {
           const file = parsed as DeviceManifestFile
-          manifest = Array.isArray(file.devices) ? file.devices.filter(isManifestEntry) : []
+          manifest = Array.isArray(file.devices) ? file.devices.map(normalizeManifestEntry).filter((entry): entry is DeviceManifestEntry => entry !== undefined) : []
           manifestVersion = typeof file.version === 'number' ? file.version : 1
         }
       } catch (error) {
@@ -1144,8 +1211,38 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     }
   }
 
+  /**
+   * Live backend per manifest key.
+   *
+   * The registry keeps its own map, but the host needs the backend instance to
+   * read the platform id chosen by the BLE chooser and to rebuild one on
+   * "重新配对".
+   */
+  const backends = new Map<string, DeviceBackend>()
+
+  /** Register one manifest entry's backend (used by boot, add and rebind). */
+  const registerDeviceBackend = (entry: DeviceManifestEntry): DeviceBackend => {
+    const backend = createBackend(entry)
+    backends.set(entry.key, backend)
+    registry.register(backend)
+    return backend
+  }
+
   /** Build the backend for one manifest entry. */
   const createBackend = (entry: DeviceManifestEntry): DeviceBackend => {
+    // Read the pairing pin fresh on every connect: "重新配对" clears `bleId`
+    // without rebuilding the backend.
+    const boundDeviceId = (): string | undefined => manifest.find(candidate => candidate.key === entry.key)?.bleId
+    // Unpinned pairings must not take a unit another card has persisted — after
+    // a restart no link is live yet, so "connected" alone is not enough.
+    const reservedDeviceIds = (): readonly string[] => {
+      const ids = new Set<string>()
+      for (const candidate of manifest) {
+        if (candidate.key === entry.key || candidate.bleId === undefined) continue
+        ids.add(candidate.bleId)
+      }
+      return [...ids]
+    }
     switch (entry.protocol) {
       case 'coyote': {
         const transport = options.bleTransport
@@ -1154,8 +1251,10 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
           clock,
           transport,
           id: entry.key,
-          name: entry.label ?? 'DG-LAB Coyote 3.0',
+          name: entry.label ?? DEFAULT_DEVICE_NAMES.coyote,
           ...(entry.bleName === undefined ? {} : { bleName: entry.bleName }),
+          bleDeviceId: boundDeviceId,
+          bleReservedIds: reservedDeviceIds,
           // Read fresh on every call so a cap change reaches the hardware.
           // `effective` is the session ceiling applied on top of the channel
           // cap, so `BF <= X` holds by construction (D4, rule 4).
@@ -1181,8 +1280,10 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
           clock,
           transport,
           id: entry.key,
-          name: entry.label ?? '谜姬 / XHTKJ 直连',
+          name: entry.label ?? DEFAULT_DEVICE_NAMES.xhtkj,
           ...(entry.bleName === undefined ? {} : { bleName: entry.bleName }),
+          bleDeviceId: boundDeviceId,
+          bleReservedIds: reservedDeviceIds,
           onError: recordError,
         })
       }
@@ -1193,15 +1294,17 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
           clock,
           transport,
           id: entry.key,
-          name: entry.label ?? '安可尼 流式玩具',
+          name: entry.label ?? DEFAULT_DEVICE_NAMES.ankni,
           ...(entry.bleName === undefined ? {} : { bleName: entry.bleName }),
+          bleDeviceId: boundDeviceId,
+          bleReservedIds: reservedDeviceIds,
           onError: recordError,
         })
       }
       case 'mock':
         return new MockBackend({
           id: entry.key,
-          name: entry.label ?? 'Mock 设备',
+          name: entry.label ?? DEFAULT_DEVICE_NAMES.mock,
           clock,
           keepAliveMs: 400,
           refreshMs: 100,
@@ -1221,7 +1324,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       continue
     }
     try {
-      registry.register(createBackend(entry))
+      registerDeviceBackend(entry)
     } catch (error) {
       recordError(error)
     }
@@ -1275,10 +1378,14 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       return {
         key: entry.key,
         protocol: entry.protocol,
-        label: entry.label ?? live?.name ?? entry.key,
+        // The backend name is fixed at construction time; a cleared label must
+        // fall back to the protocol default, not to the old override.
+        label: entry.label ?? DEFAULT_DEVICE_NAMES[entry.protocol],
         lifecycle: live?.lifecycle ?? 'disconnected',
         canScan: live?.canScan ?? false,
         channels: live === undefined ? [] : live.channels.map(channel => channel.id),
+        bound: entry.bleId !== undefined,
+        canRebind: REBINDABLE_PROTOCOLS.has(entry.protocol),
       }
     })
   }
@@ -1298,7 +1405,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     }
     return runDeviceOp(async () => {
       const entry: DeviceManifestEntry = { key: nextDeviceKey(protocol), protocol }
-      registry.register(createBackend(entry))
+      registerDeviceBackend(entry)
       manifest = [...manifest, entry]
       await saveManifest()
       // Registered but not connected: the operator drives the connection with
@@ -1310,9 +1417,154 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
   const removeDevice = async (key: string): Promise<void> => {
     await runDeviceOp(async () => {
       await registry.unregister(key)
+      backends.delete(key)
       manifest = manifest.filter(entry => entry.key !== key)
       await saveManifest()
     })
+  }
+
+  /** Strip one optional field without leaving `undefined` in the JSON file. */
+  const dropField = (entry: DeviceManifestEntry, field: 'label' | 'bleId'): DeviceManifestEntry => {
+    const copy: Record<string, unknown> = { ...entry }
+    delete copy[field]
+    return copy as unknown as DeviceManifestEntry
+  }
+
+  /** Validate and normalise a human device name; empty clears the override. */
+  const cleanDeviceLabel = (value: unknown): string | undefined => {
+    if (value === undefined) return undefined
+    if (typeof value !== 'string') throw new Error('label must be a string')
+    const label = value.trim().replace(/\s+/gu, ' ')
+    if (label.length === 0) return undefined
+    if (label.length > 40) throw new Error('label must be at most 40 characters')
+    return label
+  }
+
+  /**
+   * Rename one device card.
+   *
+   * The name is stored on the manifest and overlaid on the registry snapshot,
+   * so two same-named units become "左"/"右" without rebuilding the backend
+   * (a rebuild would drop an open BLE link).
+   */
+  const setDeviceLabel = async (key: string, value: unknown): Promise<DeviceManagerEntry[]> => {
+    return runDeviceOp(async () => {
+      if (!manifest.some(entry => entry.key === key)) throw new Error(`no such device: ${key}`)
+      const label = cleanDeviceLabel(value)
+      manifest = manifest.map(entry => {
+        if (entry.key !== key) return entry
+        return label === undefined ? dropField(entry, 'label') : { ...entry, label }
+      })
+      await saveManifest()
+      await audit.record({
+        actor: 'human',
+        action: 'settings_change',
+        result: 'ok',
+        detail: { scope: 'device-label', deviceId: key, label: label ?? null },
+      })
+      return listDevices()
+    })
+  }
+
+  /**
+   * Forget which physical unit a card was paired with.
+   *
+   * Drops the live link (if any) and clears `bleId`; the next 连接 pairs
+   * whichever free unit answers. This is how an operator swaps which box a
+   * card drives without removing and re-adding it.
+   */
+  const rebindDevice = async (key: string): Promise<DeviceManagerEntry[]> => {
+    return runDeviceOp(async () => {
+      const entry = manifest.find(candidate => candidate.key === key)
+      if (entry === undefined) throw new Error(`no such device: ${key}`)
+      if (backends.has(key)) {
+        try {
+          await registry.disconnect(key)
+        } catch (error) {
+          recordError(error)
+          // The link may still be live; clearing the pin now could bind this
+          // card to a different box while the old one keeps running.
+          throw new Error(
+            `could not disconnect ${key}: ${error instanceof Error ? error.message : String(error)}; `
+            + 'the pairing was not cleared',
+          )
+        }
+      }
+      manifest = manifest.map(candidate => (candidate.key === key ? dropField(candidate, 'bleId') : candidate))
+      await saveManifest()
+      await audit.record({
+        actor: 'human',
+        action: 'settings_change',
+        result: 'ok',
+        detail: { scope: 'device-rebind', deviceId: key },
+      })
+      return listDevices()
+    })
+  }
+
+  /**
+   * Connect a card, then remember the physical unit the chooser picked.
+   *
+   * Persisting `bleId` is what keeps "左" pointing at the same box after a
+   * reconnect or a restart: the next connect passes it back as a chooser pin.
+   *
+   * Serialised with the other device operations: the Electron chooser holds a
+   * single pending selection, so two simultaneous scans would overwrite each
+   * other's candidates (and could answer the wrong request).
+   */
+  const connectDevice = async (key: string): Promise<void> => {
+    return runDeviceOp(async () => {
+      await registry.connect(key, controller.signal)
+      const platformId = backends.get(key)?.platformDeviceId
+      const entry = manifest.find(candidate => candidate.key === key)
+      if (platformId === undefined || entry === undefined) return
+      // The chooser already excludes other cards' saved units; this is the
+      // defensive check for a transport/backends that still returned one. Do
+      // not persist a duplicate pin (it would lock both cards out later).
+      const owner = manifest.find(candidate => candidate.key !== key && candidate.bleId === platformId)
+      if (owner !== undefined) {
+        try {
+          await registry.disconnect(key)
+        } catch (error) {
+          recordError(error)
+        }
+        throw new Error(
+          `Bluetooth device ${platformId} is already paired with "${owner.key}"; `
+          + 'press 重新配对 on one of the cards to unpair it first',
+        )
+      }
+      if (entry.bleId === platformId) return
+      manifest = manifest.map(candidate => (candidate.key === key ? { ...candidate, bleId: platformId } : candidate))
+      await saveManifest()
+      await audit.record({
+        actor: 'system',
+        action: 'settings_change',
+        result: 'ok',
+        detail: { scope: 'device-paired', deviceId: key, platformId },
+      })
+    })
+  }
+
+  /**
+   * Registry snapshot with manifest device names overlaid.
+   *
+   * Backends carry the name they were built with; the rename UI lives on the
+   * manifest, and overlaying here keeps renames live without touching a
+   * connected backend (or making the prompt/audit see an inconsistent name).
+   * A manifest entry with no label (cleared / never set) shows the protocol
+   * default rather than the name baked in at boot.
+   */
+  const decoratedSnapshot = (): RegistrySnapshot => {
+    const snapshot = registry.snapshot()
+    return {
+      ...snapshot,
+      devices: snapshot.devices.map(device => {
+        const entry = manifest.find(candidate => candidate.key === device.id)
+        if (entry === undefined) return device
+        const name = entry.label ?? DEFAULT_DEVICE_NAMES[entry.protocol]
+        return name === device.name ? device : { ...device, name }
+      }),
+    }
   }
 
   // Devices register disconnected; nothing connects or scans until the operator
@@ -1347,7 +1599,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
   let dashboardAddress: { host: string; port: number } | undefined
 
   const dashboardDeps: DashboardDeps = {
-    snapshot: () => registry.snapshot(),
+    snapshot: decoratedSnapshot,
     // Model-requested band percent per channel, shown by the console instead
     // of the mapped output; the session owns this state.
     requestedPercents: () => play.requestedPercents(),
@@ -1413,6 +1665,8 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     listDevices,
     addDevice: async protocol => addDevice(protocol),
     removeDevice: async key => removeDevice(key),
+    setDeviceLabel: async (key, label) => setDeviceLabel(key, label),
+    rebindDevice: async key => rebindDevice(key),
     rawWrite: async (deviceId, hex, channel) => registry.rawWrite('human', deviceId, hex, channel),
     setCap: async (deviceId, channelId, patch) => {
       await registry.setPolicyByHuman(deviceId, channelId, patch)
@@ -1454,7 +1708,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
         durationSec: durationSec === undefined ? capacity : Math.min(Math.round(durationSec), capacity),
       })
     },
-    connect: async deviceId => { await registry.connect(deviceId, controller.signal) },
+    connect: async deviceId => { await connectDevice(deviceId) },
     scan: async (deviceId, durationMs) => { await registry.scan('human', deviceId, durationMs, controller.signal) },
     listWaveforms: () => waveforms.list(),
     waveformPreview: id => {
@@ -1549,7 +1803,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       url: intifaceProcess.url,
       owned: intifaceProcess.owned,
     },
-    snapshot: () => registry.snapshot(),
+    snapshot: decoratedSnapshot,
     sensorsStatus,
     sensorFrame,
     pushFeatures,
@@ -1563,6 +1817,9 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     listDevices,
     addDevice,
     removeDevice,
+    setDeviceLabel,
+    rebindDevice,
+    connectDevice,
     async shutdown(): Promise<void> {
       if (stopped) return
       stopped = true

@@ -1688,6 +1688,18 @@ body.in-session .main-play {
   height: 15px;
 }
 
+/* Rename dialog: device names can be renamed from the device card. */
+.modal-box input[type="text"] {
+  width: 100%;
+  margin-top: 6px;
+}
+
+/* "已配对" marker next to a device title. */
+.device header .tag {
+  margin-left: 8px;
+  font-size: 10px;
+}
+
 .modal-actions {
   display: flex;
   justify-content: flex-end;

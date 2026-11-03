@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   BF_LENGTH,
@@ -244,6 +244,76 @@ describe('host runtime with a BLE transport', () => {
     // The transport addresses each unit by its own filter name.
     expect(transport.peripheralFor(filter => filter.name === COYOTE_BLE_NAME)).toBeDefined()
     expect(runtime.listDevices().map(entry => entry.key)).toEqual(['coyote', 'xhtkj', 'zkrxb', 'coyote-2'])
+  })
+
+  it('binds a coyote card to the chosen platform id and pins reconnects', async () => {
+    const clock = new FakeClock()
+    const transport = new MockBleTransport({ clock, name: COYOTE_BLE_NAME, platformId: 'unit-a-1f2e' })
+    runtime = await createHostRuntime({ dataDir: root, clock, withPanicServer: false, bleTransport: transport })
+
+    expect(runtime.listDevices().find(device => device.key === 'coyote')?.bound).toBe(false)
+    await runtime.connectDevice('coyote')
+    // First pairing: no pin on the filter (the chooser picks a free unit), then
+    // the host records which physical box the card got.
+    expect(transport.requests.at(-1)?.deviceId).toBeUndefined()
+    expect(runtime.listDevices().find(device => device.key === 'coyote')?.bound).toBe(true)
+    expect(runtime.snapshot().devices.find(device => device.id === 'coyote')?.lifecycle).toBe('ready')
+
+    const manifest = JSON.parse(await readFile(join(root, 'state', 'devices.json'), 'utf8')) as {
+      devices: Array<{ key: string; bleId?: string }>
+    }
+    expect(manifest.devices.find(device => device.key === 'coyote')?.bleId).toBe('unit-a-1f2e')
+
+    // Reconnect sends the stored platform id as a chooser pin, so two
+    // same-named units cannot swap cards.
+    await runtime.registry.disconnect('coyote')
+    await runtime.connectDevice('coyote')
+    expect(transport.requests.at(-1)?.deviceId).toBe('unit-a-1f2e')
+  })
+
+  it('loads a hand-edited manifest and falls back to default names when a label is cleared', async () => {
+    const clock = new FakeClock()
+    const transport = new MockBleTransport({ clock, name: COYOTE_BLE_NAME })
+    await mkdir(join(root, 'state'), { recursive: true })
+    await writeFile(join(root, 'state', 'devices.json'), JSON.stringify({
+      version: 3,
+      devices: [
+        // A blank bleId must read as "not paired"; a null label must not drop
+        // the card (it used to disappear and then be persisted as removed).
+        { key: 'coyote', protocol: 'coyote', label: '左', bleId: '' },
+        { key: 'xhtkj', protocol: 'xhtkj', label: null },
+      ],
+    }))
+    runtime = await createHostRuntime({ dataDir: root, clock, withPanicServer: false, bleTransport: transport })
+
+    const coyote = runtime.listDevices().find(entry => entry.key === 'coyote')
+    expect(coyote?.label).toBe('左')
+    expect(coyote?.bound).toBe(false)
+    expect(coyote?.canRebind).toBe(true)
+    expect(runtime.listDevices().find(entry => entry.key === 'xhtkj')?.label).toBe('谜姬 / XHTKJ 直连')
+    expect(runtime.snapshot().devices.find(device => device.id === 'coyote')?.name).toBe('左')
+
+    // Clearing goes back to the protocol default, not to the boot-time name.
+    await runtime.setDeviceLabel('coyote', '')
+    expect(runtime.listDevices().find(entry => entry.key === 'coyote')?.label).toBe('DG-LAB Coyote 3.0')
+    expect(runtime.snapshot().devices.find(device => device.id === 'coyote')?.name).toBe('DG-LAB Coyote 3.0')
+  })
+
+  it('reserves units paired with other cards and refuses a duplicate pairing', async () => {
+    const clock = new FakeClock()
+    const transport = new MockBleTransport({ clock, name: COYOTE_BLE_NAME, platformId: 'unit-shared' })
+    runtime = await createHostRuntime({ dataDir: root, clock, withPanicServer: false, bleTransport: transport })
+
+    await runtime.connectDevice('coyote')
+    expect(runtime.listDevices().find(entry => entry.key === 'coyote')?.bound).toBe(true)
+    const second = await runtime.addDevice('coyote')
+
+    // The unbound card excludes the unit already persisted on the first card.
+    await expect(runtime.connectDevice(second.key)).rejects.toThrow(/already paired/)
+    expect(transport.requests.at(-1)?.excludeDeviceIds).toContain('unit-shared')
+    // The duplicate pin was not persisted and the wrong link was released.
+    expect(runtime.listDevices().find(entry => entry.key === second.key)?.bound).toBe(false)
+    expect(runtime.snapshot().devices.find(device => device.id === second.key)?.lifecycle).not.toBe('ready')
   })
 
   it('allows adding and removing a mock device without a BLE transport (start-dev)', async () => {

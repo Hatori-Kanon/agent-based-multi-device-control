@@ -495,6 +495,46 @@ describe('shutdown', () => {
     )).code).toBe('UNKNOWN_DEVICE')
     expect(h.records().some(record => record.action === 'device_removed')).toBe(true)
   })
+
+  it('disconnects a device without forgetting it, so a later connect re-scans', async () => {
+    const h = createHarness()
+    await h.registry.connect('toy', signal())
+    await h.registry.runPattern('model', { deviceId: 'toy', channelId: 'a', envelope: steady(30), durationSec: 60 })
+    h.clock.advance(50)
+    await h.registry.settled()
+    expect(h.toy.deviceLevel('a')).toBe(30)
+
+    await h.registry.disconnect('toy')
+    await h.registry.settled()
+    expect(h.toy.deviceLevel('a')).toBe(0)
+    expect(h.toy.closeCount).toBe(1)
+    // Still registered (a rebind needs the same card/backends), just not live.
+    expect(h.registry.snapshot().devices.find(device => device.id === 'toy')?.lifecycle).toBe('disconnected')
+    expect(h.records().some(record => record.action === 'device_disconnected')).toBe(true)
+
+    // A second connect on the same backend is allowed (this is how 重新配对 works).
+    await h.registry.connect('toy', signal())
+    expect(h.registry.snapshot().devices.find(device => device.id === 'toy')?.lifecycle).toBe('ready')
+  })
+
+  it('treats a second connect while ready as a no-op and refuses an in-flight duplicate', async () => {
+    const h = createHarness()
+    await h.registry.connect('toy', signal())
+    const firstConnectRecords = h.records().filter(record => record.action === 'connect').length
+
+    // The UI can still show 连接 for a moment after success; a second click must
+    // not re-scan and mark the live device failed.
+    await h.registry.connect('toy', signal())
+    expect(h.records().filter(record => record.action === 'connect').length).toBe(firstConnectRecords)
+    expect(h.registry.snapshot().devices.find(device => device.id === 'toy')?.lifecycle).toBe('ready')
+
+    await h.registry.disconnect('toy')
+    const first = h.registry.connect('toy', signal())
+    const duplicate = h.registry.connect('toy', signal())
+    await expect(duplicate).rejects.toMatchObject({ code: 'NOT_CONNECTED' })
+    await first
+    expect(h.registry.snapshot().devices.find(device => device.id === 'toy')?.lifecycle).toBe('ready')
+  })
 })
 
 describe('audit trail', () => {

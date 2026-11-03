@@ -93,6 +93,27 @@ describe('AnkniBackend', () => {
     expect(frameOf(written[written.length - 1]!)).toEqual([0xaa, 0x08, 0x04, 0x28, 0x00, 0x00, 0x00, 0xde])
   })
 
+  it('pins the chooser to a bound platform id and reports the connected unit', async () => {
+    const clock = new FakeClock()
+    const transport = new MockBleTransport({
+      clock,
+      name: 'ANKNI ZKRXB',
+      platformId: 'ankni-1',
+      reads: { [PNP_KEY]: pnpFor(0x2000) },
+    })
+    const backend = new AnkniBackend({
+      clock,
+      transport,
+      bleDeviceId: () => 'ankni-1',
+      bleReservedIds: () => ['ankni-2'],
+    })
+    await backend.connect(signal())
+    expect(transport.requests[0]?.deviceId).toBe('ankni-1')
+    expect(transport.requests[0]?.excludeDeviceIds).toEqual(['ankni-2'])
+    expect(backend.platformDeviceId).toBe('ankni-1')
+    await backend.close()
+  })
+
   it('stops by streaming the zero frame', async () => {
     const h = harness()
     await h.backend.connect(signal())

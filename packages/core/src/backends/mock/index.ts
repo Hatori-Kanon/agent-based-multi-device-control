@@ -53,6 +53,8 @@ export class MockBackend implements DeviceBackend {
   readonly id: string
   readonly name: string
   readonly channels: readonly Channel[]
+  /** Not a Web Bluetooth backend, so there is no platform chooser identity. */
+  readonly platformDeviceId = undefined
   /** Every write the registry performed, in order. */
   readonly writes: MockWrite[] = []
   /** Raw frames from an experiment (writeRaw). */

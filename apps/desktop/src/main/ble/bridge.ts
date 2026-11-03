@@ -18,9 +18,11 @@ export interface BleBridge {
    * Request and connect one matching device.
    *
    * `deviceId` pins the choice when the platform chooser already ran; omitted,
-   * the worker asks the OS to pick.
+   * the worker asks the OS to pick. The resolved `deviceId` is the platform
+   * identity of the chosen unit (`BluetoothDevice.id`), which the host persists
+   * so a card stays bound to one of several same-named units.
    */
-  request(filter: BleFilter, deviceId?: string): Promise<{ handle: string; name?: string }>
+  request(filter: BleFilter, deviceId?: string): Promise<{ handle: string; name?: string; deviceId?: string }>
   /**
    * Open the platform chooser for a filter and resolve with the chosen device
    * id, or `undefined` when nothing suitable appeared. The caller drives the
@@ -38,6 +40,12 @@ export interface BleBridge {
    * reason `requestDevice` was refused (adapter off, unavailable, denied).
    */
   readonly lastSelectionError: string | undefined
+  /**
+   * Why the most recent chooser produced no device, when the host can tell
+   * (`pinned-not-found` / `pinned-already-connected` / `pinned-reserved` /
+   * `none-available`). Used to make the failure message actionable.
+   */
+  readonly lastSelectionReason: string | undefined
   /**
    * Execution trace of the most recent selection, surfaced in the failure
    * message because terminal stdout can be buffered and lost.
@@ -88,6 +96,8 @@ class BridgedPeripheral implements BlePeripheral {
     readonly id: string,
     readonly name: string | undefined,
     private readonly bridge: BleBridge,
+    /** Platform identity of the chosen unit (`BluetoothDevice.id`). */
+    readonly platformId: string | undefined,
   ) {}
 
   get connected(): boolean {
@@ -204,15 +214,22 @@ export class BridgedBleTransport implements BleTransport {
       signal.throwIfAborted()
       try {
         // Call through the object, never detached: `const chooser = bridge.selectionMethod; chooser(...)` loses `this`, and the method's first `this.` reference throws. The fake in tests did not catch this because it uses an arrow-function property.
-        const deviceId = this.bridge.selectDevice === undefined
+        const chosenId = this.bridge.selectDevice === undefined
           ? undefined
           : await this.bridge.selectDevice(filter, signal)
-        totalCandidates += this.bridge.lastSelectionSize ?? 0
+        // A chooser-backed selection reports its candidate count here; the
+        // Electron bridge only learns it while `request` runs (read below).
+        if (this.bridge.selectDevice !== undefined) {
+          totalCandidates += this.bridge.lastSelectionSize ?? 0
+        }
         // A selection that found nothing means "scan again", not "connect to
         // nothing": skip straight to the next attempt without asking the OS.
-        if (this.bridge.selectDevice !== undefined && deviceId === undefined) continue
-        const { handle, name } = await this.bridge.request(filter, deviceId)
-        const peripheral = new BridgedPeripheral(handle, name, this.bridge)
+        if (this.bridge.selectDevice !== undefined && chosenId === undefined) continue
+        const { handle, name, deviceId } = await this.bridge.request(filter, chosenId)
+        if (this.bridge.selectDevice === undefined) {
+          totalCandidates += this.bridge.lastSelectionSize ?? 0
+        }
+        const peripheral = new BridgedPeripheral(handle, name, this.bridge, deviceId)
         this.peripherals.set(handle, peripheral)
         if (signal.aborted) {
           await peripheral.disconnect()
@@ -220,6 +237,12 @@ export class BridgedBleTransport implements BleTransport {
         }
         return peripheral
       } catch (error) {
+        // On the Electron path the chooser ran inside `request`, so the count is
+        // only final once it settles; reading it before the request reported
+        // "no devices found" on the first failure.
+        if (this.bridge.selectDevice === undefined) {
+          totalCandidates += this.bridge.lastSelectionSize ?? 0
+        }
         lastError = error
       }
     }
@@ -232,9 +255,22 @@ export class BridgedBleTransport implements BleTransport {
     const platformError = totalCandidates === 0 && this.bridge.lastSelectionError !== undefined
       ? `; the Bluetooth stack reported: ${this.bridge.lastSelectionError}`
       : ''
+    const reason = this.bridge.lastSelectionReason
+    // A chooser miss has a precise cause; say which, instead of always telling
+    // the operator to power a unit on.
+    const reasonHint = reason === 'pinned-already-connected'
+      ? '; the paired unit is already connected to another device card in this console — check which card owns it, or press 重新配对 on this one'
+      : reason === 'pinned-reserved'
+        ? '; the paired unit is already assigned to another device card — press 重新配对 on one of the two cards'
+        : ''
     const guidance = totalCandidates === 0
       ? 'no Bluetooth devices were found at all; check that Windows Bluetooth is on and the toy is powered on'
       : `found ${totalCandidates} device(s) but none matched; make sure the toy is powered on, nearby, and not already connected to another app`
+    // A bound card must not silently grab a different unit, so say which unit it
+    // is waiting for and how to re-pair instead.
+    const pinnedHint = filter.deviceId === undefined
+      ? ''
+      : `; this card is paired with Bluetooth device ${filter.deviceId} — power that unit on, or press 重新配对 to pair another one`
     const trace = this.bridge.lastSelectionTrace !== undefined && this.bridge.lastSelectionTrace.length > 0
       ? `; selection trace: [${this.bridge.lastSelectionTrace.join(' | ')}]`
       : ''
@@ -243,7 +279,7 @@ export class BridgedBleTransport implements BleTransport {
       : `; inner cause: ${describeUnknown(lastError)}`
     throw new SafetyError(
       'NOT_CONNECTED',
-      `no BLE device matched this request after ${attempts} attempt(s)${describeFilter(filter)}; ${guidance}${platformError}${trace}${cause}`,
+      `no BLE device matched this request after ${attempts} attempt(s)${describeFilter(filter)}; ${guidance}${reasonHint}${pinnedHint}${platformError}${trace}${cause}`,
     )
   }
 
@@ -258,8 +294,11 @@ export class BridgedBleTransport implements BleTransport {
 
 /** Human-readable hint about what a filter was looking for. */
 function describeFilter(filter: BleFilter): string {
+  const parts: string[] = []
   const wanted = filter.name ?? filter.namePrefix ?? filter.services[0]
-  return wanted === undefined ? '' : ` (wanted: ${wanted})`
+  if (wanted !== undefined) parts.push(`wanted: ${wanted}`)
+  if (filter.deviceId !== undefined) parts.push(`bound unit: ${filter.deviceId}`)
+  return parts.length === 0 ? '' : ` (${parts.join('; ')})`
 }
 
 /**

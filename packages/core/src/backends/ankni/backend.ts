@@ -51,6 +51,17 @@ export interface AnkniBackendOptions {
   readonly transport: BleTransport
   /** Advertised name to scan for; pins a specific unit among the family. */
   readonly bleName?: string
+  /**
+   * Platform device id previously bound to this card, read on every connect.
+   * The host stores the chooser's `deviceId` per card so identical-name units
+   * stay tied to their card instead of whichever one advertises first.
+   */
+  readonly bleDeviceId?: () => string | undefined
+  /**
+   * Platform ids already bound to *other* device cards, read on every connect.
+   * An unpinned pairing must not grab a unit another card has persisted.
+   */
+  readonly bleReservedIds?: () => readonly string[]
   readonly frameMs?: number
   readonly onError?: (error: unknown) => void
 }
@@ -59,6 +70,8 @@ export class AnkniBackend implements DeviceBackend {
   readonly id: string
   readonly name: string
   readonly channels = CHANNELS
+  /** Platform id of the unit this backend connected to; persisted by the host. */
+  platformDeviceId: string | undefined
 
   private peripheral: BlePeripheral | undefined
   private layout: XhtkjLayout | undefined
@@ -80,13 +93,19 @@ export class AnkniBackend implements DeviceBackend {
   async connect(signal: AbortSignal): Promise<void> {
     signal.throwIfAborted()
     this.resetState()
+    this.platformDeviceId = undefined
 
+    const pinnedDeviceId = this.options.bleDeviceId?.()
+    const reservedDeviceIds = this.options.bleReservedIds?.() ?? []
     const peripheral = await this.options.transport.request({
       services: [XHTKJ_ADVERTISING_SERVICE],
       optionalServices: [XHTKJ_DEVICE_SERVICE, DEVICE_INFORMATION_SERVICE, XHTKJ_ALT_SERVICE],
       ...(this.options.bleName === undefined ? {} : { name: this.options.bleName }),
+      ...(pinnedDeviceId === undefined ? {} : { deviceId: pinnedDeviceId }),
+      ...(reservedDeviceIds.length === 0 ? {} : { excludeDeviceIds: reservedDeviceIds }),
     }, signal)
     this.peripheral = peripheral
+    this.platformDeviceId = peripheral.platformId
     this.disconnectOff = peripheral.onDisconnect(() => { this.handleLinkLost() })
 
     try {

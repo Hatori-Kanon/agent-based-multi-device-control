@@ -47,6 +47,10 @@
     devAddDialog: document.getElementById('devAddDialog'),
     devAddConfirm: document.getElementById('devAddConfirm'),
     devAddCancel: document.getElementById('devAddCancel'),
+    devRenameDialog: document.getElementById('devRenameDialog'),
+    devRenameInput: document.getElementById('devRenameInput'),
+    devRenameConfirm: document.getElementById('devRenameConfirm'),
+    devRenameCancel: document.getElementById('devRenameCancel'),
     devWfName: document.getElementById('devWfName'),
     devWfFrames: document.getElementById('devWfFrames'),
     devWfImport: document.getElementById('devWfImport'),
@@ -60,6 +64,15 @@
   let waveforms = []
   /** Keys of manifest devices: only these get a 移除 button. */
   let managedKeys = new Set()
+  /**
+   * Manifest metadata per device key (protocol, bound unit, label).
+   *
+   * The snapshot only carries the name; the console needs `protocol`/`canRebind`
+   * to know whether "重新配对" applies and `bound` to show 已配对.
+   */
+  let managedDevices = new Map()
+  /** Device keys whose 连接 request is in flight (prevents double scans). */
+  const busyConnects = new Set()
   /** 正在编辑的通道控件（device:channel:field）。 */
   const editing = new Set()
   /** 上一次快照的锁定状态，用于「刚锁上」时立即停掉直控 keepalive。 */
@@ -739,7 +752,10 @@
     const nextSignature = JSON.stringify({
       locked,
       devices: snapshot.devices,
-      managed: [...managedKeys].sort(),
+      managed: [...managedKeys].sort().map(key => {
+        const entry = managedDevices.get(key)
+        return `${key}:${entry?.protocol ?? ''}:${entry?.bound === true ? 'bound' : 'unbound'}`
+      }),
     })
     if (nextSignature === deviceSignature) return
     deviceSignature = nextSignature
@@ -762,17 +778,36 @@
       life.textContent = LIFECYCLE_TEXT[shownLife] ?? '未连接'
       const actions = document.createElement('div')
       actions.className = 'device-actions'
-      header.append(title, life, actions)
+      const managed = managedDevices.get(device.id)
+      if (managed?.bound === true) {
+        const paired = document.createElement('span')
+        paired.className = 'tag'
+        paired.textContent = '已配对'
+        paired.title = '已与一台实体设备绑定；重连会回到同一台'
+        header.append(title, paired, life, actions)
+      } else {
+        header.append(title, life, actions)
+      }
 
       if (device.lifecycle === 'failed' || device.lifecycle === 'disconnected') {
         const connect = document.createElement('button')
         connect.className = 'mini'
         connect.type = 'button'
         connect.textContent = '连接'
-        connect.addEventListener('click', () => call(api('/api/connect', {
-          method: 'POST',
-          body: JSON.stringify({ deviceId: device.id }),
-        })))
+        connect.addEventListener('click', () => {
+          // A second click while the chooser is open would open a second scan;
+          // the host serialises them too, but the button should not offer it.
+          if (busyConnects.has(device.id)) return
+          busyConnects.add(device.id)
+          connect.disabled = true
+          void call(api('/api/connect', {
+            method: 'POST',
+            body: JSON.stringify({ deviceId: device.id }),
+          })).finally(() => {
+            busyConnects.delete(device.id)
+            if (connect.isConnected) connect.disabled = false
+          })
+        })
         actions.append(connect)
       }
       if (device.canScan && device.lifecycle === 'ready') {
@@ -788,6 +823,36 @@
       }
 
       if (managedKeys.has(device.id)) {
+        const rename = document.createElement('button')
+        rename.className = 'mini'
+        rename.type = 'button'
+        rename.textContent = '重命名'
+        rename.addEventListener('click', () => openRenameDialog(device.id, device.name))
+        actions.append(rename)
+
+        if (managed !== undefined && managed.canRebind === true) {
+          const rebind = document.createElement('button')
+          rebind.className = 'mini'
+          rebind.type = 'button'
+          rebind.textContent = '重新配对'
+          rebind.addEventListener('click', async () => {
+            const ok = await window.embodiedConfirm(
+              `重新配对「${device.name}」？会先断开当前连接，之后点「连接」重新扫描并绑定到一台设备。`,
+            )
+            if (!ok) return
+            try {
+              await api('/api/devices/rebind', {
+                method: 'POST',
+                body: JSON.stringify({ key: device.id }),
+              })
+              await refresh()
+            } catch (error) {
+              fail(error.message ?? String(error))
+            }
+          })
+          actions.append(rebind)
+        }
+
         const remove = document.createElement('button')
         remove.className = 'mini'
         remove.type = 'button'
@@ -903,10 +968,20 @@
   }
 
   // ── 添加设备弹窗 ────────────────────────────────────────────────────────
-  /** Focusable controls inside the dialog, for the Tab trap. */
-  function dialogFocusables() {
-    return [...el.devAddDialog.querySelectorAll('button, input')]
-      .filter(node => !node.disabled)
+  /** Trap Tab inside an open modal; focus must not escape to the page behind. */
+  function trapFocus(dialog, event) {
+    if (event.key !== 'Tab') return
+    const items = [...dialog.querySelectorAll('button, input')].filter(node => !node.disabled)
+    if (items.length === 0) return
+    const first = items[0]
+    const last = items[items.length - 1]
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault()
+      last.focus()
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault()
+      first.focus()
+    }
   }
   function openAddDialog() {
     el.devAddDialog.style.display = 'flex'
@@ -929,20 +1004,7 @@
     if (event.key === 'Escape') closeAddDialog()
   })
   // Tab 在模态框内循环：对话框之外的控件在视觉上不可达，键盘也应一致。
-  el.devAddDialog.addEventListener('keydown', event => {
-    if (event.key !== 'Tab') return
-    const items = dialogFocusables()
-    if (items.length === 0) return
-    const first = items[0]
-    const last = items[items.length - 1]
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault()
-      last.focus()
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault()
-      first.focus()
-    }
-  })
+  el.devAddDialog.addEventListener('keydown', event => { trapFocus(el.devAddDialog, event) })
   el.devAddConfirm.addEventListener('click', async () => {
     // 协议只来自对话框里被选中的单选项；没有选中时退回郊狼。
     const checked = el.devAddDialog.querySelector('input[name="addProto"]:checked')
@@ -958,6 +1020,56 @@
     } catch (error) {
       fail(error.message ?? String(error))
     }
+  })
+
+  // ── 重命名设备弹窗 ──────────────────────────────────────────────────────
+  // 两台同型号郊狼的蓝牙名相同，设备名是操作者区分「左/右」的唯一手段；
+  // 名字存在 manifest 上，不影响已连接的 backend（重命名不断线）。
+  let renameKey = null
+
+  function openRenameDialog(key, currentName) {
+    renameKey = key
+    el.devRenameInput.value = currentName
+    el.devRenameDialog.style.display = 'flex'
+    el.devRenameInput.focus()
+    el.devRenameInput.select()
+  }
+
+  function closeRenameDialog() {
+    if (el.devRenameDialog === null || el.devRenameDialog.style.display === 'none') return
+    el.devRenameDialog.style.display = 'none'
+    renameKey = null
+  }
+
+  async function submitRename() {
+    const key = renameKey
+    if (key === null) return
+    const label = el.devRenameInput.value.trim()
+    closeRenameDialog()
+    try {
+      await api('/api/devices/label', {
+        method: 'POST',
+        body: JSON.stringify({ key, label }),
+      })
+      await refresh()
+    } catch (error) {
+      fail(error.message ?? String(error))
+    }
+  }
+
+  el.devRenameCancel.addEventListener('click', closeRenameDialog)
+  el.devRenameDialog.addEventListener('click', event => {
+    if (event.target === el.devRenameDialog) closeRenameDialog()
+  })
+  el.devRenameDialog.addEventListener('keydown', event => { trapFocus(el.devRenameDialog, event) })
+  el.devRenameConfirm.addEventListener('click', () => { void submitRename() })
+  el.devRenameInput.addEventListener('keydown', event => {
+    if (event.key !== 'Enter') return
+    event.preventDefault()
+    void submitRename()
+  })
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape') closeRenameDialog()
   })
 
   // ── 事件接线 ────────────────────────────────────────────────────────────
@@ -993,8 +1105,9 @@
         api('/api/devices').catch(() => ({ devices: [] })),
       ])
       snapshot = snap
-      managedKeys = new Set((Array.isArray(manager.devices) ? manager.devices : [])
-        .map(device => device.key))
+      const devices = Array.isArray(manager.devices) ? manager.devices : []
+      managedKeys = new Set(devices.map(device => device.key))
+      managedDevices = new Map(devices.map(device => [device.key, device]))
       renderDevices()
     } catch (error) {
       el.devConnState.textContent = '连接失败'

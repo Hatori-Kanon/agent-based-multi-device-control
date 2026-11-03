@@ -164,6 +164,38 @@ describe('Coyote connect handshake', () => {
     expect(first.strengthB).toBe(0)
     expect(first.seq).toBeGreaterThan(0)
   })
+
+  it('pins the chooser to the bound unit and reports the connected platform id', async () => {
+    const clock = new FakeClock()
+    const transport = new MockBleTransport({ clock, name: COYOTE_BLE_NAME, platformId: 'unit-a-1f2e' })
+    const backend = new CoyoteBackend({
+      clock,
+      transport,
+      maxPercent: () => 40,
+      maxWaveIntensity: () => 80,
+      frequencyRange: () => ({ min: MIN_FREQ, max: MAX_FREQ }),
+      bleDeviceId: () => 'unit-a-1f2e',
+    })
+    await backend.connect(signal())
+    await backend.settled()
+    // Two units advertise the same name; the persisted platform id is the only
+    // way the second card can ask for the *other* box.
+    expect(transport.requests[0]?.deviceId).toBe('unit-a-1f2e')
+    expect(backend.platformDeviceId).toBe('unit-a-1f2e')
+  })
+
+  it('omits the pin on a first pairing and reports no platform id without one', async () => {
+    const h = harness()
+    await h.backend.connect(signal())
+    expect(h.transport.requests[0]).not.toHaveProperty('deviceId')
+    expect(h.backend.platformDeviceId).toBeUndefined()
+  })
+
+  it('passes units reserved by other cards as chooser exclusions', async () => {
+    const h = harness({ bleReservedIds: () => ['unit-b', 'unit-c'] })
+    await h.backend.connect(signal())
+    expect(h.transport.requests[0]?.excludeDeviceIds).toEqual(['unit-b', 'unit-c'])
+  })
 })
 
 describe('Coyote frame stream', () => {

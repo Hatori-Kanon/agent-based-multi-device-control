@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url'
 import { BrowserWindow, ipcMain, type WebContents } from 'electron'
 import type { BleCharacteristicRef, BleFilter } from '@embodied/core'
 import { BridgedBleTransport, type BleBridge } from './bridge.ts'
+import { chooseCandidate, type BleCandidate } from './chooser.ts'
 import { log } from '../log.ts'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -46,42 +47,15 @@ function literal(value: unknown): string {
 type NotifyListener = (event: { handle: string; ref: BleCharacteristicRef; hex: string }) => void
 type DisconnectListener = (event: { handle: string }) => void
 
-interface Candidate {
-  readonly deviceId: string
-  readonly name: string
-}
-
-/** Score a candidate against what the filter was looking for. */
-function scoreFor(filter: BleFilter, candidate: Candidate): number {
-  const name = candidate.name
-  if (filter.name !== undefined) return name === filter.name ? 3 : 0
-  if (filter.namePrefix !== undefined) return name.startsWith(filter.namePrefix) ? 3 : 0
-  return 1
-}
-
 interface PendingSelection {
   readonly filter: BleFilter
-  readonly devices: Map<string, Candidate>
+  readonly devices: Map<string, BleCandidate>
   /** The chooser's callback; requestDevice stays pending until it fires. */
   selectCallback: (deviceId: string) => void
   /** True once a chooser event delivered a callback for this selection. */
   callbackStored: boolean
   timer: ReturnType<typeof setTimeout>
   answered: boolean
-}
-
-/** Best candidate for a filter, or undefined when nothing matches. */
-function pickBest(filter: BleFilter, candidates: readonly Candidate[]): Candidate | undefined {
-  let best: Candidate | undefined
-  let bestScore = 0
-  for (const candidate of candidates) {
-    const score = scoreFor(filter, candidate)
-    if (score > bestScore) {
-      best = candidate
-      bestScore = score
-    }
-  }
-  return best
 }
 
 class ElectronBleBridge implements BleBridge {
@@ -96,6 +70,8 @@ class ElectronBleBridge implements BleBridge {
   private selectionCandidates = 0
   /** Raw platform error from the most recent selection, or undefined. */
   private selectionError: string | undefined
+  /** Why the last chooser produced nothing; feeds the transport's message. */
+  private selectionReason: string | undefined
   /**
    * Execution trace of the most recent selection. Surfaced inside the final
    * error message because terminal stdout is not reliable in every launch
@@ -103,6 +79,18 @@ class ElectronBleBridge implements BleBridge {
    * delivered through stderr, which is always visible.
    */
   private selectionTrace: string[] = []
+  /**
+   * Platform ids currently controlled by a card in this process.
+   *
+   * Two units advertise the same name; the chooser must not hand the second
+   * card the box the first one is already driving (that interleaves two B0
+   * streams into one device — the multi-Coyote failure this exists to stop).
+   * Filled on a successful connect and drained on the worker's disconnect
+   * event.
+   */
+  private readonly connectedDeviceIds = new Set<string>()
+  /** Transport handle → platform id, so a disconnect can free the unit. */
+  private readonly handleDeviceIds = new Map<string, string>()
 
   constructor(private readonly contents: WebContents) {}
 
@@ -112,6 +100,10 @@ class ElectronBleBridge implements BleBridge {
 
   get lastSelectionError(): string | undefined {
     return this.selectionError
+  }
+
+  get lastSelectionReason(): string | undefined {
+    return this.selectionReason
   }
 
   get lastSelectionTrace(): readonly string[] {
@@ -130,11 +122,12 @@ class ElectronBleBridge implements BleBridge {
    * handler answers on the grace timer (see `addCandidates`); the worker then
    * proceeds straight to `gatt.connect()` with the device it already holds.
    */
-  async request(filter: BleFilter, _deviceId?: string): Promise<{ handle: string; name?: string }> {
+  async request(filter: BleFilter, _deviceId?: string): Promise<{ handle: string; name?: string; deviceId?: string }> {
     this.selectionTrace = ['called', 'executor', 'choose-call']
     this.selectionCandidates = 0
     this.selectionError = undefined
-    return new Promise<{ handle: string; name?: string }>((resolve, reject) => {
+    this.selectionReason = undefined
+    return new Promise<{ handle: string; name?: string; deviceId?: string }>((resolve, reject) => {
       const pending: PendingSelection = {
         filter,
         devices: new Map(),
@@ -144,8 +137,15 @@ class ElectronBleBridge implements BleBridge {
         answered: false,
       }
       this.pending = pending
-      void this.call<{ handle: string; name?: string }>(`window.__ble.connect(${literal(filter)})`).then(raw => {
+      void this.call<{ handle: string; name?: string; deviceId?: string }>(`window.__ble.connect(${literal(filter)})`).then(raw => {
         this.selectionTrace.push(`connect-settled:${raw?.handle ?? 'none'}`)
+        // Remember which physical unit this card got: the host persists it and
+        // later choosers must not give the same unit to another card.
+        const platformId = raw?.deviceId
+        if (raw?.handle !== undefined && platformId !== undefined) {
+          this.connectedDeviceIds.add(platformId)
+          this.handleDeviceIds.set(raw.handle, platformId)
+        }
         // The chooser answer (if any) has already happened or will happen via
         // the grace timer; the connection itself is the payload here.
         resolve(raw)
@@ -161,7 +161,7 @@ class ElectronBleBridge implements BleBridge {
   }
 
   /** The chooser handler reports each discovery batch. */
-  addCandidates(candidates: readonly Candidate[], callback: (deviceId: string) => void): void {
+  addCandidates(candidates: readonly BleCandidate[], callback: (deviceId: string) => void): void {
     const pending = this.pending
     if (pending === undefined || pending.answered) {
       // Events can straggle in after the chooser settled. The request was
@@ -185,41 +185,30 @@ class ElectronBleBridge implements BleBridge {
     pending.answered = true
     this.pending = undefined
     clearTimeout(pending.timer)
-    this.selectionTrace.push(`answered:${deviceId ?? 'none'} (${pending.devices.size} candidates)`)
     if (deviceId !== undefined) {
+      this.selectionTrace.push(`answered:explicit:${deviceId} (${pending.devices.size} candidates)`)
       pending.selectCallback(deviceId)
       return
     }
-    // Nothing chosen yet: pick the best candidate seen so far, or cancel.
-    let best: { id: string; score: number } | undefined
-    for (const [id, candidate] of pending.devices) {
-      const score = scoreFor(pending.filter, candidate)
-      if (best === undefined || score > best.score) best = { id, score }
+    const choice = chooseCandidate(pending.filter, [...pending.devices.values()], this.connectedDeviceIds)
+    if (choice.kind !== 'none' && choice.deviceId !== undefined) {
+      this.selectionReason = undefined
+      this.selectionTrace.push(`answered:${choice.kind}:${choice.deviceId} (${pending.devices.size} candidates)`)
+      pending.selectCallback(choice.deviceId)
+      return
     }
-    if (best === undefined) {
-      // No candidates at all: cancel and let the transport retry.
-      pending.selectCallback('')
+    this.selectionReason = choice.reason
+    this.selectionTrace.push(`answered:none (${choice.reason ?? 'none'}, ${pending.devices.size} candidates)`)
+    // Nothing can be chosen: cancel and let the transport retry/report.
+    pending.selectCallback('')
+    if (!pending.callbackStored) {
       // If the chooser event never fired, the worker's requestDevice is still
       // pending and would block every later BLE request. Reloading the hidden
       // worker clears it; the page boots in milliseconds.
-      if (!pending.callbackStored) this.contents.reload()
-      return
+      this.connectedDeviceIds.clear()
+      this.handleDeviceIds.clear()
+      this.contents.reload()
     }
-    if (best.score === 0) {
-      // The name did not match, but `deviceName` reported by the OS is often
-      // empty or formatted differently. If this filter produced exactly one
-      // candidate, it IS the target — accept it rather than throwing away a
-      // working scan over a string comparison.
-      if (pending.devices.size === 1) {
-        const only = [...pending.devices.values()][0]!
-        this.selectionTrace.push(`single-candidate-accepted:${only.deviceId}`)
-        pending.selectCallback(only.deviceId)
-        return
-      }
-      pending.selectCallback('')
-      return
-    }
-    pending.selectCallback(best.id)
   }
 
   async read(handle: string, ref: BleCharacteristicRef): Promise<string> {
@@ -264,6 +253,9 @@ class ElectronBleBridge implements BleBridge {
   }
 
   emitDisconnected(handle: string): void {
+    const platformId = this.handleDeviceIds.get(handle)
+    if (platformId !== undefined) this.connectedDeviceIds.delete(platformId)
+    this.handleDeviceIds.delete(handle)
     for (const listener of [...this.disconnectListeners]) listener({ handle })
   }
 }

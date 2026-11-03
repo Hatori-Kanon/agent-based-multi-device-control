@@ -63,6 +63,8 @@ interface Pending {
 
 export class ButtplugBackend implements DeviceBackend {
   readonly id: string
+  /** Not a Web Bluetooth backend, so there is no platform chooser identity. */
+  readonly platformDeviceId = undefined
 
   private socket: TextSocket | undefined
   private offMessage: (() => void) | undefined

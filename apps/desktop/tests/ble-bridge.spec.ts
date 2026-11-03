@@ -16,7 +16,7 @@ interface Recorded {
 
 class FakeBridge implements BleBridge {
   readonly calls: Recorded[] = []
-  requestResult: { handle: string; name?: string } = { handle: 'h1', name: 'Coyote' }
+  requestResult: { handle: string; name?: string; deviceId?: string } = { handle: 'h1', name: 'Coyote' }
   readResult = '025e041d0001'
   failNext: Error | undefined
   failRequests = 0
@@ -28,6 +28,8 @@ class FakeBridge implements BleBridge {
   selectionSize = 0
   /** Raw platform error the fake chooser reports. */
   selectionError: string | undefined
+  /** Chooser miss reason the fake reports. */
+  selectionReason: string | undefined
   /** Trace the fake chooser reports. */
   trace: readonly string[] = ['called', 'executor']
   private notifyListeners = new Set<(event: { handle: string; ref: BleCharacteristicRef; hex: string }) => void>()
@@ -41,11 +43,15 @@ class FakeBridge implements BleBridge {
     return this.selectionError
   }
 
+  get lastSelectionReason(): string | undefined {
+    return this.selectionReason
+  }
+
   get lastSelectionTrace(): readonly string[] | undefined {
     return this.trace
   }
 
-  request(filter: BleFilter, deviceId?: string): Promise<{ handle: string; name?: string }> {
+  request(filter: BleFilter, deviceId?: string): Promise<{ handle: string; name?: string; deviceId?: string }> {
     this.calls.push({ kind: 'request', filter, handle: deviceId })
     if (this.failRequests > 0) {
       this.failRequests -= 1
@@ -155,6 +161,20 @@ describe('BridgedBleTransport', () => {
     expect(peripheral.connected).toBe(true)
   })
 
+  it('exposes the chosen platform id and forwards a bound-unit pin', async () => {
+    const bridge = new FakeBridge()
+    bridge.requestResult = { handle: 'h9', name: 'Coyote', deviceId: 'unit-b' }
+    const transport = new BridgedBleTransport(bridge)
+    const filter: BleFilter = { name: 'CoyoteV3', services: [COYOTE_SERVICE], deviceId: 'unit-b' }
+
+    const peripheral = await transport.request(filter, signal())
+
+    // The pin reaches the chooser; the chosen id comes back on the peripheral
+    // so the host can persist it per device card.
+    expect(bridge.calls[0]?.filter).toEqual(filter)
+    expect(peripheral.platformId).toBe('unit-b')
+  })
+
   it('retries once when the chooser finds nothing on the first pass', async () => {
     const bridge = new FakeBridge()
     bridge.withChooser([undefined, 'found-late'])
@@ -218,6 +238,26 @@ describe('BridgedBleTransport', () => {
       caught = error2
     }
     expect((caught as SafetyError).message).toContain('found 6 device(s) but none matched')
+  })
+
+  it('explains a pinned chooser miss and reads the candidate count after the scan', async () => {
+    // Electron path: no separate chooser method; candidates appear inside
+    // `request`, which then rejects because no unit could be chosen.
+    const bridge = new FakeBridge()
+    bridge.failRequests = 1
+    bridge.selectionSize = 2
+    bridge.selectionReason = 'pinned-already-connected'
+    const transport = new BridgedBleTransport(bridge)
+    let caught: unknown
+    try {
+      await transport.request({ name: 'CoyoteV3', services: [COYOTE_SERVICE], deviceId: 'unit-a' }, signal())
+    } catch (error) {
+      caught = error
+    }
+    const message = (caught as SafetyError).message
+    expect(message).toContain('already connected to another device card')
+    expect(message).toContain('found 2 device(s)')
+    expect(message).toContain('paired with Bluetooth device unit-a')
   })
 
   it('surfaces the platform refusal when requestDevice fails outright', async () => {

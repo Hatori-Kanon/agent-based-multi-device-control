@@ -295,6 +295,19 @@
   </div>
 </div>
 
+<!-- 两台同型号设备广告名相同时，用这里给卡片起名（左/右）来区分。 -->
+<div class="modal" id="devRenameDialog" style="display:none">
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="devRenameTitle">
+    <h3 id="devRenameTitle">重命名设备</h3>
+    <label class="field-label" for="devRenameInput">设备名</label>
+    <input id="devRenameInput" type="text" maxlength="40" autocomplete="off" placeholder="例如：郊狼 A / 左（留空恢复默认名）">
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="devRenameCancel" type="button">取消</button>
+      <button class="btn btn-accent" id="devRenameConfirm" type="button">保存</button>
+    </div>
+  </div>
+</div>
+
 <script src="/shell.js"></script>
 <!-- 波形柱状图的纯几何计算；play.js 直接读 window.EmbodiedChartMath，
      所以必须在它之前加载。 -->

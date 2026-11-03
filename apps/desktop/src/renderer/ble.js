@@ -120,7 +120,7 @@
         host?.disconnected(handle)
       })
 
-      return { handle, name: device.name || undefined }
+      return { handle, name: device.name || undefined, deviceId: device.id }
     },
 
     async read(handle, service, char) {

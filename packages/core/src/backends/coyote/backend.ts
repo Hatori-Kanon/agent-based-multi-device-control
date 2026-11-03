@@ -104,6 +104,23 @@ export interface CoyoteBackendOptions {
    * during add).
    */
   readonly bleName?: string
+  /**
+   * Platform device id previously bound to this card, read on every connect.
+   *
+   * Coyote units advertise the same name, so the host stores the chooser's
+   * `deviceId` per card and passes it back here to keep the card tied to the
+   * same physical unit instead of grabbing whichever one advertises first.
+   * A getter (not a value) so a rebind takes effect without rebuilding the
+   * backend.
+   */
+  readonly bleDeviceId?: () => string | undefined
+  /**
+   * Platform ids already bound to *other* device cards, read on every connect.
+   *
+   * An unpinned first pairing must not grab a unit another card has persisted,
+   * even after a restart when no link is live to signal "occupied".
+   */
+  readonly bleReservedIds?: () => readonly string[]
   /** Percentage ceiling per channel; becomes the `BF` hardware soft cap. */
   readonly maxPercent: (channelId: CoyoteChannelId) => number
   /**
@@ -153,6 +170,8 @@ export class CoyoteBackend implements DeviceBackend {
   readonly id: string
   readonly name: string
   readonly channels = CHANNELS
+  /** Platform id of the unit this backend connected to; persisted by the host. */
+  platformDeviceId: string | undefined
 
   private peripheral: BlePeripheral | undefined
   private notifyOff: (() => void) | undefined
@@ -185,12 +204,18 @@ export class CoyoteBackend implements DeviceBackend {
     this.seq = 0
     this.pendingSeq = undefined
     this.writeFailures = 0
+    this.platformDeviceId = undefined
 
+    const pinnedDeviceId = this.options.bleDeviceId?.()
+    const reservedDeviceIds = this.options.bleReservedIds?.() ?? []
     const peripheral = await this.options.transport.request({
       name: this.options.bleName ?? COYOTE_BLE_NAME,
       services: [COYOTE_SERVICE, COYOTE_BATTERY_SERVICE],
+      ...(pinnedDeviceId === undefined ? {} : { deviceId: pinnedDeviceId }),
+      ...(reservedDeviceIds.length === 0 ? {} : { excludeDeviceIds: reservedDeviceIds }),
     }, signal)
     this.peripheral = peripheral
+    this.platformDeviceId = peripheral.platformId
     this.disconnectOff = peripheral.onDisconnect(() => { this.handleLinkLost() })
 
     try {

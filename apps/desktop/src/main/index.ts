@@ -121,10 +121,11 @@ function registerIpc(): void {
     return runtime?.snapshot() ?? null
   })
 
-  // Retry after a failed or dropped link without restarting the app.
+  // Retry after a failed or dropped link without restarting the app. Goes
+  // through the same path as the console so the chosen unit is persisted and
+  // concurrent scans stay serialised.
   ipcMain.handle('host:connect', async (_event, deviceId: string) => {
-    const controller = new AbortController()
-    await runtime?.registry.connect(deviceId, controller.signal)
+    await runtime?.connectDevice(deviceId)
     return runtime?.snapshot() ?? null
   })
 }

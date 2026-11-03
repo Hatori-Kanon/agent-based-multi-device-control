@@ -379,6 +379,14 @@ export class DeviceRegistry {
   async connect(deviceId: string, signal: AbortSignal): Promise<void> {
     this.assertRunning()
     const device = this.requireDevice(deviceId)
+    // Idempotent by design: a second "连接" click while the first one is still
+    // settling must not re-scan and fail, which would mark a live device as
+    // `failed` while its old link keeps streaming. The queue already serialises
+    // connects, so `ready` here means the first attempt finished.
+    if (device.lifecycle === 'ready') return
+    if (device.lifecycle === 'connecting') {
+      throw new SafetyError('NOT_CONNECTED', `${deviceId} is already connecting; wait for it to finish`)
+    }
     device.lifecycle = 'connecting'
     try {
       await device.queue.enqueue(() => device.backend.connect(signal))
@@ -402,6 +410,45 @@ export class DeviceRegistry {
       })
       throw error
     }
+  }
+
+  /**
+   * Drop the live link but keep the device registered.
+   *
+   * Used by "重新配对": output stops, the transport closes, and the lifecycle
+   * goes back to disconnected so a later {@link connect} scans again. Unlike
+   * {@link unregister} the device (and its policy/region state) stays.
+   */
+  async disconnect(deviceId: string): Promise<void> {
+    const device = this.requireDevice(deviceId)
+    if (device.lifecycle === 'disconnected') return
+    for (const state of device.channels.values()) {
+      state.runner.cancel()
+      state.percent = 0
+      state.waveform = undefined
+    }
+    try {
+      await device.queue.enqueue(() => device.backend.close(), true)
+    } catch (error) {
+      // The link may still be live, so do not pretend it is gone: mark `failed`
+      // and make the failure visible in the audit trail.
+      device.lifecycle = 'failed'
+      await this.options.audit.record({
+        actor: 'human',
+        action: 'device_disconnected',
+        result: 'error',
+        detail: { deviceId },
+        reason: describe(error),
+      })
+      throw error
+    }
+    device.lifecycle = 'disconnected'
+    await this.options.audit.record({
+      actor: 'human',
+      action: 'device_disconnected',
+      result: 'ok',
+      detail: { deviceId },
+    })
   }
 
   /** Hold one level for a bounded time. `percent <= 0` stops the channel. */

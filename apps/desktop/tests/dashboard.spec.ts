@@ -189,6 +189,54 @@ describe('DashboardServer', () => {
     expect(body.devices).toEqual([])
   })
 
+  it('renames a device card and forgets its physical pairing', async () => {
+    const host = await start()
+    const token = host.dashboardToken
+    const added = await host.addDevice('mock')
+
+    let response = await fetch(`${base(host)}/api/devices/label`, {
+      method: 'POST',
+      headers: headers(token, true),
+      body: JSON.stringify({ key: added.key, label: '左' }),
+    })
+    expect(response.status).toBe(200)
+    let body = await response.json()
+    expect(body.devices.find((device: { key: string }) => device.key === added.key).label).toBe('左')
+    // The registry snapshot (the card title) picks up the label too.
+    const snapshot = await (await fetch(`${base(host)}/api/snapshot`, { headers: headers(token) })).json() as {
+      devices: Array<{ id: string; name: string }>
+    }
+    expect(snapshot.devices.find(device => device.id === added.key)?.name).toBe('左')
+
+    // An empty label clears the override (back to the backend default name).
+    response = await fetch(`${base(host)}/api/devices/label`, {
+      method: 'POST',
+      headers: headers(token, true),
+      body: JSON.stringify({ key: added.key, label: '' }),
+    })
+    expect(response.status).toBe(200)
+    body = await response.json()
+    expect(body.devices.find((device: { key: string }) => device.key === added.key).label).not.toBe('左')
+
+    // Too long is a client error, not a 500.
+    response = await fetch(`${base(host)}/api/devices/label`, {
+      method: 'POST',
+      headers: headers(token, true),
+      body: JSON.stringify({ key: added.key, label: 'x'.repeat(41) }),
+    })
+    expect(response.status).toBe(400)
+
+    // Rebind drops the pairing and safe-closes the live link (none for mock).
+    response = await fetch(`${base(host)}/api/devices/rebind`, {
+      method: 'POST',
+      headers: headers(token, true),
+      body: JSON.stringify({ key: added.key }),
+    })
+    expect(response.status).toBe(200)
+    body = await response.json()
+    expect(body.devices.find((device: { key: string }) => device.key === added.key).bound).toBe(false)
+  })
+
   it('rejects an unknown add protocol with 400', async () => {
     const host = await start()
     const response = await fetch(`${base(host)}/api/devices`, {
@@ -458,6 +506,8 @@ function debugDeps(records: readonly ProbeRecord[]): DashboardDeps {
     listDevices: () => unused(),
     addDevice: async () => unused(),
     removeDevice: async () => unused(),
+    setDeviceLabel: async () => unused(),
+    rebindDevice: async () => unused(),
     rawWrite: async () => unused(),
     listWaveforms: () => unused(),
     importWaveform: async () => unused(),
@@ -1210,6 +1260,8 @@ describe('session controls (B2-T11)', () => {
       listDevices: () => unused(),
       addDevice: async () => unused(),
       removeDevice: async () => unused(),
+      setDeviceLabel: async () => unused(),
+      rebindDevice: async () => unused(),
       rawWrite: async () => unused(),
       listWaveforms: () => unused(),
       importWaveform: async () => unused(),
@@ -1341,6 +1393,8 @@ describe('play page (B2-T12)', () => {
       listDevices: () => unused(),
       addDevice: async () => unused(),
       removeDevice: async () => unused(),
+      setDeviceLabel: async () => unused(),
+      rebindDevice: async () => unused(),
       rawWrite: async () => unused(),
       listWaveforms: () => unused(),
       importWaveform: async () => unused(),

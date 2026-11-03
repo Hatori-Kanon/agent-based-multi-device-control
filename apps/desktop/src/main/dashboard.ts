@@ -151,6 +151,10 @@ export interface DashboardDeps {
   listDevices(): DeviceManagerEntry[]
   addDevice(protocol: DeviceProtocol): Promise<DeviceManagerEntry>
   removeDevice(key: string): Promise<void>
+  /** Rename one device card; `undefined`/empty clears the override. */
+  setDeviceLabel(key: string, label: string | undefined): Promise<DeviceManagerEntry[]>
+  /** Forget the paired physical unit; the next connect scans again. */
+  rebindDevice(key: string): Promise<DeviceManagerEntry[]>
   /** Human protocol experiment: one raw frame to the device transport. */
   rawWrite(deviceId: string, hex: string, channel: 'live' | 'setup'): Promise<void>
   listWaveforms(): unknown[]
@@ -1560,6 +1564,48 @@ export class DashboardServer {
       const body = await readJsonBody(request)
       await this.options.deps.removeDevice(asString(body.key, ''))
       sendJson(response, 200, { devices: this.options.deps.listDevices(), snapshot: this.snapshotPayload() })
+      return
+    }
+
+    // Rename one device card. Two units share one advertised name; the label is
+    // the only thing that tells "左" from "右" in the console.
+    if (request.method === 'POST' && pathname === '/api/devices/label') {
+      const body = await readJsonBody(request)
+      const key = asString(body.key, '')
+      if (!this.options.deps.listDevices().some(device => device.key === key)) {
+        sendError(response, 400, `no such device: ${key}`)
+        return
+      }
+      const raw = body.label
+      let label: string | undefined
+      if (raw === undefined || raw === null) {
+        label = undefined
+      } else if (typeof raw === 'string') {
+        if (raw.trim().length > 40) {
+          sendError(response, 400, 'label must be at most 40 characters')
+          return
+        }
+        label = raw
+      } else {
+        sendError(response, 400, 'label must be a string or null')
+        return
+      }
+      const devices = await this.options.deps.setDeviceLabel(key, label)
+      sendJson(response, 200, { devices, snapshot: this.snapshotPayload() })
+      return
+    }
+
+    // Forget which physical unit this card was paired with; the next 连接 picks
+    // whichever free unit answers and re-binds to it.
+    if (request.method === 'POST' && pathname === '/api/devices/rebind') {
+      const body = await readJsonBody(request)
+      const key = asString(body.key, '')
+      if (!this.options.deps.listDevices().some(device => device.key === key)) {
+        sendError(response, 400, `no such device: ${key}`)
+        return
+      }
+      const devices = await this.options.deps.rebindDevice(key)
+      sendJson(response, 200, { devices, snapshot: this.snapshotPayload() })
       return
     }
 

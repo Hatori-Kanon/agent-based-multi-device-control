@@ -102,6 +102,22 @@ describe('XHTKJ connect', () => {
     expect(filter.services).toEqual([XHTKJ_ADVERTISING_SERVICE])
   })
 
+  it('pins the chooser to a bound platform id and reports the connected unit', async () => {
+    const clock = new FakeClock()
+    const transport = new MockBleTransport({ clock, name: 'MZ-TOY', platformId: 'mz-71c0', reads: { [PNP_KEY]: pnpFor(29) } })
+    const backend = new XhtkjBackend({
+      clock,
+      transport,
+      bleDeviceId: () => 'mz-71c0',
+      bleReservedIds: () => ['mz-other'],
+    })
+    await backend.connect(signal())
+    expect(transport.requests[0]?.deviceId).toBe('mz-71c0')
+    expect(transport.requests[0]?.excludeDeviceIds).toEqual(['mz-other'])
+    expect(backend.platformDeviceId).toBe('mz-71c0')
+    await backend.close()
+  })
+
   it('fails over to the ANKNI clone control layout (0xdddd) when 0xff10 is absent', async () => {
     const clock = new FakeClock()
     const errors: unknown[] = []
