@@ -178,6 +178,7 @@ const TURN_PROTOCOL = [
   '本端点工具调用不携带正文 content：给玩家看的完整正文必须写进 apply_plan 的 narration 字段（非空，篇幅遵循人设），不能只写在 reasoning 里，也不能只调用工具。',
   'narration 是玩家会看到的正文，不是计划摘要；环境/动作/身体反应用（）包裹，台词不加括号，不出现设备硬件词。',
   'narration 必须写清本回合 beats 实际作用的玩家部位（用这些名字）和动作，不能写没有下发动作的部位，也不能写成与部位无关的泛泛台词。',
+  '正文只输出给玩家看的叙事；不要输出 <|...|>、DSML、工具调用语法、parameter/invoke 或任何特殊 token。',
   'strength 档位：low=40%、med=70%、high=100%（100% = 玩家设定的通道上限；具体数值不向模型暴露）。普通接触用 med，升级/高峰用 high，low 只用于真正的试探/停顿，不要整局 low。',
   'targetPercent 是 0–100 的区间百分比：100 = 玩家的通道上限，50 = 区间中点；请直接给普通强度 40–70 这样的区间百分比，不要用 5–20 这类过小值（会得到很弱的实际输出）；deltaPercent 只用于微调。',
   '非 stop 动作的 durationSec 建议 30–60s，避免设备在下一回合开始前停掉；短促/瞬间动作用 ramp/pulse 且 duration 设短。',
@@ -510,6 +511,15 @@ export class PlaySession {
    * control and invalidate the stored body for their channel.
    */
   private dispatchWindowActive = false
+  /**
+   * Latest *model-requested* band percent per `device:channel` (0–100 before
+   * the soft-range mapping). The UI shows this instead of the mapped output:
+   * the player asked for "what the model chose", not the hidden cap math.
+   * Written only when a plan command is committed, deleted by an explicit
+   * stop/percent-0 command, a stop event or human direct control; an
+   * unmentioned channel keeps its value (continuation).
+   */
+  private readonly lastRequested = new Map<string, number>()
   /** `metaReactions` opening brief, consumed by the opening turn only. */
   private openingBrief: OpeningBrief | undefined
   /**
@@ -948,6 +958,23 @@ export class PlaySession {
     return this.probeRecorder?.recent(20) ?? []
   }
 
+  /**
+   * Latest model-requested band percent per `device:channel` (0–100).
+   *
+   * The UI shows *this* instead of the mapped output so a narrow human cap is
+   * not mistaken for a weak model request. Values survive until an explicit
+   * stop, a stop event/pause/panic/end, or human direct control on the channel.
+   */
+  requestedPercents(): Readonly<Record<string, number>> {
+    const percents: Record<string, number> = {}
+    for (const [key, value] of this.lastRequested) {
+      const [deviceId, channelId] = key.split('\u0000')
+      if (deviceId === undefined || channelId === undefined) continue
+      percents[`${deviceId}:${channelId}`] = value
+    }
+    return percents
+  }
+
   /** The current engine snapshot plus the pack identity, or undefined. */
   snapshot(): PlaySnapshot | undefined {
     const engine = this.engine
@@ -997,6 +1024,7 @@ export class PlaySession {
     this.unsubscribeDispatch?.()
     this.unsubscribeDispatch = undefined
     this.lastBodies.clear()
+    this.lastRequested.clear()
     // Remove only the pack waveforms this session registered. The same scratch
     // map holds human imports/authors from the device page, and a session
     // boundary must not delete those (review P1-4R: this was the cleanup
@@ -1316,35 +1344,45 @@ export class PlaySession {
   /**
    * Subscribe to registry dispatch events for the session's lifetime.
    *
-   * Only `stop` events matter now: they drop the continuation state so pause,
-   * panic, end and human stops are never revived by the next turn. Ordinary
-   * level/pattern/waveform events are ignored — human direct control is not a
-   * plan body and must not be replayed.
+   * Stop events drop both continuation state and requested percentages so
+   * pause/panic/end and human stops are never revived. Events accepted outside
+   * the host's trusted windows are human direct control and invalidate the
+   * channel's stored request/body too.
    */
   private subscribeDispatch(): void {
     this.unsubscribeDispatch?.()
     this.lastBodies.clear()
+    this.lastRequested.clear()
     this.unsubscribeDispatch = this.env.registry.subscribe(event => this.noteDispatch(event))
   }
 
   /**
-   * Drop continuation state on a stop; invalidate on human direct control.
+   * Drop continuation/request state on a stop; invalidate on human control.
    *
    * Any `stop` (per-channel or the `all` sentinel) clears unconditionally —
    * pause/panic/end and human stops must never be revived. A level/pattern/
    * waveform command accepted outside the host's trusted dispatch window is a
    * human device-page action: it becomes the channel's truth, so the stored
-   * plan body is dropped and the next turn will not overwrite it.
+   * plan body and requested percent are dropped and the next turn will not
+   * overwrite or mislabel it.
    */
   private noteDispatch(event: DispatchEvent): void {
     if (event.kind === 'stop') {
-      if (event.deviceId === 'all' || event.channelId === 'all') this.lastBodies.clear()
-      else this.lastBodies.delete(dispatchKey(event.deviceId, event.channelId))
+      if (event.deviceId === 'all' || event.channelId === 'all') {
+        this.lastBodies.clear()
+        this.lastRequested.clear()
+      } else {
+        const key = dispatchKey(event.deviceId, event.channelId)
+        this.lastBodies.delete(key)
+        this.lastRequested.delete(key)
+      }
       return
     }
     if (this.dispatchWindowActive) return
     if (event.deviceId === 'all' || event.channelId === 'all') return
-    this.lastBodies.delete(dispatchKey(event.deviceId, event.channelId))
+    const key = dispatchKey(event.deviceId, event.channelId)
+    this.lastBodies.delete(key)
+    this.lastRequested.delete(key)
   }
 
   /**
@@ -1359,7 +1397,9 @@ export class PlaySession {
    *
    * Rejected commands only skip their own channel; a final stop / `percent 0`
    * deletes the channel, everything else stores the original body so a loop
-   * pattern's envelope/texture survives the next turn.
+   * pattern's envelope/texture survives the next turn. The model's requested
+   * band percent (`action.request.requestedPercent`) is committed alongside:
+   * it is what the UI shows ("区间 50%"), independent of the mapped output.
    */
   private commitResolvedBodies(resolved: ResolvedPlan, result: DispatchResult): void {
     if (result.blocked) return
@@ -1382,10 +1422,13 @@ export class PlaySession {
       const key = dispatchKey(resolved.commands[index]!.deviceId, resolved.commands[index]!.channelId)
       if (body.kind === 'level' && body.percent <= 0) {
         this.lastBodies.delete(key)
+        this.lastRequested.delete(key)
         continue
       }
       if (body.kind === 'level' || body.kind === 'pattern') {
         this.lastBodies.set(key, { body, at, durationSec: body.durationSec })
+        const requested = action.request?.requestedPercent
+        if (requested !== undefined) this.lastRequested.set(key, requested)
       }
     }
   }
@@ -1856,6 +1899,11 @@ export class PlayHost {
   /** Recent probes from the open session (debug panel only). */
   probes(): readonly ProbeRecord[] {
     return this.session?.probes() ?? []
+  }
+
+  /** Latest model-requested band percent per `device:channel` (empty before start). */
+  requestedPercents(): Readonly<Record<string, number>> {
+    return this.session?.requestedPercents() ?? {}
   }
 
   /** Human unlock for both latches (registry unlock stays the dashboard's job). */

@@ -844,3 +844,201 @@ describe('invalid beats are dropped without silencing the turn (B-5)', () => {
     expect(result.line.length).toBeGreaterThan(0)
   })
 })
+
+describe('leaked tool markup is stripped from the turn line', () => {
+  /** A runner that streams `text` and always calls apply_plan. */
+  function planRunner(text: string, narration?: string): ModelRunner {
+    const call: ToolCall = narration === undefined
+      ? APPLY_PLAN_CALL
+      : { id: 'call_plan_markup', name: 'apply_plan', arguments: { ...PLAN_ARGS, narration } }
+    return {
+      async run(request) {
+        emitText(request, [text])
+        request.onToolCall?.(call)
+        return { text, toolCalls: [call], finishReason: 'tool-calls' }
+      },
+    }
+  }
+
+  it('drops a trailing full-width DSML calls tag', async () => {
+    const prose = '她抬起眼，看着你。'
+    const result = await runTurn({
+      runner: planRunner(`${prose}\n\n<｜｜DSML｜｜ calls>`),
+      tools: M2_MODEL_TOOLS,
+      executor: recordingExecutor().executor,
+      input: inputFixture(),
+      clock: new FakeClock(),
+    })
+
+    expect(result.line).toBe(prose)
+    expect(result.line).not.toContain('DSML')
+  })
+
+  it('removes a whole invoke block wedged between two prose paragraphs', async () => {
+    const raw = '第一段。\n'
+      + '<||DSML|| calls>\n'
+      + '<||DSML|| invoke name="apply_plan">\n'
+      + '<parameter name="beats">[{"id":"b1"}]\n'
+      + '<||DSML|| calls>\n'
+      + '第二段。'
+    const result = await runTurn({
+      runner: planRunner(raw),
+      tools: M2_MODEL_TOOLS,
+      executor: recordingExecutor().executor,
+      input: inputFixture(),
+      clock: new FakeClock(),
+    })
+
+    expect(result.line).toBe('第一段。\n\n第二段。')
+    expect(result.line).not.toContain('parameter')
+  })
+
+  it('cleans markup out of apply_plan narration', async () => {
+    const narration = '（低声）……\n\n<｜｜DSML｜｜ calls>'
+    const call: ToolCall = {
+      id: 'call_plan_narration_markup',
+      name: 'apply_plan',
+      arguments: { ...PLAN_ARGS, narration },
+    }
+    const runner: ModelRunner = {
+      async run(request) {
+        request.onToolCall?.(call)
+        return { text: '', toolCalls: [call], finishReason: 'tool-calls' }
+      },
+    }
+    const result = await runTurn({
+      runner,
+      tools: M2_MODEL_TOOLS,
+      executor: recordingExecutor().executor,
+      input: inputFixture(),
+      clock: new FakeClock(),
+    })
+
+    expect(result.plan).toBeDefined()
+    expect(result.line).toBe('（低声）……')
+  })
+
+  it('treats a markup-only reply as empty and retries', async () => {
+    const requests: ModelTurnRequest[] = []
+    const runner: ModelRunner = {
+      async run(request) {
+        requests.push(request)
+        if (requests.length === 1) {
+          emitText(request, ['<｜｜DSML｜｜ calls>'])
+          return { text: '<｜｜DSML｜｜ calls>', toolCalls: [], finishReason: 'stop' }
+        }
+        emitText(request, ['第二次正文。'])
+        request.onToolCall?.(APPLY_PLAN_CALL)
+        return { text: '第二次正文。', toolCalls: [APPLY_PLAN_CALL], finishReason: 'tool-calls' }
+      },
+    }
+    const result = await runTurn({
+      runner,
+      tools: M2_MODEL_TOOLS,
+      executor: recordingExecutor().executor,
+      input: inputFixture(),
+      clock: new FakeClock(),
+    })
+
+    expect(requests).toHaveLength(2)
+    expect(requests[1]?.messages.at(-1)?.content ?? '').toContain('narration')
+    expect(result.warnings.some(warning => warning.includes('empty model reply'))).toBe(true)
+    expect(result.line).toBe('第二次正文。')
+  })
+
+  it('leaves ordinary angle brackets, quotes and square brackets alone', async () => {
+    const prose = '他把“<不是标记>”写在纸上（笑）：「别动。」[低笑]'
+    const result = await runTurn({
+      runner: planRunner(prose),
+      tools: M2_MODEL_TOOLS,
+      executor: recordingExecutor().executor,
+      input: inputFixture(),
+      clock: new FakeClock(),
+    })
+
+    expect(result.line).toBe(prose)
+  })
+
+  it('adopts plan narration when the content was pure markup', async () => {
+    const narration = '这是合法正文。'
+    const call: ToolCall = {
+      id: 'call_plan_p1',
+      name: 'apply_plan',
+      arguments: { ...PLAN_ARGS, narration },
+    }
+    const runner: ModelRunner = {
+      async run(request) {
+        emitText(request, ['<｜｜DSML｜｜ calls>'])
+        request.onToolCall?.(call)
+        return { text: '<｜｜DSML｜｜ calls>', toolCalls: [call], finishReason: 'tool-calls' }
+      },
+    }
+    const result = await runTurn({
+      runner,
+      tools: M2_MODEL_TOOLS,
+      executor: recordingExecutor().executor,
+      input: inputFixture(),
+      clock: new FakeClock(),
+    })
+
+    // Cleaned content is empty, so the cleaned narration must be adopted; the
+    // player would otherwise lose the only prose the model produced.
+    expect(result.plan).toBeDefined()
+    expect(result.line).toBe(narration)
+  })
+
+  it('keeps prose between two leaked blocks', async () => {
+    const block = '<||DSML|| calls>\n'
+      + '<||DSML|| invoke name="apply_plan">\n'
+      + '<parameter name="beats">[{"id":"b1"}]\n'
+      + '<||DSML|| calls>'
+    const raw = `甲。\n${block}\n乙。\n${block}\n丙。`
+    const result = await runTurn({
+      runner: planRunner(raw),
+      tools: M2_MODEL_TOOLS,
+      executor: recordingExecutor().executor,
+      input: inputFixture(),
+      clock: new FakeClock(),
+    })
+
+    expect(result.line).toBe('甲。\n\n乙。\n\n丙。')
+  })
+
+  it('cleans full-width angle bracket markup', async () => {
+    const prose = '她点头。'
+    const result = await runTurn({
+      runner: planRunner(`${prose}\n＜｜｜DSML｜｜ calls＞`),
+      tools: M2_MODEL_TOOLS,
+      executor: recordingExecutor().executor,
+      input: inputFixture(),
+      clock: new FakeClock(),
+    })
+
+    expect(result.line).toBe(prose)
+  })
+
+  it('keeps dialogue that merely resembles a JSON payload', async () => {
+    const raw = '他低声说：\n[他说"别动"]\n<|token|>'
+    const result = await runTurn({
+      runner: planRunner(raw),
+      tools: M2_MODEL_TOOLS,
+      executor: recordingExecutor().executor,
+      input: inputFixture(),
+      clock: new FakeClock(),
+    })
+
+    expect(result.line).toBe('他低声说：\n[他说"别动"]')
+  })
+
+  it('collapses the double space left by an inline token removal', async () => {
+    const result = await runTurn({
+      runner: planRunner('甲 <|token|> 乙'),
+      tools: M2_MODEL_TOOLS,
+      executor: recordingExecutor().executor,
+      input: inputFixture(),
+      clock: new FakeClock(),
+    })
+
+    expect(result.line).toBe('甲 乙')
+  })
+})

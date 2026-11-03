@@ -336,6 +336,22 @@ export async function runTurn(options: TurnLoopOptions): Promise<TurnResult> {
     if (timedOut) throw timeoutError(timeoutMs)
     if (isAborted(callerSignal)) throw abortedError()
 
+    /**
+     * Fold leaked tool markup out of the streamed line.
+     *
+     * Some providers stream DSML/tool-call scaffolding into `content`. It is
+     * not prose and must never reach the transcript; a markup-only reply
+     * becomes an empty line, which the existing empty-turn correction retries.
+     */
+    const cleanLine = (): void => {
+      if (lineParts.length === 0) return
+      const raw = lineParts.join('')
+      const cleaned = stripToolMarkup(raw)
+      if (cleaned === raw) return
+      lineParts.length = 0
+      if (cleaned !== '') lineParts.push(cleaned)
+    }
+
     /** Fold one model result into the turn's line/plan state. */
     const consume = (turnResult: ModelTurnResult): void => {
       // A non-streaming runner fills `result.text` instead of emitting deltas;
@@ -343,10 +359,15 @@ export async function runTurn(options: TurnLoopOptions): Promise<TurnResult> {
       if (lineParts.length === 0 && turnResult.text !== '') lineParts.push(turnResult.text)
       // A runner that only fills `toolCalls` (no callback) still works.
       for (const call of turnResult.toolCalls) onToolCall(call)
+      cleanLine()
       // DeepSeek-style tool calls carry no `content`; the schema's `narration`
-      // is the player-visible prose. Prefer streamed/plain text when a provider
-      // supplies both so the same sentence is not duplicated.
-      if (lineParts.length === 0 && narration !== '') lineParts.push(narration)
+      // is the player-visible prose. Adopt it *after* cleaning so a content
+      // field that was pure markup cannot throw away legitimate narration
+      // (ui-v13 review P1-1). Streamed/plain text still wins when it survived.
+      if (lineParts.length === 0 && narration !== '') {
+        const cleanedNarration = stripToolMarkup(narration)
+        if (cleanedNarration !== '') lineParts.push(cleanedNarration)
+      }
     }
     consume(result)
     await settleDispatch()
@@ -424,13 +445,90 @@ export async function runTurn(options: TurnLoopOptions): Promise<TurnResult> {
   }
 }
 
+/**
+ * Remove leaked tool-call markup from model prose.
+ *
+ * Some providers stream the assistant's special-token scaffolding into
+ * `content` (DeepSeek DSML: `<｜｜DSML｜｜ calls>`, `<invoke ...>`,
+ * `<parameter name="beats">[{...}]`, with full-width bars and angle brackets).
+ * It is not prose and must never reach the transcript, but ordinary text may
+ * still contain `<`, `>`, brackets or quotes, so this function only touches
+ * strings that actually contain a markup signal and returns everything else
+ * byte-identical.
+ *
+ * Full-width bars `｜` (U+FF5C) and angle brackets `＜＞` (U+FF1C/U+FF1E) are
+ * normalised for detection; when no markup is found the original string is
+ * returned unchanged. Blocks are removed one at a time so prose between two
+ * leaked blocks survives.
+ */
+export function stripToolMarkup(text: string): string {
+  if (text === '') return text
+  const normalized = text
+    .replace(/\uFF5C/g, '|')
+    .replace(/\uFF1C/g, '<')
+    .replace(/\uFF1E/g, '>')
+  if (!hasToolMarkup(normalized)) return text
+
+  let cleaned = normalized
+  // 1. Delete leaked blocks one at a time. A greedy single pass used to
+  //    swallow the prose between two blocks (ui-v13 review P2-1); a lazy
+  //    repeated match keeps that prose.
+  const block = /<\|{2}DSML[^>\n]*>[\s\S]*?<\|{2}DSML[^>\n]*calls>/i
+  for (let guard = 0; guard < 64 && block.test(cleaned); guard += 1) {
+    cleaned = cleaned.replace(block, '')
+  }
+  // 2. Any remaining unbalanced DSML tag (e.g. a tail `<||DSML|| calls>`).
+  cleaned = cleaned.replace(/<\|{2}\/?DSML[^>\n]*>/gi, '')
+  // 3. A complete `<parameter ...>...</parameter>` block (may span lines).
+  cleaned = cleaned.replace(/<parameter\b[^>]*>[\s\S]*?<\/parameter>/gi, '')
+  // 4. A parameter header plus its same-line payload.
+  cleaned = cleaned.replace(/<parameter\b[^>]*>[^\n]*/gi, '')
+  // 5. Residual tool tags and any single-line `<|...>` token.
+  cleaned = cleaned.replace(/<\/?(?:parameter|invoke|calls)\b[^>\n]*>/gi, '')
+  cleaned = cleaned.replace(/<\|[^>\n]*>/g, '')
+  // 6. A leftover JSON payload line belongs to the removed parameter block.
+  cleaned = cleaned
+    .split('\n')
+    .filter(line => !isToolJsonLine(line.trim()))
+    .join('\n')
+  // 7. Collapse the blank runs/spaces the removals produced, then trim.
+  return cleaned
+    .replace(/\n[ \t]*\n[ \t]*\n+/g, '\n\n')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim()
+}
+
+/** Does this (normalised) string contain any tool-markup signal at all? */
+function hasToolMarkup(normalized: string): boolean {
+  return /<\|/.test(normalized)
+    || /<parameter\b/i.test(normalized)
+    || /<invoke\b/i.test(normalized)
+    || /<\/?(?:calls|parameter|invoke)\b/i.test(normalized)
+}
+
+/**
+ * A leftover line that parses as a JSON object/array is a parameter payload,
+ * not prose. Strict parsing keeps dialogue like `[他说"别动"]` (invalid JSON)
+ * untouched.
+ */
+function isToolJsonLine(line: string): boolean {
+  if (line.length < 2) return false
+  if (!line.startsWith('[') && !line.startsWith('{')) return false
+  try {
+    const parsed: unknown = JSON.parse(line)
+    return typeof parsed === 'object' && parsed !== null
+  } catch {
+    return false
+  }
+}
+
 /** Read `apply_plan.narration` when present; models may omit it in other modes. */
 function narrationOf(argumentsValue: unknown): string {
   if (typeof argumentsValue !== 'object' || argumentsValue === null || Array.isArray(argumentsValue)) {
     return ''
   }
   const value = (argumentsValue as Record<string, unknown>).narration
-  return typeof value === 'string' ? value.trim() : ''
+  return typeof value === 'string' ? stripToolMarkup(value.trim()) : ''
 }
 
 /** Narrow an optional cancellation signal to its aborted state. */

@@ -1348,6 +1348,9 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
 
   const dashboardDeps: DashboardDeps = {
     snapshot: () => registry.snapshot(),
+    // Model-requested band percent per channel, shown by the console instead
+    // of the mapped output; the session owns this state.
+    requestedPercents: () => play.requestedPercents(),
     session: {
       start: async input => await play.start(input),
       message: async text => await play.message(text),

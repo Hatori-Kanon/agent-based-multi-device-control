@@ -661,18 +661,16 @@
   }
 
   /**
-   * 效果小框里强度那一格：区间请求 vs 实际输出。
+   * 效果小框里强度那一格：只写模型请求的区间百分比（0–100）。
    *
-   * 软上限 0–20 时「区间 40% → 实际 8%」能一眼看出「不是模型只敢要 8%」。
-   * 软上限就是满量程时区间=实际，两个数字是同一件事：只留一个（和旧格式
-   * 一致），不写「区间 40% → 实际 40%」这种重复。
+   * 实际输出（映射到软上限后的 `percent`）不展示：它看起来像「模型只敢要
+   * 很小的数」，还会把玩家软上限的换算暴露在叙事界面上。旧宿主没有
+   * `requestedPercent` 时才回退旧的单数字格式。
    */
   function effectPercentText(effect) {
     const { requested, actual } = effectPercentValues(effect)
-    if (requested === undefined) return actual === undefined ? '' : `${actual}%`
-    if (actual === undefined) return `区间 ${requested}%`
-    if (requested === actual) return `${actual}%`
-    return `区间 ${requested}% → 实际 ${actual}%`
+    if (requested !== undefined) return `区间 ${requested}%`
+    return actual === undefined ? '' : `${actual}%`
   }
 
   /** 小框：本回合实际下发的部位 / 强度 / 波形（来自宿主 dispatch 结果）。 */
@@ -694,10 +692,13 @@
         ? effect.waveformName
         : ''
       const text = [part, percentText, waveform].filter(partText => partText !== '').join(' · ')
-      // 去重 key 必须含「区间请求」和「实际输出」两个数：只按最终文案/实际值
-      // 去重会把「区间 40% → 实际 8%」和「区间 70% → 实际 8%」误吞成一条。
-      // strength 不参与展示，所以也不进 key。
-      const key = [part, percentValues.requested ?? '', percentValues.actual ?? '', waveform].join('|')
+      // 去重 key 跟着展示内容走：有区间请求就按请求值去重 —— 实际输出不展示，
+      // 也不进 key，否则「同请求、不同实际」会被拆成两条一模一样的 chip。
+      // 旧路径没有 request 时按实际 percent 去重；两条路径用不同前缀，避免
+      //「区间 40%」和旧格式「40%」被当成同一格。
+      const key = percentValues.requested !== undefined
+        ? [part, 'request', percentValues.requested, waveform].join('|')
+        : [part, 'legacy', percentValues.actual ?? '', waveform].join('|')
       if (text === '' || seen.has(key)) continue
       seen.add(key)
       const chip = document.createElement('span')
@@ -959,12 +960,22 @@
         continue
       }
       view.row.style.display = ''
-      const level = typeof channel.percent === 'number' && Number.isFinite(channel.percent)
-        ? Math.max(0, Math.min(100, channel.percent))
-        : 0
+      // 右轨显示「模型请求的区间百分比」（0–100），不是映射后的实际输出：
+      // 实际值会让人以为模型只敢要一点点。旧宿主/手动直控没有
+      // `channel.requestedPercent` 时回退 `channel.percent`，保证滑杆直控仍有反馈。
+      const requestedLevel = typeof channel.requestedPercent === 'number'
+        && Number.isFinite(channel.requestedPercent)
+        ? channel.requestedPercent
+        : undefined
+      const rawLevel = requestedLevel !== undefined
+        ? requestedLevel
+        : (typeof channel.percent === 'number' && Number.isFinite(channel.percent) ? channel.percent : 0)
+      const level = Math.max(0, Math.min(100, rawLevel))
       view.level = level
       view.fill.style.width = `${level}%`
       view.percent.textContent = `${Math.round(level)}%`
+      // 悬停说明这个数字的含义；回退路径不写「实际」，避免界面重新暴露它。
+      view.percent.title = requestedLevel === undefined ? '' : '模型请求（区间百分比）'
       const waveform = channel.waveform !== null && typeof channel.waveform === 'object'
         ? channel.waveform
         : undefined

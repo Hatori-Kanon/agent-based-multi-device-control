@@ -875,6 +875,23 @@ describe('session HTTP routes', () => {
       packVersion: '1.0.0',
     })
 
+    // `GET /api/snapshot` decorates the channels with the model-requested band
+    // percent the session tracks (fixture plan: probe-touch, strength low → 40).
+    const requested = runtime.play.requestedPercents()
+    expect(Object.values(requested)).toContain(40)
+    const [requestedKey, requestedValue] = Object.entries(requested)[0]!
+    const [requestedDeviceId, requestedChannelId] = requestedKey.split(':')
+    const decoratedSnapshot = await (await get('/api/snapshot')).json() as {
+      devices: readonly {
+        id: string
+        channels: readonly { id: string; requestedPercent?: number }[]
+      }[]
+    }
+    const requestedChannel = decoratedSnapshot.devices
+      .find(device => device.id === requestedDeviceId)?.channels
+      .find(channel => channel.id === requestedChannelId)
+    expect(requestedChannel?.requestedPercent).toBe(requestedValue)
+
     // A second start is a 400, not a 500: one active session.
     const secondStart = await post('/api/session/start', { packId: 'demo', plannedMinutes: 30 })
     expect(secondStart.status).toBe(400)
@@ -1523,6 +1540,10 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
     expect(opening).toContain('不要使用 beats[].targets')
     expect(opening).toContain('写错设备 id 的 beat 会回退到 regions')
     expect(opening).toContain('只写正文')
+    // Raw provider/tool marker syntax must never leak into the player-visible
+    // prose (some providers stream DSML/parameter tags into the text).
+    expect(opening).toContain('正文只输出给玩家看的叙事')
+    expect(opening).toContain('不要输出 <|...|>、DSML、工具调用语法、parameter/invoke 或任何特殊 token')
     // Band-percent semantics, continuation-by-default and the loop-order
     // rule are global directives (manual and auto mode both need them). The
     // model's own percentage scale is 0–100 with no concrete cap number: the
@@ -2313,6 +2334,43 @@ describe('effect requested percent transparency', () => {
         status: 'dispatched',
       })
     }
+    // The console projection exposes the requested factor per channel too.
+    expect(h.host.requestedPercents()).toEqual({
+      'mock-pulse:a': 50,
+      'mock-pulse:b': 50,
+    })
+  })
+
+  it('clears the requested percent on an explicit stop', async () => {
+    const h = await createHarness([
+      scriptedTurn('（起。）', [targetPercentPlanCall(50)]),
+      scriptedTurn('（停。）', [stopPlanCall('call_stop')]),
+    ])
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    expect(h.host.requestedPercents()).toEqual({ 'mock-pulse:a': 50, 'mock-pulse:b': 50 })
+
+    await h.host.message('继续。')
+    // A stop removes the channel's continuation state *and* its last request.
+    expect(h.host.requestedPercents()).toEqual({})
+  })
+
+  it('clears the requested percent on human direct control', async () => {
+    const h = await createHarness([
+      scriptedTurn('（起。）', [targetPercentPlanCall(50)]),
+      scriptedTurn('（继续。）', [planCall('call_2')]),
+    ])
+    await h.host.start({ packId: 'demo', plannedMinutes: 30 })
+    expect(h.host.requestedPercents()).toEqual({ 'mock-pulse:a': 50, 'mock-pulse:b': 50 })
+
+    // Human device-page control on channel a: that channel no longer reflects
+    // a model request, while channel b keeps its value (continuation).
+    await h.registry.setLevel('human', {
+      deviceId: 'mock-pulse',
+      channelId: 'a',
+      percent: 15,
+      durationSec: 5,
+    })
+    expect(h.host.requestedPercents()).toEqual({ 'mock-pulse:b': 50 })
   })
 
   it('reports the strength bucket as its band percent', async () => {

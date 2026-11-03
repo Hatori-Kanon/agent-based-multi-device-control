@@ -1474,17 +1474,23 @@ describe('play page (B2-T12)', () => {
     expect(js).toContain('embodiedConfirm')
     expect(js).toContain('is-latest')
     expect(js).toContain('line-effects')
-    // v14: 效果小框显示「区间请求% → 实际输出%」（软上限映射一眼可见）；
-    // 旧宿主没有 requestedPercent 时退回旧格式，rejected 记录不展示。
+    // v15: 效果小框与右轨只显示模型请求的区间百分比（0–100）；映射后的
+    // 实际输出不再展示，旧宿主没有 requestedPercent 时才回退旧单数字格式，
+    // rejected 记录不展示。
     expect(js).toContain('requestedPercent')
     expect(js).toContain('区间 ${requested}%')
-    expect(js).toContain('实际 ${actual}%')
-    expect(js).toContain('requested === actual')
+    expect(js).not.toContain('实际 ${actual}%')
+    expect(js).not.toContain('requested === actual')
     expect(js).toContain("effect.status === 'rejected'")
-    // 去重 key 必须把 requestedPercent 和 percent 都算进去，否则
-    // 「区间 40% → 实际 8%」与「区间 70% → 实际 8%」会被误合并成一条。
+    // 右轨实时条读取 snapshot 的 channel.requestedPercent（会话记录），
+    // 手动直控/旧宿主没有该字段时才回退 channel.percent。
+    expect(js).toContain('channel.requestedPercent')
+    // 去重 key：有请求时 [part,'request',请求值,waveform]；旧路径 'legacy'
+    // 才把实际 percent 算进去，避免两种格式被当成同一格。
     expect(js).toContain('percentValues.requested')
     expect(js).toContain('percentValues.actual')
+    expect(js).toContain("'request'")
+    expect(js).toContain("'legacy'")
     expect(js).toContain("join('|')")
     expect(js).toContain('channel-live')
     expect(js).toContain('/api/waveforms/preview')

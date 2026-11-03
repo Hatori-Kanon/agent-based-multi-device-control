@@ -99,6 +99,13 @@ export interface WaveformPreviewPayload {
 export interface DashboardDeps {
   snapshot(): unknown
   /**
+   * Latest model-requested band percent per `device:channel` (0–100), from the
+   * open session. Optional: without it snapshots stay undecorated, so older
+   * hosts/test doubles keep working. The console shows this instead of the
+   * mapped output.
+   */
+  readonly requestedPercents?: () => Readonly<Record<string, number>>
+  /**
    * The session service (B1-T16). Optional so a console-only host (or an older
    * test double) keeps working; the session routes answer 404 without it.
    */
@@ -464,6 +471,7 @@ function hzBandFields(minCode: unknown, maxCode: unknown): { minHz: number; maxH
 function decorateChannel(
   channel: Record<string, unknown>,
   protocol: DeviceProtocol | undefined,
+  requestedPercent: number | undefined,
 ): Record<string, unknown> {
   const nativeStrength = protocol === 'coyote'
   const decorated: Record<string, unknown> = {
@@ -471,6 +479,9 @@ function decorateChannel(
     intensityUnit: nativeStrength ? 'strength' : 'percent',
     intensityMax: nativeStrength ? 200 : 100,
   }
+  // The model's requested band percent is host session state, not registry
+  // state: merge it here (never into the registry snapshot itself).
+  if (requestedPercent !== undefined) decorated.requestedPercent = requestedPercent
   const hz = hzBandFields(channel.minFreq, channel.maxFreq)
   if (hz !== undefined) {
     decorated.minFreqHz = hz.minHz
@@ -485,8 +496,15 @@ function decorateChannel(
  * `protocol` is omitted for devices the operator manifest does not know (hub
  * backends, the mock pair in tests); the console then falls back to percentage
  * units, which is the safe default for anything that is not a Coyote.
+ *
+ * `requested` is the session's model-requested band percent keyed
+ * `device:channel`; channels without a value stay undecorated.
  */
-function decorateSnapshot(snapshot: unknown, protocols: ReadonlyMap<string, DeviceProtocol>): unknown {
+function decorateSnapshot(
+  snapshot: unknown,
+  protocols: ReadonlyMap<string, DeviceProtocol>,
+  requested: Readonly<Record<string, number>> = {},
+): unknown {
   const root = asJsonObject(snapshot)
   if (root === undefined || !Array.isArray(root.devices)) return snapshot
   const devices = root.devices.map(entry => {
@@ -497,7 +515,12 @@ function decorateSnapshot(snapshot: unknown, protocols: ReadonlyMap<string, Devi
     const channels = Array.isArray(device.channels)
       ? device.channels.map(channel => {
           const record = asJsonObject(channel)
-          return record === undefined ? channel : decorateChannel(record, protocol)
+          if (record === undefined) return channel
+          const channelId = typeof record.id === 'string' ? record.id : undefined
+          const requestedPercent = id === undefined || channelId === undefined
+            ? undefined
+            : requested[`${id}:${channelId}`]
+          return decorateChannel(record, protocol, requestedPercent)
         })
       : device.channels
     return {
@@ -838,7 +861,11 @@ export class DashboardServer {
    * cannot be added to one route and forgotten on another.
    */
   private snapshotPayload(): unknown {
-    return decorateSnapshot(this.options.deps.snapshot(), this.deviceProtocols())
+    return decorateSnapshot(
+      this.options.deps.snapshot(),
+      this.deviceProtocols(),
+      this.options.deps.requestedPercents?.() ?? {},
+    )
   }
 
   /** Waveform summaries plus their Hz display bands; every `{waveforms}` payload uses it. */
