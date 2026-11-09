@@ -32,7 +32,7 @@ audit/
 *.jsonl
 
 # Session save files.
-state/
+/state/
 
 # Agent-authored waveforms are session-scoped scratch.
 waveforms/session/
