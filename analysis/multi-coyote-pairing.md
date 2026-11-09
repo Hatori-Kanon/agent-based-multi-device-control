@@ -71,7 +71,7 @@
   策略/部位状态）→ 清除 `bleId`；之后点「连接」重新扫描、重新绑定。若 close 失败，
   lifecycle 记 `failed` 且**不清 `bleId`**（链路可能还在，不能换绑）。
 - 卡片头部显示 `已配对` 标记；`GET /api/devices` 的每条记录新增 `bound` / `canRebind` / `pairedId`；
-  设备卡在有配对时显示一行 `配对地址 · D4:04:F3:8E:CC:A6`（即 chooser 的 `deviceId`），
+  设备卡在有配对时显示一行 `配对地址 · <coyote-2>`（即 chooser 的 `deviceId`），
   方便和 Windows/Chrome 的设备列表对照。
 
 ### 2.4 已连接的稳定身份
@@ -101,7 +101,7 @@
   它只证明 UI 线路与请求命中，**不证明** rebind 真的断链/停输出——那部分由 core 单测 +
   `registry.disconnect` 覆盖。
 - **真机验收（2026-11-04 04:07，用户确认通过）**：两台郊狼同时连接成功，各自绑定不同地址：
-  `coyote → CC:E3:81:07:09:3D`、`coyote-2 → D4:04:F3:8E:CC:A6`（与 Chrome/xtoys 列表中的两个地址一致）。
+  `coyote → <coyote-1>`、`coyote-2 → <coyote-2>`（与 Chrome/xtoys 列表中的两个地址一致）。
   审计 `settings_change(scope=device-paired)` 两条不同 `platformId`；`state/devices.json` 里两个 `bleId`
   不同。用户反馈："真机验收完成，两台机器同时连接也可以了。"
 
@@ -133,7 +133,7 @@
 ## 5. v18 第二版修复：统一用 chooser 的 id（地址）
 
 首版上线后用户实测：连着一台时另一台连不上；Chrome/xtoys 的配对窗可以按地址区分两台
-（`47L121000 (D4:04:F3:8E:CC:A6)` / `47L121000 (CC:E3:81:07:09:3D)`）。审计证据：
+（`47L121000 (<coyote-2>)` / `47L121000 (<coyote-1>)`）。审计证据：
 
 ```
 connect error NOT_CONNECTED: ... (wanted: 47L121000; bound unit: SzsD/vOS4gB6Q2xHxeZp3A==);

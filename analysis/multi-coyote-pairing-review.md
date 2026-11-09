@@ -258,7 +258,7 @@ hash）** 作为 `bleId`/pin，但 Electron `select-bluetooth-device` 候选列�
 ## 11. 真机验收通过（2026-11-04 04:18，用户确认）
 
 - 两台郊狼同时连接成功；审计 `device-paired` 两条不同平台地址：
-  `coyote → CC:E3:81:07:09:3D`、`coyote-2 → D4:04:F3:8E:CC:A6`；
+  `coyote → <coyote-1>`、`coyote-2 → <coyote-2>`；
   `state/devices.json` 两个 `bleId` 均为此地址格式（非 hash）。
 - 用户原话："真机验收完成，两台机器同时连接也可以了。"
 - 因此 §10 的 id 空间修复与 §9 的 P1 修复均在真实硬件上确认；剩余项只有 §4 的已知限制
