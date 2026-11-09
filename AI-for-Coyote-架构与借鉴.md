@@ -38,8 +38,8 @@
 
 ### 2.1 一张图
 
-- 交互版（可切主题/缩放/导出）：[ai-for-coyote-architecture.html](.archify/architecture-ai-for-coyote-20261101-160515/ai-for-coyote-architecture.html)
-- 静态预览：![AI-for-Coyote 架构](.archify/architecture-ai-for-coyote-20261101-160515/ai-for-coyote-architecture.visual-check.1440x900.light.png)
+- 交互版（可切主题/缩放/导出）：本地 `.archify/architecture-ai-for-coyote-20261101-160515/ai-for-coyote-architecture.html`（archify 生成物，已加入 `.gitignore`，不随仓库发布）
+- 静态预览：本地 `.archify/architecture-ai-for-coyote-20261101-160515/ai-for-coyote-architecture.visual-check.1440x900.light.png`（同上，本地生成）
 
 图中每个组件都挂了源码出处；`archify` 的 validate / deliver / check / browser-check 四道门禁全过，并已人工看过 1440×900 渲染。
 
@@ -330,5 +330,5 @@ AI-for-Coyote 整体 GPL-3.0，`relay/` 源自 GPL-3.0 的 `dglab-websocket-serv
 - [后端证据笔记（622 行，51 条证据表 + 18 条旧分析勘误）](analysis/coyote-backend-notes.md)
 - [产品面证据笔记（685 行，681 处行号引用）](analysis/coyote-product-notes.md)
 - [我方基线盘点（441 行，含 14 条文档-代码矛盾）](analysis/our-baseline.md)
-- [架构图（archify，可交互）](.archify/architecture-ai-for-coyote-20261101-160515/ai-for-coyote-architecture.html)
-- [架构图规格 JSON（含每个组件的源码出处）](.archify/architecture-ai-for-coyote-20261101-160515/candidate.json)
+- 架构图（archify，可交互）：本地 `.archify/architecture-ai-for-coyote-20261101-160515/ai-for-coyote-architecture.html`（生成物，未跟踪）
+- 架构图规格 JSON（含每个组件的源码出处）：本地 `.archify/architecture-ai-for-coyote-20261101-160515/candidate.json`（生成物，未跟踪）
