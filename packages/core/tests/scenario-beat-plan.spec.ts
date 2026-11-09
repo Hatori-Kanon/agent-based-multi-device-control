@@ -41,6 +41,24 @@ function firstBeat(result: PlanValidation): Beat {
 }
 
 describe('parseBeatPlan only drops what the contract rejects', () => {
+  it('accepts a phase transition request and trims its id', () => {
+    const result = parseBeatPlan(rawPlan({ advanceTo: ' peak ' }), CTX)
+    expect(result.plan.advanceTo).toBe('peak')
+    expect(result.warnings).toEqual([])
+    // The host still validates the edge; the parser only keeps the request.
+    expect(result.plan.phase).toBe('probe')
+  })
+
+  it('warns and ignores a malformed advanceTo instead of dropping the plan', () => {
+    const numeric = parseBeatPlan(rawPlan({ advanceTo: 42 }), CTX)
+    expect(numeric.plan.advanceTo).toBeUndefined()
+    expect(numeric.plan.beats).toHaveLength(1)
+    expect(numeric.warnings).toContainEqual(expect.stringContaining('advanceTo must be a non-empty phase id'))
+
+    const blank = parseBeatPlan(rawPlan({ advanceTo: '   ' }), CTX)
+    expect(blank.plan.advanceTo).toBeUndefined()
+    expect(blank.warnings).toContainEqual(expect.stringContaining('advanceTo must be a non-empty phase id'))
+  })
   it('drops an unknown intent and keeps the remaining beats', () => {
     const result = parseBeatPlan(
       rawPlan({

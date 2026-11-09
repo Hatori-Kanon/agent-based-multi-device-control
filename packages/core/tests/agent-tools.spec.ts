@@ -130,9 +130,10 @@ describe('M2 model tool surface', () => {
     const properties = asRecord(parameters['properties'])
 
     // BeatPlan top level minus the engine-injected fields (§4.3), plus the
-    // single-call `narration` extension (prose travels in the tool call).
+    // single-call `narration` extension (prose travels in the tool call) and
+    // the model-requested `advanceTo` phase edge.
     expect(objectKeys(properties)).toEqual([
-      'beats', 'choices', 'lineGuidance', 'narration', 'nextTurnAfterSec', 'pacing',
+      'advanceTo', 'beats', 'choices', 'lineGuidance', 'narration', 'nextTurnAfterSec', 'pacing',
     ])
     expect(parameters['required']).toEqual(['pacing', 'beats'])
     for (const engineField of BEAT_PLAN_ENGINE_FIELDS) {
@@ -169,20 +170,23 @@ describe('M2 model tool surface', () => {
     ])
     expect(objectKeys(asRecord(branches[1])['properties'])).toEqual(['durationSec', 'kind', 'waveformId'])
 
-    // Intensity semantics are spelled out so the model picks interval values
-    // instead of writing tiny "absolute-looking" numbers (task-16).
+    // Intensity semantics are capability facts, not a prescription of "normal"
+    // values: the human owns the band and the model chooses the relative
+    // request. Caps are never exposed to the model.
     const levelProperties = asRecord(branches[0])['properties']
     const targetPercent = asRecord(asRecord(levelProperties)['targetPercent'])
-    expect(targetPercent['description']).toContain('50 = 区间中点')
-    expect(targetPercent['description']).toContain('不要用 5–20')
+    expect(targetPercent['description']).toContain('0–100 的连续区间百分比')
+    expect(targetPercent['description']).toContain('需要具体强度时优先用它表达')
+    expect(targetPercent['description']).not.toContain('40–70')
+    expect(targetPercent['description']).not.toContain('5–20')
     // Caps are never exposed to the model, so no concrete cap example may leak.
     expect(targetPercent['description']).not.toContain('上限 20')
     expect(targetPercent['description']).toContain('具体上限数值对模型不可见')
     const deltaPercent = asRecord(asRecord(levelProperties)['deltaPercent'])
-    expect(deltaPercent['description']).toContain('只用于微调')
+    expect(deltaPercent['description']).toContain('只用于在当前位置微调')
     expect(asRecord(branches[1])['description']).toContain('beat.strength')
     const strengthSchema = asRecord(beatProperties['strength'])
-    expect(strengthSchema['description']).toContain('low = 40%')
+    expect(strengthSchema['description']).toContain('low = 25%')
     expect(strengthSchema['description']).toContain('具体数值不向模型暴露')
 
     // Per-target override: device/channel plus the same change/strength fields.
@@ -354,12 +358,13 @@ describe('withPlayableEnums', () => {
     expect(applyPlanOf(decorated).parameters).not.toBe(applyPlanOf(M2_MODEL_TOOLS).parameters)
   })
 
-  it('injects the pack waveform ids into beat and target changes', () => {
+  it('injects the pack waveforms and the legal phase edges into apply_plan', () => {
     const decorated = withPlayableEnums(
       M2_MODEL_TOOLS,
       ['probe-touch'],
       ['chest'],
       ['tentacle-shadow:saw-spin', 'tentacle-shadow:spiral-squeeze'],
+      ['probe', 'peak'],
     )
     const properties = beatPropertiesOf(decorated)
     expect(waveformEnumOf(properties['change'])).toEqual([
@@ -372,6 +377,14 @@ describe('withPlayableEnums', () => {
       'tentacle-shadow:saw-spin',
       'tentacle-shadow:spiral-squeeze',
     ])
+    const rootProperties = asRecord(parametersOf(applyPlanOf(decorated))['properties'])
+    expect(asRecord(rootProperties['advanceTo'])['enum']).toEqual(['probe', 'peak'])
+  })
+
+  it('leaves advanceTo enum-free on a terminal phase', () => {
+    const decorated = withPlayableEnums(M2_MODEL_TOOLS, ['probe-touch'], ['chest'], [], [])
+    const rootProperties = asRecord(parametersOf(applyPlanOf(decorated))['properties'])
+    expect(asRecord(rootProperties['advanceTo'])).not.toHaveProperty('enum')
   })
 
   it('deduplicates and trims ids, and always keeps whole-body first', () => {

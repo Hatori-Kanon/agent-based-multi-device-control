@@ -121,9 +121,9 @@ describe('the freeform intent table', () => {
 })
 
 describe('the strength and envelope constants', () => {
-  it('maps low/med/high to 40/70/100 percent of the cap', () => {
-    // D8 freeze (2026-11-01); the retired draft said 50/80/100.
-    expect(STRENGTH_RATIO).toEqual({ low: 0.4, med: 0.7, high: 1 })
+  it('maps low/med/high to 25/50/80 percent of the cap', () => {
+    // D8 revision (2026-11-04): 25/50/80 replaced 40/70/100.
+    expect(STRENGTH_RATIO).toEqual({ low: 0.25, med: 0.5, high: 0.8 })
 
     const plain: FeedbackIntent = { id: 'plain', meaning: '无建议', regions: ['whole-body'] }
     const intents = new Map([['plain', plain]])
@@ -133,7 +133,7 @@ describe('the strength and envelope constants', () => {
       return body?.kind === 'level' ? body.percent : undefined
     }
 
-    expect([percentOf('low'), percentOf('med'), percentOf('high')]).toEqual([16, 28, 40])
+    expect([percentOf('low'), percentOf('med'), percentOf('high')]).toEqual([10, 20, 32])
   })
 
   it('ships the documented envelope defaults', () => {

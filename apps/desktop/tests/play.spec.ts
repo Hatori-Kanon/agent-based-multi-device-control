@@ -126,7 +126,20 @@ function pacedPlanCall(nextTurnAfterSec: number, id = 'call_paced'): ToolCall {
   }
 }
 
-/** The same plan, plus one offered player option (B2-T6/T11). */
+/** A plan that asks the engine to advance to a phase. */
+function advancePlanCall(target: string, id = 'call_advance'): ToolCall {
+  return {
+    id,
+    name: 'apply_plan',
+    arguments: {
+      pacing: 'probe',
+      advanceTo: target,
+      beats: [{ id: 'b1', intentId: 'probe-touch', regions: ['whole-body'], strength: 'low' }],
+    },
+  }
+}
+
+/** The same plan plus one offered player option (B2-T6/T11). */
 function choicePlanCall(id = 'call_1'): ToolCall {
   return {
     id,
@@ -362,6 +375,50 @@ function narrativePack(): Promise<LoadedPack> {
   return cachedScenarioPack
 }
 
+/** A scenario pack with three phases, phase windows and per-phase notes. */
+let cachedPhasedPack: Promise<LoadedPack> | undefined
+
+function phasedPack(): Promise<LoadedPack> {
+  cachedPhasedPack ??= loadPack(new MemoryContentSource({
+    'pack.json': JSON.stringify({
+      id: 'phased',
+      name: '分阶段包',
+      version: '1.0.0',
+      engine: '>=0.2 <1.0',
+      mode: 'scenario',
+      rating: 'all',
+      boundaries: ['不做真实伤害'],
+    }),
+    'persona.md': '# 阿岚\n\n## 导演摘要\n\n温柔的试探者，先观察再靠近。\n',
+    'setting.md': '一间只有台灯的书房。\n',
+    'phases/arrival.md': 'ARRIVAL-NOTE',
+    'phases/middle.md': 'MIDDLE-NOTE',
+    'phases/resolve.md': 'RESOLVE-NOTE',
+    'scenario.json': JSON.stringify({
+      session: {
+        plannedMinutes: 30,
+        phaseWindows: [
+          { phase: 'arrival', from: 0, to: 0.2 },
+          { phase: 'middle', from: 0.2, to: 0.7 },
+          { phase: 'resolve', from: 0.7, to: 1 },
+        ],
+        aftercareMin: 0,
+      },
+      regions: [{ id: 'whole-body', label: '全身' }],
+      phases: [
+        { id: 'arrival', goal: '抵达与安顿', advanceWhen: '对方愿意留下', next: ['middle'] },
+        { id: 'middle', goal: '守灯与靠近', advanceWhen: '风转小', next: ['resolve'] },
+        { id: 'resolve', goal: '收束', next: [] },
+      ],
+      feedbackIntents: [
+        { id: 'probe-touch', meaning: '短促试探', regions: ['whole-body'] },
+        { id: 'stop', meaning: '停下', regions: ['whole-body'] },
+      ],
+    }),
+  }))
+  return cachedPhasedPack
+}
+
 let cachedTentaclePack: Promise<LoadedPack> | undefined
 
 /**
@@ -575,6 +632,141 @@ describe('play session', () => {
     expect(secondRequest.messages.some(message =>
       message.role === 'user' && message.content === '我往后缩了一下')).toBe(true)
   })
+
+describe('phase advancement', () => {
+  it('tells the model the session timeline, current phase and legal edges', async () => {
+    const h = await createHarness([scriptedTurn('（开场。）', [planCall()])], await phasedPack())
+    await h.session.start({ pack: await phasedPack(), plannedMinutes: 30 })
+
+    const request = h.runner.requests[0]!
+    const system = request.messages[0]?.content ?? ''
+    expect(system).toContain('会话时间：已进行 0 分钟 / 计划 30 分钟（0%）')
+    expect(system).toContain('剩余 30 分钟')
+    expect(system).toContain('当前阶段：arrival（抵达与安顿）')
+    expect(system).toContain('推进条件：对方愿意留下')
+    expect(system).toContain('可推进到：middle')
+    expect(system).toContain('阶段时间窗：arrival 0–20%')
+    expect(system).toContain('advanceTo')
+
+    const applyPlan = request.tools.find(tool => tool.name === 'apply_plan')!
+    const properties = (applyPlan.parameters as { properties: Record<string, unknown> }).properties
+    expect((properties['advanceTo'] as { enum?: readonly string[] }).enum).toEqual(['middle'])
+  })
+
+  it('advances only along a declared edge and injects the next phase note', async () => {
+    const h = await createHarness([
+      scriptedTurn('（进入下一阶段。）', [advancePlanCall('middle')]),
+      scriptedTurn('（中段。）', [planCall('call_2')]),
+    ], await phasedPack())
+
+    const first = await h.session.start({ pack: await phasedPack(), plannedMinutes: 30 })
+    expect(first.phase).toBe('middle')
+    const second = await h.session.message('继续')
+    expect(second.phase).toBe('middle')
+
+    const secondSystem = h.runner.requests[1]!.messages[0]?.content ?? ''
+    expect(secondSystem).toContain('当前阶段：middle（守灯与靠近）')
+    expect(secondSystem).toContain('MIDDLE-NOTE')
+    expect(secondSystem).toContain('可推进到：resolve')
+
+    const advances = h.records().filter(record => record.action === 'phase_advance')
+    expect(advances).toHaveLength(1)
+    expect(advances[0]).toMatchObject({
+      actor: 'model',
+      action: 'phase_advance',
+      result: 'ok',
+      detail: { from: 'arrival', to: 'middle' },
+    })
+  })
+
+  it('rejects an illegal edge, keeps the phase and audits the refusal', async () => {
+    const h = await createHarness([
+      scriptedTurn('（跳不过去。）', [advancePlanCall('resolve')]),
+      scriptedTurn('（继续。）', [planCall('call_2')]),
+    ], await phasedPack())
+
+    const first = await h.session.start({ pack: await phasedPack(), plannedMinutes: 30 })
+    expect(first.phase).toBe('arrival')
+    await h.session.message('继续')
+
+    const rejected = h.records().find(record => record.action === 'phase_advance')
+    expect(rejected).toMatchObject({
+      actor: 'model',
+      action: 'phase_advance',
+      result: 'rejected',
+      detail: { from: 'arrival', requested: 'resolve' },
+    })
+    expect(h.runner.requests[1]!.messages[0]?.content ?? '').toContain('当前阶段：arrival')
+    expect(h.runner.requests[1]!.messages[0]?.content ?? '').not.toContain('MIDDLE-NOTE')
+  })
+
+  it('starts a new session at the first phase after a normal end', async () => {
+    const backing: ArchiveBacking = {
+      state: new MemoryDocumentStore(),
+      ledger: new MemoryAppendOnlyStore(),
+      memory: new MemoryDocumentStore(),
+    }
+    const clock = new FakeClock()
+    const firstRun = await createArchivedHarness({
+      turns: [scriptedTurn('（进入下一阶段。）', [advancePlanCall('middle')])],
+      pack: await phasedPack(),
+      backing,
+      clock,
+    })
+    const first = await firstRun.host.start({ packId: 'phased', plannedMinutes: 30 })
+    expect(first.phase).toBe('middle')
+    await firstRun.host.end('completed')
+
+    const secondRun = await createArchivedHarness({
+      turns: [scriptedTurn('（新的一局。）', [planCall()])],
+      pack: await phasedPack(),
+      backing,
+      clock,
+    })
+    const second = await secondRun.host.start({ packId: 'phased', plannedMinutes: 30 })
+    expect(second.phase).toBe('arrival')
+    const system = secondRun.runner.requests[0]?.messages[0]?.content ?? ''
+    expect(system).toContain('当前阶段：arrival（抵达与安顿）')
+    expect(system).toContain('ARRIVAL-NOTE')
+    expect(system).not.toContain('MIDDLE-NOTE')
+  })
+
+  it('starts at the first phase after an interrupted (recovered) session', async () => {
+    const backing: ArchiveBacking = {
+      state: new MemoryDocumentStore(),
+      ledger: new MemoryAppendOnlyStore(),
+      memory: new MemoryDocumentStore(),
+    }
+    const clock = new FakeClock()
+    const crashed = await createArchivedHarness({
+      turns: [
+        scriptedTurn('（进入下一阶段。）', [advancePlanCall('middle')]),
+        scriptedTurn('（中段。）', [planCall('call_2')]),
+      ],
+      pack: await phasedPack(),
+      backing,
+      clock,
+    })
+    const first = await crashed.host.start({ packId: 'phased', plannedMinutes: 30 })
+    expect(first.phase).toBe('middle')
+    crashed.host.dispose()
+
+    const restarted = await createArchivedHarness({
+      turns: [scriptedTurn('（重新开始。）', [planCall()])],
+      pack: await phasedPack(),
+      backing,
+      clock,
+    })
+    const next = await restarted.host.start({ packId: 'phased', plannedMinutes: 30 })
+    // Unfinished snapshots are facts for the content pack, never a phase
+    // restore: the new session still starts at the first phase.
+    expect(next.phase).toBe('arrival')
+    const system = restarted.runner.requests[0]?.messages[0]?.content ?? ''
+    expect(system).toContain('当前阶段：arrival（抵达与安顿）')
+    expect(system).toContain('ARRIVAL-NOTE')
+    expect(system).not.toContain('MIDDLE-NOTE')
+  })
+})
 
   it('refuses a player message while no session is open', async () => {
     const h = await createHarness([])
@@ -876,9 +1068,9 @@ describe('session HTTP routes', () => {
     })
 
     // `GET /api/snapshot` decorates the channels with the model-requested band
-    // percent the session tracks (fixture plan: probe-touch, strength low → 40).
+    // percent the session tracks (fixture plan: probe-touch, strength low → 25).
     const requested = runtime.play.requestedPercents()
-    expect(Object.values(requested)).toContain(40)
+    expect(Object.values(requested)).toContain(25)
     const [requestedKey, requestedValue] = Object.entries(requested)[0]!
     const [requestedDeviceId, requestedChannelId] = requestedKey.split(':')
     const decoratedSnapshot = await (await get('/api/snapshot')).json() as {
@@ -1547,15 +1739,19 @@ describe('session ceiling and narrative regions (B2-T9/T10)', () => {
     // Band-percent semantics, continuation-by-default and the loop-order
     // rule are global directives (manual and auto mode both need them). The
     // model's own percentage scale is 0–100 with no concrete cap number: the
-    // mapping into the human's soft range happens client-side.
-    expect(opening).toContain('strength 档位：low=40%、med=70%、high=100%')
+    // mapping into the human's soft range happens client-side. The prompt must
+    // not prescribe "normal" intensity values: the human owns the band and the
+    // model chooses the relative request.
+    expect(opening).toContain('strength 是粗档位')
+    expect(opening).toContain('low/med/high = 玩家软区间的 25/50/80%')
     expect(opening).toContain('100% = 玩家设定的通道上限')
     expect(opening).toContain('具体数值不向模型暴露')
-    expect(opening).toContain('普通接触用 med')
-    expect(opening).toContain('targetPercent 是 0–100 的区间百分比')
-    expect(opening).toContain('请直接给普通强度 40–70 这样的区间百分比')
-    expect(opening).toContain('不要用 5–20 这类过小值')
-    expect(opening).toContain('deltaPercent 只用于微调')
+    expect(opening).toContain('targetPercent 是 0–100 的连续区间百分比')
+    expect(opening).toContain('需要具体强度时优先用它精确表达')
+    expect(opening).toContain('deltaPercent 只用于在当前位置微调')
+    expect(opening).not.toContain('普通接触用 med')
+    expect(opening).not.toContain('40–70')
+    expect(opening).not.toContain('5–20')
     expect(opening).not.toContain('上限 20 时输出 10')
     expect(opening).toContain('本回合未提及的通道默认延续上一回合输出')
     expect(opening).toContain('不再刺激某个部位时必须用 stop 意图')
@@ -1675,8 +1871,8 @@ describe('packed waveforms, player parts and true effect rows (audit fixes)', ()
         status: 'dispatched',
         waveformId: 'tentacle:saw-spin',
         waveformName: '回旋锯齿',
-        // `strength: 'low'` is 40 % of the channel's soft band (0–20) → 8 %.
-        percent: 8,
+        // `strength: 'low'` is 25 % of the channel's soft band (0–20) → 5 %.
+        percent: 5,
       })
     }
     expect(planActions(h.records()).every(action => action.status !== 'rejected')).toBe(true)
@@ -1976,10 +2172,10 @@ describe('continuity hold while the model thinks', () => {
     expect(firstPlanCommand).toBeGreaterThan(firstHold)
 
     // The new plan overrides the held channel: `probe-touch` is `primary`, so
-    // it drives channel a only; low strength is 40 % of the band → 8 %.
+    // it drives channel a only; low strength is 25 % of the band → 5 %.
     const second = h.host.transcript()[1]!
     expect(second.effects).toHaveLength(1)
-    expect(second.effects[0]).toMatchObject({ channelId: 'a', percent: 8 })
+    expect(second.effects[0]).toMatchObject({ channelId: 'a', percent: 5 })
   })
 
   it('does not hold a channel that was explicitly stopped', async () => {
@@ -2377,11 +2573,11 @@ describe('effect requested percent transparency', () => {
     const h = await createHarness([scriptedTurn('（轻触。）', [strengthLevelPlanCall('low')])])
     await h.host.start({ packId: 'demo', plannedMinutes: 30 })
 
-    // `strength: 'low'` is 40 % of the soft band → actual 8 on a 0–20 band.
+    // `strength: 'low'` is 25 % of the soft band → actual 5 on a 0–20 band.
     const effects = h.host.transcript()[0]!.effects
     expect(effects).toHaveLength(2)
     for (const effect of effects) {
-      expect(effect).toMatchObject({ requestedPercent: 40, strength: 'low', percent: 8 })
+      expect(effect).toMatchObject({ requestedPercent: 25, strength: 'low', percent: 5 })
     }
   })
 
@@ -2405,7 +2601,7 @@ describe('effect requested percent transparency', () => {
       const h = await createHarness([scriptedTurn('（旧路径。）', [planCall()])])
       await h.host.start({ packId: 'demo', plannedMinutes: 30 })
       const effect = h.host.transcript()[0]!.effects[0]!
-      expect(effect.percent).toBe(8)
+      expect(effect.percent).toBe(5)
       expect(effect).not.toHaveProperty('requestedPercent')
       expect(effect).not.toHaveProperty('strength')
     } finally {

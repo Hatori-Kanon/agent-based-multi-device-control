@@ -23,6 +23,8 @@
 export interface PhaseNode {
   readonly id: string
   readonly goal: string
+  /** Author-written condition shown to the director; free text, not machine-evaluated. */
+  readonly advanceWhen?: string
   readonly next: readonly string[]
 }
 

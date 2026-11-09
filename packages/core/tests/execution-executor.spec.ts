@@ -253,8 +253,8 @@ describe('dispatch', () => {
     expect(byBeat.get('b3')).toEqual(['degraded', 'degraded'])
     expect(byBeat.has('b4')).toBe(false)
     // The merged command keeps b3's fallback body (wave preset, low strength:
-    // 0.4 × the 0-40 test interval = 16%).
-    expect(result.actions.every(action => action.percent === 16)).toBe(true)
+    // 0.25 × the 0-40 test interval = 10%).
+    expect(result.actions.every(action => action.percent === 10)).toBe(true)
 
     // Never above the human's cap.
     expect(harness.toy.writes.length).toBeGreaterThan(0)
@@ -313,8 +313,8 @@ describe('dispatch', () => {
     // retry succeeds; the request still records what the model asked for.
     expect(result.actions[1]).toMatchObject({
       status: 'degraded',
-      percent: 8,
-      request: { strength: 'low', requestedPercent: 40 },
+      percent: 5,
+      request: { strength: 'low', requestedPercent: 25 },
     })
 
     const detail = planResolvedRecords(harness)[0]?.detail as Record<string, unknown>

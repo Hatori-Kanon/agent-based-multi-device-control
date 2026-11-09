@@ -8,8 +8,9 @@
  * number here is deliberate: retuning the feel of the device is a one-file
  * change, and no other module is allowed to invent a percentage.
  *
- * D8 freeze (2026-11-01): `low=40% / med=70% / high=100%` of the channel cap.
- * The earlier draft's 50/80/100 is retired.
+ * D8 revision (2026-11-04): `low=25% / med=50% / high=80%` of the channel cap.
+ * The earlier 40/70/100 values are retired: the tier is only a coarse fallback
+ * now that the plan can express any 0–100 interval percentage via `targetPercent`.
  */
 
 import type { EnvelopePreset } from '../devices/effect.ts'
@@ -21,7 +22,7 @@ import type { FeedbackIntent } from './intents.ts'
  * Everything downstream (`resolvePlan`, the executor, the audit) reads this
  * table; no other module may hard-code an intensity number.
  */
-export const STRENGTH_RATIO = { low: 0.4, med: 0.7, high: 1 } as const
+export const STRENGTH_RATIO = { low: 0.25, med: 0.5, high: 0.8 } as const
 
 /** Default envelope shape per preset: `min = round(max × minRatio)`. */
 export const ENVELOPE_DEFAULTS: Record<EnvelopePreset, { minRatio: number; periodMs: number; jitter: number }> = {

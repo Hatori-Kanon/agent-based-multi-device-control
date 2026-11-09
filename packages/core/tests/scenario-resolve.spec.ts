@@ -255,7 +255,7 @@ describe('one turn drives each channel once', () => {
     expect(command.beatId).toBe('b2')
     expect(command.body).toEqual({
       kind: 'pattern',
-      envelope: { preset: 'steady', minPercent: 14, maxPercent: 14, periodMs: 1_000, jitter: 0 },
+      envelope: { preset: 'steady', minPercent: 10, maxPercent: 10, periodMs: 1_000, jitter: 0 },
       durationSec: 40,
       waveformId: 'climb',
     })
@@ -473,7 +473,7 @@ describe('clamping and the strength conversion', () => {
       plan([levelBeat('b1', { intentId: 'plain', regions: ['chest'], strength: 'med', change: { kind: 'level' } })]),
       ctx,
     )
-    expect(firstCommand(strengthOnly.commands).body).toEqual({ kind: 'level', percent: 14, durationSec: 2 })
+    expect(firstCommand(strengthOnly.commands).body).toEqual({ kind: 'level', percent: 10, durationSec: 2 })
     expect(firstCommand(strengthOnly.commands).clamped).toBe(false)
   })
 
@@ -499,11 +499,11 @@ describe('clamping and the strength conversion', () => {
       )
 
     const within = hold(8)
-    expect(within.body).toEqual({ kind: 'level', percent: 14, durationSec: 8 })
+    expect(within.body).toEqual({ kind: 'level', percent: 10, durationSec: 8 })
     expect(within.clamped).toBe(false)
 
     const over = hold(600)
-    expect(over.body).toEqual({ kind: 'level', percent: 14, durationSec: 10 })
+    expect(over.body).toEqual({ kind: 'level', percent: 10, durationSec: 10 })
     expect(over.clamped).toBe(true)
   })
 })
@@ -540,9 +540,9 @@ describe('resolved commands carry the pre-mapping request', () => {
       context(registry, PLAIN_INTENT_MAP),
     ).commands)
 
-    expect(command.request).toEqual({ strength: 'low', requestedPercent: 40 })
+    expect(command.request).toEqual({ strength: 'low', requestedPercent: 25 })
     expect(command.body.kind).toBe('pattern')
-    if (command.body.kind === 'pattern') expect(command.body.envelope.maxPercent).toBe(8)
+    if (command.body.kind === 'pattern') expect(command.body.envelope.maxPercent).toBe(5)
   })
 
   it('keeps a zero request for the stop intent', () => {
@@ -645,7 +645,7 @@ describe('region routing and distribution', () => {
     )
 
     // Target `a` inherits the level change and overrides only the strength.
-    expect(commands.get('a')?.body).toEqual({ kind: 'level', percent: 20, durationSec: 2 })
+    expect(commands.get('a')?.body).toEqual({ kind: 'level', percent: 16, durationSec: 2 })
     // Target `b` overrides the change too: deltaPercent is relative to its own
     // current position. Current 30 in 0-40 is a 75% position; +10 lands at
     // 85%, i.e. 34, and that is a normal mapping rather than a clamp.
@@ -939,7 +939,7 @@ describe('pattern bodies', () => {
 
     expect(command.body).toEqual({
       kind: 'pattern',
-      envelope: { preset: 'wave', minPercent: 5, maxPercent: 14, periodMs: 4_000, jitter: 0 },
+      envelope: { preset: 'wave', minPercent: 4, maxPercent: 10, periodMs: 4_000, jitter: 0 },
       durationSec: 30,
       waveformId: 'tide',
     })
@@ -957,7 +957,7 @@ describe('pattern bodies', () => {
 
     expect(command.body).toEqual({
       kind: 'pattern',
-      envelope: { preset: 'steady', minPercent: 14, maxPercent: 14, periodMs: 1_000, jitter: 0 },
+      envelope: { preset: 'steady', minPercent: 10, maxPercent: 10, periodMs: 1_000, jitter: 0 },
       durationSec: 8,
       waveformId: 'climb',
     })
@@ -1085,7 +1085,7 @@ describe('looping waveforms sustain across the thinking gap', () => {
       plan([levelBeat('b1', { intentId: 'plain', regions: ['chest'], change: { kind: 'level', durationSec: 4 } })]),
       ctx,
     ).commands)
-    expect(level.body).toEqual({ kind: 'level', percent: 14, durationSec: 4 })
+    expect(level.body).toEqual({ kind: 'level', percent: 10, durationSec: 4 })
 
     const stop = firstCommand(resolvePlan(
       plan([levelBeat('b2', { intentId: 'stop', regions: ['chest'] })]),

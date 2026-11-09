@@ -130,6 +130,12 @@ export interface BeatPlan {
   readonly turnId: number
   /** Injected by the engine. */
   readonly phase: string
+  /**
+   * Model-requested phase transition. The host validates it against the
+   * current phase's declared `next` edges; an illegal target is ignored and
+   * audited, never applied by the resolver.
+   */
+  readonly advanceTo?: string
   readonly pacing: PlanPacing
   /** Suggested gap before the next turn; the engine clamps it to [10, 60]. */
   readonly nextTurnAfterSec?: number
@@ -198,6 +204,7 @@ const DIGITS = /\p{Nd}/u
 const PACING_VALUES: readonly PlanPacing[] = ['hold', 'build', 'release', 'probe']
 const STRENGTH_VALUES: readonly BeatStrength[] = ['low', 'med', 'high']
 const KNOWN_TOP_LEVEL = new Set([
+  'advanceTo',
   'beats',
   'choices',
   'lineGuidance',
@@ -319,6 +326,7 @@ function parsePlan(raw: unknown, ctx: PlanContext): PlanValidation {
   )
   const lineGuidance = parseLineGuidance(record['lineGuidance'], new Set(beats.map(beat => beat.id)), warnings)
   const nextTurnAfterSec = readNextTurnAfterSec(record, warnings)
+  const advanceTo = readAdvanceTo(record, warnings)
 
   const plan: BeatPlan = {
     turnId,
@@ -326,10 +334,25 @@ function parsePlan(raw: unknown, ctx: PlanContext): PlanValidation {
     pacing,
     beats,
     ...(nextTurnAfterSec === undefined ? {} : { nextTurnAfterSec }),
+    ...(advanceTo === undefined ? {} : { advanceTo }),
     ...(choices === undefined ? {} : { choices }),
     ...(lineGuidance === undefined ? {} : { lineGuidance }),
   }
   return { plan, dropped, warnings }
+}
+
+/**
+ * Optional phase transition requested by the model.
+ *
+ * The parser can only check its shape; whether the target is an allowed
+ * `next` edge is the host's decision (the parser has no phase graph).
+ */
+function readAdvanceTo(record: UnknownRecord, warnings: string[]): string | undefined {
+  const value = record['advanceTo']
+  if (value === undefined) return undefined
+  if (typeof value === 'string' && value.trim() !== '') return value.trim()
+  warnings.push(`advanceTo must be a non-empty phase id, got ${describe(value)}; ignored`)
+  return undefined
 }
 
 /**

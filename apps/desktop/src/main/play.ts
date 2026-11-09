@@ -179,8 +179,8 @@ const TURN_PROTOCOL = [
   'narration 是玩家会看到的正文，不是计划摘要；环境/动作/身体反应用（）包裹，台词不加括号，不出现设备硬件词。',
   'narration 必须写清本回合 beats 实际作用的玩家部位（用这些名字）和动作，不能写没有下发动作的部位，也不能写成与部位无关的泛泛台词。',
   '正文只输出给玩家看的叙事；不要输出 <|...|>、DSML、工具调用语法、parameter/invoke 或任何特殊 token。',
-  'strength 档位：low=40%、med=70%、high=100%（100% = 玩家设定的通道上限；具体数值不向模型暴露）。普通接触用 med，升级/高峰用 high，low 只用于真正的试探/停顿，不要整局 low。',
-  'targetPercent 是 0–100 的区间百分比：100 = 玩家的通道上限，50 = 区间中点；请直接给普通强度 40–70 这样的区间百分比，不要用 5–20 这类过小值（会得到很弱的实际输出）；deltaPercent 只用于微调。',
+  'strength 是粗档位：low/med/high = 玩家软区间的 25/50/80%（100% = 玩家设定的通道上限；具体数值不向模型暴露）；未提供 targetPercent/deltaPercent 时使用，波形动作的幅度也由它决定。',
+  'targetPercent 是 0–100 的连续区间百分比（100 = 玩家设定的通道上限，0 = 停止）：需要具体强度时优先用它精确表达（可用任意值，按当前情境自行选择）；deltaPercent 只用于在当前位置微调。',
   '非 stop 动作的 durationSec 建议 30–60s，避免设备在下一回合开始前停掉；短促/瞬间动作用 ramp/pulse 且 duration 设短。',
   '玩家选项会作为下一回合用户消息（含选项文字和 tag）回传；必须据此改变动作与叙事，不要无视选项或复读上一回合。',
 ] as const
@@ -610,7 +610,11 @@ export class PlaySession {
     const aftercareMin = input.pack.manifest.mode === 'scenario'
       ? scenario.session?.aftercareMin ?? 0
       : 0
-    const phases = new PhaseMachine(scenario.phases)
+    // Every new session starts at the pack's first declared phase. A recovered
+    // snapshot (crashed/unfinished session) deliberately does NOT restore its
+    // phase: unfinished-session handling is a content-pack concern, so the host
+    // keeps the snapshot/ledger facts but starts the new session clean.
+    const initialPhase = scenario.phases[0]?.id ?? 'scene'
 
     // ── B2-T7/T8: recover the previous session, then open this one ───────
     // Recovery happens before the new snapshot is written: a still-active
@@ -652,10 +656,12 @@ export class PlaySession {
       archived = await store.open({
         sessionId,
         packId: input.pack.manifest.id,
-        phase: phases.current,
+        phase: initialPhase,
       })
       await ledger.open(sessionId, { pack: input.pack.manifest.id, plannedMin: plannedMinutes })
     }
+
+    const phases = new PhaseMachine(scenario.phases, initialPhase)
 
     const engine = new TurnEngine({
       clock: this.env.clock,
@@ -1165,6 +1171,7 @@ export class PlaySession {
         [...resolveContext.intents.keys()],
         playableRegions,
         pack.waveforms.map(waveform => waveform.id),
+        phases.allowedNext,
       ),
       executor,
       input: {
@@ -1186,6 +1193,12 @@ export class PlaySession {
         this.env.onLine?.(delta)
       },
     })
+
+    // Phase advancement is a model request validated by the engine: only an
+    // edge declared by the pack may be taken. Advancing before this turn
+    // settles makes both the persisted snapshot and the next prompt see the
+    // new phase.
+    await this.applyPhaseAdvance(phases, result.plan?.advanceTo)
 
     // A plan can drive hardware with no prose at all: tool-call providers may
     // put the whole reply in `apply_plan` and omit both `content` and
@@ -1229,9 +1242,37 @@ export class PlaySession {
     }
   }
 
+  /**
+   * Apply a model-requested phase transition.
+   *
+   * The phase graph is the engine's authority: only a declared edge is taken.
+   * A refused request leaves the phase untouched and is audited so a bad
+   * model proposal is visible without failing the turn.
+   */
+  private async applyPhaseAdvance(phases: PhaseMachine, requested: string | undefined): Promise<void> {
+    if (requested === undefined) return
+    const from = phases.current
+    if (!phases.allowedNext.includes(requested)) {
+      await this.env.audit.record({
+        actor: 'model',
+        action: 'phase_advance',
+        result: 'rejected',
+        reason: 'requested phase is not an allowed next phase',
+        detail: { from, requested, allowed: [...phases.allowedNext] },
+      })
+      return
+    }
+    phases.advanceTo(requested)
+    await this.env.audit.record({
+      actor: 'model',
+      action: 'phase_advance',
+      result: 'ok',
+      detail: { from, to: requested },
+    })
+  }
+
   /** Persist the snapshot that `TurnEngine.onSettle` hands us (B2-T7). */
-  private async persistSnapshot(engine: EngineSnapshot): Promise<void> {
-    const store = this.store
+  private async persistSnapshot(engine: EngineSnapshot): Promise<void> {    const store = this.store
     const base = this.archived
     if (store === undefined || base === undefined) return
     const next: SessionState = {
@@ -1649,6 +1690,10 @@ export class PlaySession {
     const waveformMenu = pack.waveforms.length === 0
       ? []
       : [`可用波形：${pack.waveforms.map(waveform => `${waveform.id}=${waveform.name}`).join('；')}（change.waveformId 只能取这些 id）`]
+    // Time + phase facts are mandatory prompt context: the pack graph alone
+    // cannot tell the model how far the session has progressed, and without
+    // the time budget it has no basis for deciding when to advance.
+    const phaseFacts = this.phaseFacts(phases)
     return buildSystemPrompt({
       ...(pack.manifest.boundaries === undefined ? {} : { boundaries: pack.manifest.boundaries }),
       ...(pack.host === undefined ? {} : { host: pack.host }),
@@ -1661,12 +1706,44 @@ export class PlaySession {
       // actually speak on this provider.
       protocol: [
         ...TURN_PROTOCOL,
+        ...phaseFacts,
         ...waveformMenu,
         ...(opening ? OPENING_PROTOCOL : []),
         ...(autopilot ? AUTOPILOT_PROTOCOL : []),
         ...pacing,
       ],
     })
+  }
+
+  /**
+   * Session-time and phase facts for the prompt.
+   *
+   * The session length is a host input (the pack's `plannedMinutes` is only
+   * archival), so the prompt must state elapsed/remaining time for the model to
+   * know where the session sits on the pack's phase windows. All values here
+   * are temporal — never a device cap or an absolute intensity.
+   */
+  private phaseFacts(phases: PhaseMachine): readonly string[] {
+    const facts: string[] = []
+    const engine = this.engine?.snapshot()
+    if (engine !== undefined && this.plannedMinutes > 0) {
+      const percent = Math.min(100, Math.round((engine.elapsedMin / this.plannedMinutes) * 100))
+      const remaining = engine.remainingMin === null ? '开放式' : `${engine.remainingMin} 分钟`
+      const resolve = engine.mustResolve ? '；已到强制收束点，本回合必须收束' : ''
+      facts.push(`会话时间：已进行 ${engine.elapsedMin} 分钟 / 计划 ${this.plannedMinutes} 分钟（${percent}%）；剩余 ${remaining}${resolve}。`)
+    }
+    const phase = phases.currentPhase
+    const next = phases.allowedNext
+    const condition = phase.advanceWhen === undefined ? '' : `；推进条件：${phase.advanceWhen}`
+    facts.push(`当前阶段：${phase.id}（${phase.goal}）${condition}${next.length === 0 ? '；终局阶段，不可再推进' : `；可推进到：${next.join('、')}`}。`)
+    const windows = this.scenario?.session.phaseWindows ?? []
+    if (windows.length > 0) {
+      facts.push(`阶段时间窗：${windows.map(window => `${window.phase} ${Math.round(window.from * 100)}–${Math.round(window.to * 100)}%`).join('；')}。`)
+    }
+    if (next.length > 0) {
+      facts.push('需要推进阶段时，在 apply_plan 里给 advanceTo（只能取「可推进到」里的 id）；阶段切换由引擎执行，不要只在 narration 里宣称已进入下一阶段。')
+    }
+    return facts
   }
 
   /**

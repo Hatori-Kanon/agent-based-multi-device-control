@@ -66,14 +66,14 @@ const LEVEL_CHANGE_SCHEMA: Record<string, unknown> = {
       minimum: 0,
       maximum: 100,
       description:
-        '0–100 的区间百分比：100 = 玩家设定的通道上限，50 = 区间中点；'
-        + '请直接给普通强度 40–70 这类值，不要用 5–20 表达普通强度；具体上限数值对模型不可见。',
+        '0–100 的连续区间百分比：100 = 玩家设定的通道上限，0 = 停止；'
+        + '需要具体强度时优先用它表达（可用任意值）；具体上限数值对模型不可见。',
     },
     deltaPercent: {
       type: 'number',
       minimum: -20,
       maximum: 20,
-      description: '区间百分点微调（±20 相当于区间的 20%），只用于微调；普通强度请用 targetPercent/strength。',
+      description: '区间百分点微调（±20 相当于区间跨度的 20%），只用于在当前位置微调。',
     },
     durationSec: { type: 'number', minimum: 1, maximum: 600 },
   },
@@ -101,7 +101,7 @@ const BEAT_CHANGE_SCHEMA: Record<string, unknown> = {
 const BEAT_STRENGTH_SCHEMA: Record<string, unknown> = {
   type: 'string',
   enum: ['low', 'med', 'high'],
-  description: 'low = 40%、med = 70%、high = 100%（100% = 玩家设定的通道上限；具体数值不向模型暴露）。',
+  description: '粗档位：low = 25%、med = 50%、high = 80%（100% = 玩家设定的通道上限；具体数值不向模型暴露）。',
 }
 
 const TEXTURE_SCHEMA: Record<string, unknown> = {
@@ -217,6 +217,11 @@ export const M2_TOOL_SCHEMAS: readonly ToolDefinition[] = [
       properties: {
         pacing: { type: 'string', enum: ['hold', 'build', 'release', 'probe'] },
         nextTurnAfterSec: { type: 'number', minimum: 1 },
+        advanceTo: {
+          type: 'string',
+          minLength: 1,
+          description: '进入下一阶段的 id；只能取当前阶段允许的 next（引擎校验，非法值忽略并写审计）。终局阶段不要填。',
+        },
         beats: {
           type: 'array',
           minItems: 1,
@@ -431,6 +436,10 @@ function uniqueNonEmpty(values: readonly string[]): string[] {
  * @param intentIds - Intent ids declared by the loaded pack.
  * @param regionIds - Region ids declared by the loaded pack (no wildcard
  *   required; it is added here).
+ * @param waveformIds - Pack waveform ids (already namespaced).
+ * @param phaseIds - Legal `advanceTo` targets for this turn (current phase's
+ *   declared `next` edges). Empty on a terminal phase; the property then keeps
+ *   no enum rather than advertising an impossible transition.
  * @returns A new array with the decorated `apply_plan`, or `tools` unchanged
  *   when no `apply_plan` definition is present.
  */
@@ -439,6 +448,7 @@ export function withPlayableEnums(
   intentIds: readonly string[],
   regionIds: readonly string[],
   waveformIds: readonly string[] = [],
+  phaseIds: readonly string[] = [],
 ): readonly ToolDefinition[] {
   const index = tools.findIndex(tool => tool.name === 'apply_plan')
   if (index < 0) return tools
@@ -471,6 +481,14 @@ export function withPlayableEnums(
     if (intentId !== undefined) intentId['enum'] = intentEnum
   }
   // Else: leave the property enum-free rather than emitting an empty enum.
+
+  // `advanceTo` is a plan-level field; a terminal phase has no legal target,
+  // so it stays enum-free (the prompt says the phase is terminal).
+  const phaseEnum = uniqueNonEmpty(phaseIds)
+  if (phaseEnum.length > 0) {
+    const advanceTo = asSchemaObject(properties?.['advanceTo'])
+    if (advanceTo !== undefined) advanceTo['enum'] = phaseEnum
+  }
 
   const regionsSchema = asSchemaObject(beatProperties['regions'])
   const regionItems = regionsSchema === undefined ? undefined : asSchemaObject(regionsSchema['items'])
