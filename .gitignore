@@ -149,3 +149,14 @@ analysis/hw9-capture/_tools/_pkgs/
 
 # Content-pack kit: source lives in deliverables/content-pack-kit/, the zip is a build artifact.
 deliverables/*.zip
+
+# ── Generated / local-only trees now kept out of the repository ────────────
+# Archify diagram output is regenerated locally from requirements; the HTML
+# carries absolute local paths, so it is not published.
+.archify/
+
+# Local hardware-capture tooling: records third-party BLE scan results.
+analysis/hw9-capture/_tools/
+
+# Content-pack zips built at the repository root (rebuilt by install-pack.mjs).
+/*.zip
