@@ -39,7 +39,7 @@
       "meaning": "短促试探",
       "regions": ["hands"],
       "distribution": "primary",
-      "suggest": { "preset": "pulse", "durationSec": 2, "strength": "low" }
+      "suggest": { "preset": "pulse", "waveform": "single-touch", "durationSec": 2, "strength": "low" }
     },
     {
       "id": "ambient-field",
@@ -61,6 +61,13 @@
       "regions": ["whole-body"],
       "distribution": "synced",
       "suggest": { "preset": "wave", "waveform": "soft-waves", "durationSec": 15, "strength": "low" }
+    },
+    {
+      "id": "stop",
+      "meaning": "停下",
+      "regions": ["whole-body"],
+      "distribution": "synced",
+      "suggest": { "durationSec": 1, "strength": "low" }
     }
   ]
 }

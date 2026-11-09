@@ -6,7 +6,7 @@
  *
  * The kit deliberately reuses `packages/core/src/scenario/loader.ts` instead of
  * re-implementing the rules, so the result is byte-for-byte the same decision
- * the game will make on import. Node >= 22.7 is required for the
+ * the game will make on import. Node >= 22.19 is required for the
  * `--experimental-transform-types` flag; the .bat wrapper already passes it.
  */
 import { existsSync, statSync } from 'node:fs'
@@ -46,7 +46,7 @@ async function main() {
   } catch (error) {
     if (String(error?.message ?? '').includes('TypeScript')) {
       console.error('Node 需要 --experimental-transform-types 才能加载仓库的 TS 校验器。')
-      console.error('请用 tools/validate-pack.bat，或手动加上该参数（Node >= 22.7）。')
+      console.error('请用 校验内容包.bat，或手动加上该参数（Node >= 22.19）。')
       process.exit(2)
     }
     throw error

@@ -27,5 +27,6 @@
       "when": { "endReason": ["left_early"] },
       "opening": { "tone": "留有余地", "firstIntent": "soothe" }
     }
-  ]
+  ],
+  "requires": ["region", "waveform"]
 }

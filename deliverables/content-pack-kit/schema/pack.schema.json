@@ -1,7 +1,8 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "embodied-pack.schema.json",
-  "title": "Embodied 内容包清单 pack.json",
+  "title": "Embodied 内容包清单 pack.json（当前实现格式）",
+  "description": "依据 deliverables/content-pack-kit/内容包格式要求.md（2026-11-03，仓库 v15 代码）。Schema 只做编辑器提示，最终以 tools/validate-pack.mjs 的结论为准。",
   "type": "object",
   "required": [
     "id",
@@ -16,19 +17,22 @@
     "id": {
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9-]*$",
-      "description": "小写字母/数字/连字符"
+      "description": "包身份：小写字母/数字/连字符；同一 id 可并存多个版本，只有一个 active"
     },
     "name": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "description": "控制台/注册表展示名"
     },
     "version": {
+      "description": "严格 x.y.z（无预发布/构建元数据，如 1.0.0-beta、0.1 都拒绝）",
       "type": "string",
       "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$"
     },
     "engine": {
       "type": "string",
       "minLength": 1,
+      "description": "与引擎 ENGINE_VERSION=0.2.0 做 semver 兼容比较。只支持：精确 x.y.z（或省略 minor/patch 的部分精确，如 1.2 = 1.2.0）、>=x.y.z、<x.y.z（空格 AND）、^x.y.z、~x.y.z；不支持 >、<=、*、x、||、预发布。不兼容拒绝加载。",
       "examples": [
         ">=0.2 <1.0"
       ]
@@ -37,55 +41,64 @@
       "enum": [
         "freeform",
         "scenario"
-      ]
+      ],
+      "description": "freeform = 引擎合成单阶段与默认意图表；scenario = 必须提供 scenario.json（freeform 里出现 scenario.json 只警告并忽略）"
     },
     "rating": {
       "enum": [
         "all",
         "18+"
-      ]
+      ],
+      "description": "仅标注/过滤，引擎不审核内容"
     },
     "language": {
-      "type": "string"
+      "type": "string",
+      "description": "建议 zh-CN；仅展示，不进提示词"
     },
     "author": {
-      "type": "string"
+      "type": "string",
+      "description": "仅展示，不进提示词"
     },
     "homepage": {
-      "type": "string"
+      "type": "string",
+      "description": "仅展示，不进提示词"
     },
     "description": {
-      "type": "string"
+      "type": "string",
+      "description": "一句话介绍；仅展示，不进提示词"
     },
     "tags": {
       "type": "array",
       "items": {
         "type": "string"
-      }
+      },
+      "description": "展示用；不进提示词"
     },
     "license": {
-      "type": "string"
+      "type": "string",
+      "description": "展示/归档用；引擎不校验许可证"
     },
     "boundaries": {
       "type": "array",
       "items": {
         "type": "string"
       },
-      "description": "硬约束；只在 pack.json 声明"
+      "description": "硬约束：只在 pack.json 声明一处，注入系统提示词最前且永不截断；缺失或空数组只警告（全局边界仍生效）"
     },
     "aftercare": {
       "type": "object",
       "additionalProperties": true,
+      "description": "只允许 text；当前只校验、运行期不消费（时长见 scenario.session.aftercareMin）",
       "properties": {
         "text": {
           "type": "string",
           "minLength": 1
         }
-      },
-      "description": "默认收尾文案（时长在 scenario.session.aftercareMin）"
+      }
     },
     "history": {
       "type": "object",
+      "description": "跨会话记忆：read=true 才读账本，匹配 metaReactions 后只注入第 1 回合开场 brief",
       "required": [
         "read"
       ],
@@ -96,16 +109,19 @@
         },
         "windowHours": {
           "type": "number",
-          "exclusiveMinimum": 0
+          "exclusiveMinimum": 0,
+          "description": "时间窗（小时）"
         },
         "lastN": {
           "type": "integer",
-          "minimum": 1
+          "minimum": 1,
+          "description": "只取最近 N 条结束记录"
         }
       }
     },
     "metaReactions": {
       "type": "array",
+      "description": "按最近一条结束记录匹配，命中后把 tone / firstIntent 写进第 1 回合开场 brief（firstIntent 不在意图表只警告、仍注入 tone）",
       "items": {
         "type": "object",
         "required": [
@@ -159,7 +175,7 @@
       "items": {
         "type": "string"
       },
-      "description": "M2 只实现 region/waveform，其他能力仅告警"
+      "description": "依赖的引擎能力：M2 只实现 region / waveform，其余只警告忽略"
     }
   }
 }

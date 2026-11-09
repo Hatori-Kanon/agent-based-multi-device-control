@@ -1,7 +1,8 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "embodied-scenario.schema.json",
-  "title": "Embodied 剧本 scenario.json",
+  "title": "Embodied 剧本 scenario.json（当前实现格式）",
+  "description": "依据 deliverables/content-pack-kit/内容包格式要求.md（2026-11-03，仓库 v15 代码）。Schema 只做编辑器提示，最终以 tools/validate-pack.mjs 的结论为准。",
   "type": "object",
   "required": [
     "session",
@@ -13,10 +14,11 @@
     "host": {
       "type": "string",
       "minLength": 1,
-      "description": "引用包内 Markdown；缺失/不存在回退引擎默认 host"
+      "description": "引用包内 Markdown 文件；文件不存在 → 警告并回退 host.md；两者都没有时提示词里没有「主持风格」段（不存在引擎默认 host 文本）"
     },
     "session": {
       "type": "object",
+      "description": "会话时长与收尾设置；三个字段都必填",
       "required": [
         "plannedMinutes",
         "phaseWindows",
@@ -29,10 +31,12 @@
             "number",
             "null"
           ],
-          "exclusiveMinimum": 0
+          "exclusiveMinimum": 0,
+          "description": "必填但运行期不读：实际时长由大厅输入决定；null = 开放式"
         },
         "phaseWindows": {
           "type": "array",
+          "description": "必填；当前只校验，不参与运行（阶段不会自动推进）",
           "items": {
             "type": "object",
             "required": [
@@ -44,7 +48,8 @@
             "properties": {
               "phase": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "description": "必须是 phases[] 里声明过的阶段 id"
               },
               "from": {
                 "type": "number",
@@ -62,13 +67,13 @@
         "aftercareMin": {
           "type": "number",
           "minimum": 0,
-          "description": "结束前的最短收尾停留（分钟）；测试包建议 0"
+          "description": "必填；scenario 模式下 end() 会先停在 ending 这么久再结束（任意结束原因）；测试包建议 0"
         }
       }
     },
     "regions": {
       "type": "array",
-      "description": "可选：作者推荐的身体部位（玩家可自由命名；名称或 id 与推荐一致时自动映射到包内 id；整段可省略或为空数组）",
+      "description": "可选（省略或 [] 本身只警告；但若意图仍引用被删的 region id 会拒绝加载）：作者推荐的身体部位。玩家在控制台可为每个通道自由命名部位；输入与 id/label 完全一致时自动映射到包内 id。label 请写玩家常用的身体部位词（别名按「玩家词是 label 子串」命中），且不要带数字（world 段会去掉 label 里的数字）。",
       "items": {
         "type": "object",
         "required": [
@@ -79,11 +84,13 @@
         "properties": {
           "id": {
             "type": "string",
-            "pattern": "^[a-z0-9][a-z0-9-]{0,31}$"
+            "pattern": "^[a-z0-9][a-z0-9-]{0,31}$",
+            "description": "小写字母/数字/连字符，最长 32；包内唯一；whole-body 是保留通配部位"
           },
           "label": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "description": "玩家能看懂的部位名；会随 id 进入提示词"
           }
         }
       }
@@ -91,6 +98,7 @@
     "phases": {
       "type": "array",
       "minItems": 1,
+      "description": "阶段图；声明顺序里的第一个是起始阶段。模型可在 apply_plan.advanceTo 请求推进（只能取当前阶段 next），引擎校验后执行；只有当前阶段那篇 phases/<id>.md 注入。",
       "items": {
         "type": "object",
         "required": [
@@ -102,27 +110,31 @@
         "properties": {
           "id": {
             "type": "string",
-            "pattern": "^[a-z0-9][a-z0-9-]*$"
+            "pattern": "^[a-z0-9][a-z0-9-]*$",
+            "description": "同时是文件名 phases/<id>.md；包内唯一"
           },
           "goal": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "description": "当前阶段目标；会进入提示词的 scene 段"
           },
           "advanceWhen": {
-            "type": "string"
+            "type": "string",
+            "description": "可选；当前只校验、不参与运行"
           },
           "next": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "空数组 = 终局阶段"
+            "description": "空数组 = 终局阶段；必须引用已声明阶段、不能自环；图必须全可达且有终局"
           }
         }
       }
     },
     "feedbackIntents": {
       "type": "array",
+      "description": "意图表；scenario 包会整体覆盖引擎默认意图表。要让模型能显式停止，必须自己提供 id 为 stop 的意图（解析器按该 id 发 percent 0）。",
       "items": {
         "type": "object",
         "required": [
@@ -133,25 +145,28 @@
         "properties": {
           "id": {
             "type": "string",
-            "pattern": "^[a-z0-9][a-z0-9-]*$"
+            "pattern": "^[a-z0-9][a-z0-9-]*$",
+            "description": "包内唯一；会进入 world 段的「可用意图」和 apply_plan 运行时枚举"
           },
           "meaning": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "description": "进入 world 段时会去掉数字以及 ; 和 =，建议写简短中文含义"
           },
           "regions": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "可选建议；每个值仍必须在本文件 regions[] 声明（省略时默认 whole-body）"
+            "description": "可选；省略时默认 [\"whole-body\"]（whole-body 是通配、无需声明）；写了就必须在本文件 regions[] 声明，否则拒绝加载"
           },
           "distribution": {
             "enum": [
               "synced",
               "primary",
               "round-robin"
-            ]
+            ],
+            "description": "可选；省略默认 synced（与意图名无关）；未知值拒绝加载。试探型建议 primary，环境型建议 synced"
           },
           "suggest": {
             "type": "object",
@@ -164,43 +179,57 @@
                   "wave",
                   "random",
                   "ramp"
-                ]
+                ],
+                "description": "包络预设；与波形可同时使用"
               },
               "waveform": {
                 "type": "string",
                 "minLength": 1,
-                "description": "包内 id、<id> 或 builtin:<id>"
+                "description": "包内 id、<packId>:<id> 或 builtin:<id>；不可解析只警告，运行期回退包内第一个波形"
               },
               "durationSec": {
                 "type": "number",
-                "exclusiveMinimum": 0
+                "exclusiveMinimum": 0,
+                "description": "省略默认 2 秒；超过 600 只警告（执行时被通道上限夹紧）；loop:true 的波形会被抬到 min(60s, 通道 maxDurationSec)"
               },
               "strength": {
                 "enum": [
                   "low",
                   "med",
                   "high"
-                ]
+                ],
+                "description": "相对区间档位 low=25%/med=50%/high=80%（100% = 玩家设定的通道上限，旧 40/70/100 已废止）；当前只校验、运行期未消费（apply_plan 的 beats[].strength 覆盖它）"
               }
             }
           }
         }
       }
     },
+    "boundaries": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "⚠️ 忽略字段：boundaries 只在 pack.json 声明；出现在这里会警告并忽略"
+    },
+    "aftercare": {
+      "type": "object",
+      "description": "⚠️ 忽略字段：收尾时长用 session.aftercareMin、文案用 pack.aftercare.text；出现在这里会警告并忽略"
+    },
     "opening": {
       "type": "string",
-      "description": "兼容字段；当前运行期未注入，建议写进 setting.md"
+      "description": "兼容字段；仅类型校验，当前运行期不注入，建议写进 setting.md"
     },
     "npcs": {
       "type": "array",
-      "description": "兼容字段；当前运行期未使用"
+      "description": "兼容字段；仅类型校验，当前运行期不使用"
     },
     "secrets": {
       "type": "array",
       "items": {
         "type": "string"
       },
-      "description": "兼容字段；当前运行期未使用"
+      "description": "兼容字段；仅类型校验，当前运行期不使用"
     }
   }
 }

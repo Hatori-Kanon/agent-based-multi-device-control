@@ -33,7 +33,7 @@ const HELP = `用法:
   --url <http://host:port>   控制台地址（默认自动发现）
   --token <token>            控制台 token（默认从 dataDir/state/dashboard.json 读取）
   --data-dir <path>          数据目录（默认: EMBODIED_DATA_DIR / 仓库 .dev-data / Electron app data）
-  --zip <out.zip>            只生成 zip，不上传
+  --zip <out.zip>            只生成 zip，不上传（不需要控制台在运行）
   --list                     列出已安装内容包
   --activate <id@version>    切换 active 版本（导入会默认激活该版本；同版本重导会覆盖安装）
   --no-validate              跳过仓库校验器的预检（不推荐）
@@ -148,9 +148,9 @@ async function main() {
     console.log(HELP)
     return
   }
-  const endpoint = resolveEndpoint(options)
 
   if (options.list) {
+    const endpoint = resolveEndpoint(options)
     const body = await api(endpoint.url, endpoint.token, '/api/packs')
     console.log(`控制台: ${endpoint.url}（token 来自 ${endpoint.source}）`)
     printPacks(body?.packs)
@@ -158,6 +158,7 @@ async function main() {
   }
 
   if (options.activate !== undefined) {
+    const endpoint = resolveEndpoint(options)
     const [id, version] = String(options.activate).split('@')
     if (!id || !version) {
       console.error('--activate 需要 id@version，例如 lighthouse-night@0.1.0')
@@ -242,6 +243,9 @@ async function main() {
     return
   }
 
+  // Only the upload branch needs a running console: `--zip` must work offline,
+  // so resolveEndpoint() is called after the zip has been written.
+  const endpoint = resolveEndpoint(options)
   console.log(`上传到 ${endpoint.url}（token 来自 ${endpoint.source}）`)
   try {
     const body = await api(endpoint.url, endpoint.token, '/api/packs/import', {

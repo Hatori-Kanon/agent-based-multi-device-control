@@ -1,0 +1,11 @@
+{
+  "id": "single-touch",
+  "name": "轻触一下",
+  "sensation": "短促轻点",
+  "tags": ["short", "soft"],
+  "loop": false,
+  "segments": [
+    { "ms": 300, "freq": 30, "intensity": { "from": 0, "to": 30 }, "curve": "easeOut" },
+    { "ms": 200, "freq": 30, "intensity": { "from": 30, "to": 0 }, "curve": "easeIn" }
+  ]
+}
