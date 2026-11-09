@@ -1,6 +1,6 @@
 # HW9 抓包索引（2026-11-01）
 
-> 需求文档：`analysis/coospo-hw9-test-plan.md`　工具链：`analysis/hw9-capture/_tools/`
+> 需求文档：`analysis/coospo-hw9-test-plan.md`　工具链（本地、未跟踪）：`analysis/hw9-capture/_tools/`
 > 健康数据只存本地；MAC/序列号已脱敏；**不要提交到 git**（`.gitignore` 已覆盖本轮目录）。
 
 ## 会话目录
